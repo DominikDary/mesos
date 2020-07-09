@@ -103,6 +103,7 @@ MockSlave::MockSlave(
     QoSController* qosController,
     SecretGenerator* secretGenerator,
     VolumeGidManager* volumeGidManager,
+    PendingFutureTracker* futureTracker,
     const Option<Authorizer*>& authorizer)
   // It is necessary to explicitly call `ProcessBase` constructor here even
   // though the direct parent `Slave` already does this. This is because
@@ -122,6 +123,10 @@ MockSlave::MockSlave(
         qosController,
         secretGenerator,
         volumeGidManager,
+        futureTracker,
+#ifndef __WINDOWS__
+        None(),
+#endif // __WINDOWS__
         authorizer)
 {
   // Set up default behaviors, calling the original methods.
@@ -131,7 +136,7 @@ MockSlave::MockSlave(
     .WillRepeatedly(Invoke(this, &MockSlave::unmocked_runTask));
   EXPECT_CALL(*this, _run(_, _, _, _, _, _))
     .WillRepeatedly(Invoke(this, &MockSlave::unmocked__run));
-  EXPECT_CALL(*this, __run(_, _, _, _, _, _))
+  EXPECT_CALL(*this, __run(_, _, _, _, _, _, _))
     .WillRepeatedly(Invoke(this, &MockSlave::unmocked___run));
   EXPECT_CALL(*this, runTaskGroup(_, _, _, _, _, _))
     .WillRepeatedly(Invoke(this, &MockSlave::unmocked_runTaskGroup));
@@ -153,6 +158,8 @@ MockSlave::MockSlave(
     .WillRepeatedly(Invoke(this, &MockSlave::unmocked_shutdownExecutor));
   EXPECT_CALL(*this, _shutdownExecutor(_, _))
     .WillRepeatedly(Invoke(this, &MockSlave::unmocked__shutdownExecutor));
+  EXPECT_CALL(*this, applyOperation(_))
+    .WillRepeatedly(Invoke(this, &MockSlave::unmocked_applyOperation));
 }
 
 
@@ -218,7 +225,8 @@ void MockSlave::unmocked___run(
     const Option<TaskInfo>& task,
     const Option<TaskGroupInfo>& taskGroup,
     const std::vector<ResourceVersionUUID>& resourceVersionUuids,
-    const Option<bool>& launchExecutor)
+    const Option<bool>& launchExecutor,
+    bool executorGeneratedForCommandTask)
 {
   slave::Slave::__run(
       frameworkInfo,
@@ -226,7 +234,8 @@ void MockSlave::unmocked___run(
       task,
       taskGroup,
       resourceVersionUuids,
-      launchExecutor);
+      launchExecutor,
+      executorGeneratedForCommandTask);
 }
 
 
@@ -313,6 +322,11 @@ void MockSlave::unmocked__shutdownExecutor(
   slave::Slave::_shutdownExecutor(framework, executor);
 }
 
+
+void MockSlave::unmocked_applyOperation(const ApplyOperationMessage& message)
+{
+  slave::Slave::applyOperation(message);
+}
 
 } // namespace tests {
 } // namespace internal {

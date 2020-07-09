@@ -140,6 +140,10 @@ constexpr char DEFAULT_DOCKER_HOST_RESOURCE[] = "//./pipe/docker_engine";
 constexpr char DEFAULT_DOCKER_HOST_RESOURCE[] = "/var/run/docker.sock";
 #endif // __WINDOWS__
 
+// Default filename used for domain socket-based communication between
+// agent and executors, if that is enabled.
+constexpr char AGENT_EXECUTORS_SOCKET_FILENAME[] = "agent.sock";
+
 // Default duration that docker containers will be removed after exit.
 constexpr Duration DOCKER_REMOVE_DELAY = Hours(6);
 
@@ -201,6 +205,9 @@ constexpr char MESOS_EXECUTOR[] = "mesos-executor.exe";
 constexpr char MESOS_DEFAULT_EXECUTOR[] = "mesos-default-executor";
 constexpr char MESOS_EXECUTOR[] = "mesos-executor";
 #endif // __WINDOWS__
+
+// Name of the component used for describing pending futures.
+constexpr char COMPONENT_NAME_CONTAINERIZER[] = "containerizer";
 
 
 // Virtual path on which agent logs are mounted in `/files/` endpoint.

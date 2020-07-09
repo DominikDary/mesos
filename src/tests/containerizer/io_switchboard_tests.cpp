@@ -146,27 +146,30 @@ protected:
         string stdoutReceived;
         string stderrReceived;
 
-        ::recordio::Decoder<agent::ProcessIO> decoder(lambda::bind(
-            deserialize<agent::ProcessIO>, ContentType::JSON, lambda::_1));
+        ::recordio::Decoder decoder;
 
-        Try<std::deque<Try<agent::ProcessIO>>> records = decoder.decode(data);
+        Try<std::deque<string>> records = decoder.decode(data);
 
         if (records.isError()) {
           return process::Failure(records.error());
         }
 
         while(!records->empty()) {
-          Try<agent::ProcessIO> record = records->front();
+          string record = std::move(records->front());
           records->pop_front();
 
-          if (record.isError()) {
-            return process::Failure(record.error());
+          Try<agent::ProcessIO> processIO =
+            deserialize<agent::ProcessIO>(ContentType::JSON, record);
+
+          if (processIO.isError()) {
+            return process::Failure(processIO.error());
           }
 
-          if (record->data().type() == agent::ProcessIO::Data::STDOUT) {
-            stdoutReceived += record->data().data();
-          } else if (record->data().type() == agent::ProcessIO::Data::STDERR) {
-            stderrReceived += record->data().data();
+          if (processIO->data().type() == agent::ProcessIO::Data::STDOUT) {
+            stdoutReceived += processIO->data().data();
+          } else if (
+              processIO->data().type() == agent::ProcessIO::Data::STDERR) {
+            stderrReceived += processIO->data().data();
           }
         }
 
@@ -442,8 +445,7 @@ TEST_F(IOSwitchboardServerTest, SendHeartbeat)
   };
 
   recordio::Reader<agent::ProcessIO> responseDecoder(
-      ::recordio::Decoder<agent::ProcessIO>(deserializer),
-      reader.get());
+      deserializer, reader.get());
 
   // Wait for 5 heartbeat messages.
   Clock::pause();
@@ -555,9 +557,6 @@ TEST_F(IOSwitchboardServerTest, AttachInput)
 
   Future<http::Response> response = connection.send(request);
 
-  ::recordio::Encoder<mesos::agent::Call> encoder(lambda::bind(
-        serialize, ContentType::JSON, lambda::_1));
-
   Call call;
   call.set_type(Call::ATTACH_CONTAINER_INPUT);
 
@@ -565,7 +564,7 @@ TEST_F(IOSwitchboardServerTest, AttachInput)
   attach->set_type(Call::AttachContainerInput::CONTAINER_ID);
   attach->mutable_container_id()->set_value(id::UUID::random().toString());
 
-  writer.write(encoder.encode(call));
+  writer.write(::recordio::encode(serialize(ContentType::JSON, call)));
 
   size_t offset = 0;
   size_t chunkSize = 4096;
@@ -584,7 +583,7 @@ TEST_F(IOSwitchboardServerTest, AttachInput)
     message->mutable_data()->set_type(ProcessIO::Data::STDIN);
     message->mutable_data()->set_data(dataChunk);
 
-    writer.write(encoder.encode(call));
+    writer.write(::recordio::encode(serialize(ContentType::JSON, call)));
   }
 
   writer.close();
@@ -667,9 +666,6 @@ TEST_F(IOSwitchboardServerTest, ReceiveHeartbeat)
 
   Future<http::Response> response = connection.send(request);
 
-  ::recordio::Encoder<mesos::agent::Call> encoder(lambda::bind(
-      serialize, ContentType::JSON, lambda::_1));
-
   Call call;
   call.set_type(Call::ATTACH_CONTAINER_INPUT);
 
@@ -677,7 +673,7 @@ TEST_F(IOSwitchboardServerTest, ReceiveHeartbeat)
   attach->set_type(Call::AttachContainerInput::CONTAINER_ID);
   attach->mutable_container_id()->set_value(id::UUID::random().toString());
 
-  writer.write(encoder.encode(call));
+  writer.write(::recordio::encode(serialize(ContentType::JSON, call)));
 
   // Send 5 heartbeat messages.
   Duration heartbeat = Milliseconds(10);
@@ -693,7 +689,7 @@ TEST_F(IOSwitchboardServerTest, ReceiveHeartbeat)
     message->mutable_control()->mutable_heartbeat()
         ->mutable_interval()->set_nanoseconds(heartbeat.ns());
 
-    writer.write(encoder.encode(call));
+    writer.write(::recordio::encode(serialize(ContentType::JSON, call)));
 
     Clock::advance(heartbeat);
   }

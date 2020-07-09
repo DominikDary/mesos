@@ -10,9 +10,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License
 
+#ifndef __PROCESS_POLL_SOCKET__
+#define __PROCESS_POLL_SOCKET__
 #include <memory>
 
 #include <process/socket.hpp>
+
+#include <process/ssl/tls_config.hpp>
 
 #include <stout/try.hpp>
 
@@ -32,7 +36,13 @@ public:
   // Implementation of the SocketImpl interface.
   Try<Nothing> listen(int backlog) override;
   Future<std::shared_ptr<SocketImpl>> accept() override;
-  Future<Nothing> connect(const Address& address) override;
+  Future<Nothing> connect(
+      const Address& address) override;
+#ifdef USE_SSL_SOCKET
+  Future<Nothing> connect(
+      const Address& address,
+      const openssl::TLSClientConfig& config) override;
+#endif
   Future<size_t> recv(char* data, size_t size) override;
   Future<size_t> send(const char* data, size_t size) override;
   Future<size_t> sendfile(int_fd fd, off_t offset, size_t size) override;
@@ -42,3 +52,5 @@ public:
 } // namespace internal {
 } // namespace network {
 } // namespace process {
+
+#endif // __PROCESS_POLL_SOCKET__

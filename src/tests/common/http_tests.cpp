@@ -29,9 +29,12 @@
 
 #include "messages/messages.hpp"
 
+#include "tests/common/http_tests.pb.h"
+
 using namespace mesos;
 using namespace mesos::internal;
 
+using std::string;
 using std::vector;
 
 using mesos::internal::protobuf::createLabel;
@@ -88,6 +91,8 @@ TEST(HTTPTest, ModelTask)
   taskInfo.mutable_command()->set_value("echo hello");
   taskInfo.mutable_command()->set_user("user1");
   taskInfo.mutable_discovery()->CopyFrom(discovery);
+  (*taskInfo.mutable_limits())["cpus"].set_value(1.0);
+  (*taskInfo.mutable_limits())["mem"].set_value(32);
 
   Task task = createTask(taskInfo, state, frameworkId);
   task.add_statuses()->CopyFrom(statuses[0]);
@@ -106,6 +111,11 @@ TEST(HTTPTest, ModelTask)
       "    \"disk\":0,"
       "    \"gpus\":0,"
       "    \"mem\":0"
+      "  },"
+      "  \"limits\":"
+      "  {"
+      "    \"cpus\": 1.0,"
+      "    \"mem\": 32"
       "  },"
       "  \"slave_id\":\"s\","
       "  \"state\":\"TASK_RUNNING\","
@@ -260,4 +270,46 @@ TEST(HTTP, SerializeNetworkInfo)
 
   ASSERT_SOME(expected);
   EXPECT_EQ(expected.get(), object);
+}
+
+
+// Ensures jsonification of v0 protobuf converts correctly to
+// v1 protobuf.
+TEST(HTTP, AsV1Protobuf)
+{
+  test::TestSlaveMessage message;
+
+  message.set_some_slave_field(true);
+  message.add_some_slave_fields(true);
+
+  (*message.mutable_some_slave_map())[true] = true;
+
+  message.set_some_slave_enum(test::TestSlaveMessage::A_SLAVE_ENUM);
+  message.add_some_slave_enums(test::TestSlaveMessage::A_SLAVE_ENUM);
+
+  test::ParentMessage parent;
+
+  *parent.mutable_some_slave_message() = message;
+  *parent.add_some_slave_messages() = message;
+
+  EXPECT_EQ(
+      "{"
+        "\"some_agent_message\":"
+        "{"
+          "\"some_agent_field\":true,"
+          "\"some_agent_fields\":[true],"
+          "\"some_agent_map\":{\"true\":true},"
+          "\"some_agent_enum\":\"A_AGENT_ENUM\","
+          "\"some_agent_enums\":[\"A_AGENT_ENUM\"]"
+        "},"
+        "\"some_agent_messages\":["
+        "{"
+          "\"some_agent_field\":true,"
+          "\"some_agent_fields\":[true],"
+          "\"some_agent_map\":{\"true\":true},"
+          "\"some_agent_enum\":\"A_AGENT_ENUM\","
+          "\"some_agent_enums\":[\"A_AGENT_ENUM\"]"
+        "}]"
+      "}",
+      string(jsonify(asV1Protobuf(parent))));
 }

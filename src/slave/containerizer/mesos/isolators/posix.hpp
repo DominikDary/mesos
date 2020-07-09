@@ -103,7 +103,9 @@ public:
 
   process::Future<Nothing> update(
       const ContainerID& containerId,
-      const Resources& resources) override
+      const Resources& resourceRequests,
+      const google::protobuf::Map<
+          std::string, Value::Scalar>& resourceLimits = {}) override
   {
     if (!promises.contains(containerId)) {
       return process::Failure("Unknown container: " + stringify(containerId));
@@ -161,7 +163,7 @@ public:
 
     // Use 'mesos-usage' but only request 'cpus_' values.
     Try<ResourceStatistics> usage =
-      mesos::internal::usage(pids.get(containerId).get(), false, true);
+      mesos::internal::usage(pids.at(containerId), false, true);
     if (usage.isError()) {
       return process::Failure(usage.error());
     }
@@ -195,7 +197,7 @@ public:
 
     // Use 'mesos-usage' but only request 'mem_' values.
     Try<ResourceStatistics> usage =
-      mesos::internal::usage(pids.get(containerId).get(), true, false);
+      mesos::internal::usage(pids.at(containerId), true, false);
     if (usage.isError()) {
       return process::Failure(usage.error());
     }

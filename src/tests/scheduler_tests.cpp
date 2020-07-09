@@ -510,7 +510,7 @@ TEST_P(SchedulerTest, TaskRunning)
     .WillOnce(FutureArg<1>(&statusUpdate));
 
   Future<Nothing> update;
-  EXPECT_CALL(containerizer, update(_, _))
+  EXPECT_CALL(containerizer, update(_, _, _))
     .WillOnce(DoAll(FutureSatisfy(&update),
                     Return(Nothing())))
     .WillRepeatedly(Return(Future<Nothing>())); // Ignore subsequent calls.
@@ -1232,9 +1232,8 @@ TEST_P(SchedulerTest, OperationFeedbackValidationNoResourceProviderCapability)
   const v1::Offer& offer = offers->offers(0);
 
   v1::Resources resources = v1::Resources::parse("cpus:0.1").get();
-  resources.pushReservation(v1::createDynamicReservationInfo(
-      frameworkInfo.roles(1),
-      frameworkInfo.principal()));
+  resources = resources.pushReservation(v1::createDynamicReservationInfo(
+      frameworkInfo.roles(1), frameworkInfo.principal()));
 
   v1::Offer::Operation operation = v1::RESERVE(resources);
   operation.mutable_id()->set_value("RESERVE_OPERATION");
@@ -1246,6 +1245,8 @@ TEST_P(SchedulerTest, OperationFeedbackValidationNoResourceProviderCapability)
   EXPECT_EQ(
       mesos::v1::OPERATION_ERROR,
       updateOperationStatus->status().state());
+
+  EXPECT_TRUE(metricEquals("master/operations/error", 1));
 }
 
 

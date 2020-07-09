@@ -413,7 +413,7 @@ protected:
     delay(Seconds(1), self(), &Self::doReliableRegistration);
   }
 
-  static pid_t launchTaskSubprocess(
+  static Subprocess launchTaskSubprocess(
       const CommandInfo& command,
       const string& launcherDir,
       const Environment& environment,
@@ -494,6 +494,9 @@ protected:
 
     if (taskLaunchInfo.isSome()) {
       launchInfo.mutable_mounts()->CopyFrom(taskLaunchInfo->mounts());
+      launchInfo.mutable_file_operations()->CopyFrom(
+          taskLaunchInfo->file_operations());
+
       launchInfo.mutable_pre_exec_commands()->CopyFrom(
           taskLaunchInfo->pre_exec_commands());
 
@@ -560,7 +563,7 @@ protected:
       ABORT("Failed to launch task subprocess: " + s.error());
     }
 
-    return s->pid();
+    return *s;
   }
 
   void launch(const TaskInfo& task)
@@ -687,6 +690,15 @@ protected:
       }
     }
 
+    // Set the `MESOS_ALLOCATION_ROLE` environment variable for the task.
+    // Please note that tasks are not allowed to mix resources allocated
+    // to different roles, see MESOS-6636.
+    Environment::Variable variable;
+    variable.set_name("MESOS_ALLOCATION_ROLE");
+    variable.set_type(Environment::Variable::VALUE);
+    variable.set_value(task.resources().begin()->allocation_info().role());
+    environment["MESOS_ALLOCATION_ROLE"] = variable;
+
     Environment launchEnvironment;
     foreachvalue (const Environment::Variable& variable, environment) {
       launchEnvironment.add_variables()->CopyFrom(variable);
@@ -709,7 +721,7 @@ protected:
 
     LOG(INFO) << "Starting task " << taskId.get();
 
-    pid = launchTaskSubprocess(
+    Subprocess subprocess = launchTaskSubprocess(
         command,
         launcherDir,
         launchEnvironment,
@@ -722,6 +734,8 @@ protected:
         ttySlavePath,
         taskLaunchInfo,
         taskSupplementaryGroups);
+
+    pid = subprocess.pid();
 
     LOG(INFO) << "Forked command at " << pid.get();
 
@@ -787,7 +801,7 @@ protected:
     }
 
     // Monitor this process.
-    process::reap(pid.get())
+    subprocess.status()
       .onAny(defer(self(), &Self::reaped, pid.get(), lambda::_1));
 
     TaskStatus status = createTaskStatus(taskId.get(), TASK_RUNNING);

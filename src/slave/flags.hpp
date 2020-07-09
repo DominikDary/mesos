@@ -60,6 +60,8 @@ public:
   std::string docker_registry;
   std::string docker_store_dir;
   std::string docker_volume_checkpoint_dir;
+  bool docker_volume_chown;
+  bool docker_ignore_runtime;
 
   std::string default_role;
   Option<std::string> attributes;
@@ -123,6 +125,8 @@ public:
   std::string systemd_runtime_directory;
   Option<CapabilityInfo> effective_capabilities;
   Option<CapabilityInfo> bounding_capabilities;
+  Option<Bytes> default_container_shm_size;
+  bool disallow_sharing_agent_ipc_namespace;
   bool disallow_sharing_agent_pid_namespace;
 #endif
   Option<Firewall> firewall_rules;
@@ -178,6 +182,10 @@ public:
 #ifdef USE_SSL_SOCKET
   bool authenticate_http_executors;
 #endif // USE_SSL_SOCKET
+#ifndef __WINDOWS__
+  bool http_executor_domain_sockets;
+  Option<std::string> domain_socket_location;
+#endif // __WINDOWS__
   Option<Path> http_credentials;
   Option<std::string> hooks;
   Option<std::string> secret_resolver;

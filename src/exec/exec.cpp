@@ -47,6 +47,8 @@
 
 #include "common/protobuf_utils.hpp"
 
+#include "docker/executor.hpp"
+
 #include "logging/flags.hpp"
 #include "logging/logging.hpp"
 
@@ -183,8 +185,7 @@ public:
         &RunTaskMessage::task);
 
     install<KillTaskMessage>(
-        &ExecutorProcess::killTask,
-        &KillTaskMessage::task_id);
+        &ExecutorProcess::killTask);
 
     install<StatusUpdateAcknowledgementMessage>(
         &ExecutorProcess::statusUpdateAcknowledgement,
@@ -339,8 +340,10 @@ protected:
     VLOG(1) << "Executor::launchTask took " << stopwatch.elapsed();
   }
 
-  void killTask(const TaskID& taskId)
+  void killTask(KillTaskMessage&& killTaskMessage)
   {
+    const TaskID taskId = killTaskMessage.task_id();
+
     if (aborted.load()) {
       VLOG(1) << "Ignoring kill task message for task " << taskId
               << " because the driver is aborted!";
@@ -365,7 +368,18 @@ protected:
       stopwatch.start();
     }
 
-    executor->killTask(driver, taskId);
+    // If this is a Docker executor, call the `killTask()` overload which
+    // allows the kill policy to be overridden.
+    auto* dockerExecutor = dynamic_cast<docker::DockerExecutor*>(executor);
+    if (dockerExecutor) {
+      Option<KillPolicy> killPolicy = killTaskMessage.has_kill_policy()
+        ? killTaskMessage.kill_policy()
+        : Option<KillPolicy>::none();
+
+      dockerExecutor->killTask(driver, taskId, killPolicy);
+    } else {
+      executor->killTask(driver, taskId);
+    }
 
     VLOG(1) << "Executor::killTask took " << stopwatch.elapsed();
   }
@@ -395,9 +409,28 @@ protected:
       return;
     }
 
+    if (!updates.contains(uuid_.get())) {
+      LOG(WARNING) << "Ignoring unknown status update acknowledgement "
+                   << uuid_.get() << " for task " << taskId
+                   << " of framework " << frameworkId;
+      return;
+    }
+
     VLOG(1) << "Executor received status update acknowledgement "
             << uuid_.get() << " for task " << taskId
             << " of framework " << frameworkId;
+
+    // If this is a terminal status update acknowledgment for the Docker
+    // executor, stop the driver to terminate the executor.
+    //
+    // TODO(abudnik): This is a workaround for MESOS-9847. A better solution
+    // is to update supported API for the Docker executor from V0 to V1. It
+    // will allow the executor to handle status update acknowledgments itself.
+    if (mesos::internal::protobuf::isTerminalState(
+            updates[uuid_.get()].status().state()) &&
+        dynamic_cast<docker::DockerExecutor*>(executor)) {
+      driver->stop();
+    }
 
     // Remove the corresponding update.
     updates.erase(uuid_.get());
@@ -741,7 +774,7 @@ Status MesosExecutorDriver::start()
     hashmap<string, string> env(environment);
 
     // Check if this is local (for example, for testing).
-    local = env.get("MESOS_LOCAL").isSome();
+    local = env.contains("MESOS_LOCAL");
 
     // Get slave PID from environment.
     value = env.get("MESOS_SLAVE_PID");

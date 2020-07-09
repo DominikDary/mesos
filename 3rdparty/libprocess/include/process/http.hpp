@@ -55,8 +55,9 @@ namespace http {
 
 enum class Scheme {
   HTTP,
+  HTTP_UNIX,
 #ifdef USE_SSL_SOCKET
-  HTTPS
+  HTTPS,
 #endif
 };
 
@@ -129,6 +130,18 @@ bool isValidStatus(uint16_t code);
 struct URL
 {
   URL() = default;
+
+  URL(const std::string& _scheme,
+      const std::string& _domain,
+      const std::string& _path,
+      const hashmap<std::string, std::string>& _query =
+        (hashmap<std::string, std::string>()),
+      const Option<std::string>& _fragment = None())
+    : scheme(_scheme),
+      domain(_domain),
+      path(_path),
+      query(_query),
+      fragment(_fragment) {}
 
   URL(const std::string& _scheme,
       const std::string& _domain,
@@ -434,7 +447,7 @@ public:
     : authScheme_(authScheme),
       authParam_(authParam) {}
 
-  static Try<WWWAuthenticate> create(const std::string& value);
+  static Try<WWWAuthenticate> create(const std::string& input);
 
   std::string authScheme();
   hashmap<std::string, std::string> authParam();
@@ -608,11 +621,11 @@ struct Response
   }
 
   explicit Response(
-      const std::string& _body,
+      std::string _body,
       uint16_t _code,
       const std::string& contentType = "text/plain; charset=utf-8")
     : type(BODY),
-      body(_body),
+      body(std::move(_body)),
       code(_code)
   {
     headers["Content-Length"] = stringify(body.size());
@@ -670,11 +683,11 @@ struct OK : Response
   explicit OK(const char* body)
     : Response(std::string(body), Status::OK) {}
 
-  explicit OK(const std::string& body)
-    : Response(body, Status::OK) {}
+  explicit OK(std::string body)
+    : Response(std::move(body), Status::OK) {}
 
-  explicit OK(const std::string& body, const std::string& contentType)
-    : Response(body, Status::OK, contentType) {}
+  explicit OK(std::string body, const std::string& contentType)
+    : Response(std::move(body), Status::OK, contentType) {}
 
   OK(const JSON::Value& value, const Option<std::string>& jsonp = None());
 
@@ -687,8 +700,8 @@ struct Accepted : Response
   Accepted()
     : Response(Status::ACCEPTED) {}
 
-  explicit Accepted(const std::string& body)
-    : Response(body, Status::ACCEPTED) {}
+  explicit Accepted(std::string body)
+    : Response(std::move(body), Status::ACCEPTED) {}
 };
 
 
@@ -707,8 +720,8 @@ struct BadRequest : Response
   BadRequest()
     : BadRequest("400 Bad Request.") {}
 
-  explicit BadRequest(const std::string& body)
-    : Response(body, Status::BAD_REQUEST) {}
+  explicit BadRequest(std::string body)
+    : Response(std::move(body), Status::BAD_REQUEST) {}
 };
 
 
@@ -719,8 +732,8 @@ struct Unauthorized : Response
 
   Unauthorized(
       const std::vector<std::string>& challenges,
-      const std::string& body)
-    : Response(body, Status::UNAUTHORIZED)
+      std::string body)
+    : Response(std::move(body), Status::UNAUTHORIZED)
   {
     // TODO(arojas): Many HTTP client implementations do not support
     // multiple challenges within a single 'WWW-Authenticate' header.
@@ -736,8 +749,8 @@ struct Forbidden : Response
   Forbidden()
     : Forbidden("403 Forbidden.") {}
 
-  explicit Forbidden(const std::string& body)
-    : Response(body, Status::FORBIDDEN) {}
+  explicit Forbidden(std::string body)
+    : Response(std::move(body), Status::FORBIDDEN) {}
 };
 
 
@@ -746,8 +759,8 @@ struct NotFound : Response
   NotFound()
     : NotFound("404 Not Found.") {}
 
-  explicit NotFound(const std::string& body)
-    : Response(body, Status::NOT_FOUND) {}
+  explicit NotFound(std::string body)
+    : Response(std::move(body), Status::NOT_FOUND) {}
 };
 
 
@@ -787,8 +800,8 @@ struct NotAcceptable : Response
   NotAcceptable()
     : NotAcceptable("406 Not Acceptable.") {}
 
-  explicit NotAcceptable(const std::string& body)
-    : Response(body, Status::NOT_ACCEPTABLE) {}
+  explicit NotAcceptable(std::string body)
+    : Response(std::move(body), Status::NOT_ACCEPTABLE) {}
 };
 
 
@@ -797,8 +810,8 @@ struct Conflict : Response
   Conflict()
     : Conflict("409 Conflict.") {}
 
-  explicit Conflict(const std::string& body)
-    : Response(body, Status::CONFLICT) {}
+  explicit Conflict(std::string body)
+    : Response(std::move(body), Status::CONFLICT) {}
 };
 
 
@@ -807,8 +820,8 @@ struct PreconditionFailed : Response
   PreconditionFailed()
     : PreconditionFailed("412 Precondition Failed.") {}
 
-  explicit PreconditionFailed(const std::string& body)
-    : Response(body, Status::PRECONDITION_FAILED) {}
+  explicit PreconditionFailed(std::string body)
+    : Response(std::move(body), Status::PRECONDITION_FAILED) {}
 };
 
 
@@ -817,8 +830,8 @@ struct UnsupportedMediaType : Response
   UnsupportedMediaType()
     : UnsupportedMediaType("415 Unsupported Media Type.") {}
 
-  explicit UnsupportedMediaType(const std::string& body)
-    : Response(body, Status::UNSUPPORTED_MEDIA_TYPE) {}
+  explicit UnsupportedMediaType(std::string body)
+    : Response(std::move(body), Status::UNSUPPORTED_MEDIA_TYPE) {}
 };
 
 
@@ -827,8 +840,8 @@ struct InternalServerError : Response
   InternalServerError()
     : InternalServerError("500 Internal Server Error.") {}
 
-  explicit InternalServerError(const std::string& body)
-    : Response(body, Status::INTERNAL_SERVER_ERROR) {}
+  explicit InternalServerError(std::string body)
+    : Response(std::move(body), Status::INTERNAL_SERVER_ERROR) {}
 };
 
 
@@ -837,8 +850,8 @@ struct NotImplemented : Response
   NotImplemented()
     : NotImplemented("501 Not Implemented.") {}
 
-  explicit NotImplemented(const std::string& body)
-    : Response(body, Status::NOT_IMPLEMENTED) {}
+  explicit NotImplemented(std::string body)
+    : Response(std::move(body), Status::NOT_IMPLEMENTED) {}
 };
 
 
@@ -847,8 +860,8 @@ struct ServiceUnavailable : Response
   ServiceUnavailable()
     : ServiceUnavailable("503 Service Unavailable.") {}
 
-  explicit ServiceUnavailable(const std::string& body)
-    : Response(body, Status::SERVICE_UNAVAILABLE) {}
+  explicit ServiceUnavailable(std::string body)
+    : Response(std::move(body), Status::SERVICE_UNAVAILABLE) {}
 };
 
 
@@ -986,7 +999,9 @@ private:
       const network::Address& _peerAddress);
 
   friend Future<Connection> connect(
-      const network::Address& address, Scheme scheme);
+      const network::Address& address,
+      Scheme scheme,
+      const Option<std::string>& peer_hostname);
   friend Future<Connection> connect(const URL&);
 
   // Forward declaration.
@@ -994,6 +1009,12 @@ private:
 
   std::shared_ptr<Data> data;
 };
+
+
+Future<Connection> connect(
+    const network::Address& address,
+    Scheme scheme,
+    const Option<std::string>& peer_hostname);
 
 
 Future<Connection> connect(const network::Address& address, Scheme scheme);

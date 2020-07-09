@@ -16,11 +16,10 @@
 
 #include "resource_provider/storage/uri_disk_profile_adaptor.hpp"
 
+#include <algorithm>
 #include <map>
 #include <string>
 #include <tuple>
-
-#include <csi/spec.hpp>
 
 #include <mesos/type_utils.hpp>
 
@@ -41,7 +40,7 @@
 #include <stout/result.hpp>
 #include <stout/strings.hpp>
 
-#include "csi/utils.hpp"
+#include "csi/v0_utils.hpp"
 
 #include "resource_provider/storage/disk_profile_utils.hpp"
 
@@ -102,8 +101,7 @@ Future<hashset<string>> UriDiskProfileAdaptor::watch(
 UriDiskProfileAdaptorProcess::UriDiskProfileAdaptorProcess(
     const UriDiskProfileAdaptor::Flags& _flags)
   : ProcessBase(ID::generate("uri-disk-profile-adaptor")),
-    flags(_flags),
-    watchPromise(new Promise<Nothing>()) {}
+    flags(_flags) {}
 
 
 void UriDiskProfileAdaptorProcess::initialize()
@@ -132,7 +130,7 @@ Future<DiskProfileAdaptor::ProfileInfo>
   }
 
   return DiskProfileAdaptor::ProfileInfo{
-    manifest.volume_capabilities(),
+    csi::v0::devolve(manifest.volume_capabilities()),
     manifest.create_parameters()
   };
 }
@@ -142,24 +140,24 @@ Future<hashset<string>> UriDiskProfileAdaptorProcess::watch(
     const hashset<string>& knownProfiles,
     const ResourceProviderInfo& resourceProviderInfo)
 {
-  // Calculate the new set of profiles for the resource provider.
-  hashset<string> newProfiles;
-  foreachpair (const string& profile,
-               const ProfileRecord& record,
-               profileMatrix) {
+  // Calculate the current set of profiles for the resource provider.
+  hashset<string> currentProfiles;
+  foreachpair (
+      const string& profile, const ProfileRecord& record, profileMatrix) {
     if (record.active &&
         isSelectedResourceProvider(record.manifest, resourceProviderInfo)) {
-      newProfiles.insert(profile);
+      currentProfiles.insert(profile);
     }
   }
 
-  if (newProfiles != knownProfiles) {
-    return newProfiles;
+  if (currentProfiles != knownProfiles) {
+    return currentProfiles;
   }
 
   // Wait for the next update if there is no change.
-  return watchPromise->future()
-    .then(defer(self(), &Self::watch, knownProfiles, resourceProviderInfo));
+  watchers.emplace_back(knownProfiles, resourceProviderInfo);
+
+  return watchers.back().promise.future();
 }
 
 
@@ -274,12 +272,35 @@ void UriDiskProfileAdaptorProcess::notify(
     profileMatrix.put(entry.first, {entry.second, true});
   }
 
-  // Notify any watchers and then prepare a new promise for the next
-  // iteration of polling.
+  // Notify a watcher if its current set of profiles differs from its known set.
   //
   // TODO(josephw): Delay this based on the `--max_random_wait` option.
-  watchPromise->set(Nothing());
-  watchPromise.reset(new Promise<Nothing>());
+  foreach (WatcherData& watcher, watchers) {
+    hashset<string> current;
+    foreachpair (
+        const string& profile, const ProfileRecord& record, profileMatrix) {
+      if (record.active &&
+          isSelectedResourceProvider(record.manifest, watcher.info)) {
+        current.insert(profile);
+      }
+    }
+
+    if (current != watcher.known) {
+      CHECK(watcher.promise.set(current))
+        << "Promise for watcher '" << watcher.info << "' is already "
+        << watcher.promise.future();
+    }
+  }
+
+  // Remove all notified watchers.
+  watchers.erase(
+      std::remove_if(
+          watchers.begin(),
+          watchers.end(),
+          [](const WatcherData& watcher) {
+            return watcher.promise.future().isReady();
+          }),
+      watchers.end());
 
   LOG(INFO)
     << "Updated disk profile mapping to " << parsed.profile_matrix().size()

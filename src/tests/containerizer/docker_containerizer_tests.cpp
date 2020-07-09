@@ -20,6 +20,8 @@
 
 #include <mesos/slave/container_logger.hpp>
 
+#include <mesos/v1/mesos.hpp>
+
 #include <process/collect.hpp>
 #include <process/future.hpp>
 #include <process/gmock.hpp>
@@ -944,7 +946,7 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_Usage)
   ASSERT_SOME(master);
 
   slave::Flags flags = CreateSlaveFlags();
-  flags.resources = Option<string>("cpus:2;mem:1024");
+  flags.resources = Option<string>("cpus:1;mem:1024");
 
   MockDocker* mockDocker =
     new MockDocker(tests::flags.docker, tests::flags.docker_socket);
@@ -998,10 +1000,22 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_Usage)
   command.set_value("dd if=/dev/zero of=/dev/null");
 #endif // __WINDOWS__
 
+  Value::Scalar cpuLimit, memLimit;
+  cpuLimit.set_value(2);
+  memLimit.set_value(2048);
+
+  google::protobuf::Map<string, Value::Scalar> resourceLimits;
+  resourceLimits.insert({"cpus", cpuLimit});
+  resourceLimits.insert({"mem", memLimit});
+
   TaskInfo task = createTask(
       offers->front().slave_id(),
       offers->front().resources(),
-      command);
+      command,
+      None(),
+      "test-task",
+      id::UUID::random().toString(),
+      resourceLimits);
 
   // TODO(tnachen): Use local image to test if possible.
   task.mutable_container()->CopyFrom(createDockerInfo(DOCKER_TEST_IMAGE));
@@ -1013,7 +1027,7 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_Usage)
                            &MockDockerContainerizer::_launch)));
 
   // We ignore all update calls to prevent resizing cgroup limits.
-  EXPECT_CALL(dockerContainerizer, update(_, _))
+  EXPECT_CALL(dockerContainerizer, update(_, _, _))
     .WillRepeatedly(Return(Nothing()));
 
   Future<TaskStatus> statusStarting;
@@ -1054,10 +1068,11 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_Usage)
     waited += Milliseconds(200);
   } while (waited < Seconds(3));
 
-  // Usage includes the executor resources.
-  EXPECT_EQ(2.0 + slave::DEFAULT_EXECUTOR_CPUS, statistics.cpus_limit());
-  EXPECT_EQ((Gigabytes(1) + slave::DEFAULT_EXECUTOR_MEM).bytes(),
-            statistics.mem_limit_bytes());
+  EXPECT_EQ(1, statistics.cpus_soft_limit());
+  EXPECT_EQ(2, statistics.cpus_limit());
+  EXPECT_EQ(Gigabytes(1).bytes(), statistics.mem_soft_limit_bytes());
+  EXPECT_EQ(Gigabytes(2).bytes(), statistics.mem_limit_bytes());
+
 #ifndef __WINDOWS__
   // These aren't provided by the Windows Container APIs, so skip them.
   EXPECT_LT(0, statistics.cpus_user_time_secs());
@@ -1082,163 +1097,6 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_Usage)
   driver.stop();
   driver.join();
 }
-
-
-#ifdef __linux__
-TEST_F(DockerContainerizerTest, ROOT_DOCKER_Update)
-{
-  Try<Owned<cluster::Master>> master = StartMaster();
-  ASSERT_SOME(master);
-
-  MockDocker* mockDocker =
-    new MockDocker(tests::flags.docker, tests::flags.docker_socket);
-
-  Shared<Docker> docker(mockDocker);
-
-  slave::Flags flags = CreateSlaveFlags();
-
-  Fetcher fetcher(flags);
-
-  Try<ContainerLogger*> logger =
-    ContainerLogger::create(flags.container_logger);
-
-  ASSERT_SOME(logger);
-
-  MockDockerContainerizer dockerContainerizer(
-      flags,
-      &fetcher,
-      Owned<ContainerLogger>(logger.get()),
-      docker);
-
-  Owned<MasterDetector> detector = master.get()->createDetector();
-
-  Try<Owned<cluster::Slave>> slave =
-    StartSlave(detector.get(), &dockerContainerizer, flags);
-  ASSERT_SOME(slave);
-
-  MockScheduler sched;
-  MesosSchedulerDriver driver(
-      &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
-
-  Future<FrameworkID> frameworkId;
-  EXPECT_CALL(sched, registered(&driver, _, _))
-    .WillOnce(FutureArg<1>(&frameworkId));
-
-  Future<vector<Offer>> offers;
-  EXPECT_CALL(sched, resourceOffers(&driver, _))
-    .WillOnce(FutureArg<1>(&offers))
-    .WillRepeatedly(Return()); // Ignore subsequent offers.
-
-  driver.start();
-
-  AWAIT_READY(frameworkId);
-
-  AWAIT_READY(offers);
-  ASSERT_FALSE(offers->empty());
-
-  TaskInfo task = createTask(
-      offers->front().slave_id(),
-      offers->front().resources(),
-      SLEEP_COMMAND(1000));
-
-  // TODO(tnachen): Use local image to test if possible.
-  task.mutable_container()->CopyFrom(createDockerInfo("alpine"));
-
-  Future<ContainerID> containerId;
-  EXPECT_CALL(dockerContainerizer, launch(_, _, _, _))
-    .WillOnce(DoAll(FutureArg<0>(&containerId),
-                    Invoke(&dockerContainerizer,
-                           &MockDockerContainerizer::_launch)));
-
-  Future<TaskStatus> statusStarting;
-  Future<TaskStatus> statusRunning;
-  EXPECT_CALL(sched, statusUpdate(&driver, _))
-    .WillOnce(FutureArg<1>(&statusStarting))
-    .WillOnce(FutureArg<1>(&statusRunning))
-    .WillRepeatedly(DoDefault());
-
-  driver.launchTasks(offers.get()[0].id(), {task});
-
-  AWAIT_READY(containerId);
-
-  AWAIT_READY_FOR(statusStarting, Seconds(60));
-  EXPECT_EQ(TASK_STARTING, statusStarting->state());
-
-  AWAIT_READY_FOR(statusRunning, Seconds(60));
-  EXPECT_EQ(TASK_RUNNING, statusRunning->state());
-
-  ASSERT_TRUE(
-    exists(docker, containerId.get(), ContainerState::RUNNING));
-
-  string name = containerName(containerId.get());
-
-  Future<Docker::Container> inspect = docker->inspect(name);
-
-  AWAIT_READY(inspect);
-
-  Try<Resources> newResources = Resources::parse("cpus:1;mem:128");
-
-  ASSERT_SOME(newResources);
-
-  Future<Nothing> update =
-    dockerContainerizer.update(containerId.get(), newResources.get());
-
-  AWAIT_READY(update);
-
-  Result<string> cpuHierarchy = cgroups::hierarchy("cpu");
-  Result<string> memoryHierarchy = cgroups::hierarchy("memory");
-
-  ASSERT_SOME(cpuHierarchy);
-  ASSERT_SOME(memoryHierarchy);
-
-  Option<pid_t> pid = inspect->pid;
-  ASSERT_SOME(pid);
-
-  Result<string> cpuCgroup = cgroups::cpu::cgroup(pid.get());
-  ASSERT_SOME(cpuCgroup);
-
-  Result<string> memoryCgroup = cgroups::memory::cgroup(pid.get());
-  ASSERT_SOME(memoryCgroup);
-
-  Try<uint64_t> cpu = cgroups::cpu::shares(
-      cpuHierarchy.get(),
-      cpuCgroup.get());
-
-  ASSERT_SOME(cpu);
-
-  Try<Bytes> mem = cgroups::memory::soft_limit_in_bytes(
-      memoryHierarchy.get(),
-      memoryCgroup.get());
-
-  ASSERT_SOME(mem);
-
-  EXPECT_EQ(1024u, cpu.get());
-  EXPECT_EQ(128u, mem->bytes() / Bytes::MEGABYTES);
-
-  newResources = Resources::parse("cpus:1;mem:144");
-
-  // Issue second update that uses the cached pid instead of inspect.
-  update = dockerContainerizer.update(containerId.get(), newResources.get());
-
-  AWAIT_READY(update);
-
-  cpu = cgroups::cpu::shares(cpuHierarchy.get(), cpuCgroup.get());
-
-  ASSERT_SOME(cpu);
-
-  mem = cgroups::memory::soft_limit_in_bytes(
-      memoryHierarchy.get(),
-      memoryCgroup.get());
-
-  ASSERT_SOME(mem);
-
-  EXPECT_EQ(1024u, cpu.get());
-  EXPECT_EQ(144u, mem->bytes() / Bytes::MEGABYTES);
-
-  driver.stop();
-  driver.join();
-}
-#endif // __linux__
 
 
 TEST_F(DockerContainerizerTest, ROOT_DOCKER_Recover)
@@ -3539,7 +3397,7 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_ExecutorCleanupWhenLaunchFailed)
                            &MockDockerContainerizer::_launch)));
 
   // Fail the update so we don't proceed to send run task to the executor.
-  EXPECT_CALL(dockerContainerizer, update(_, _))
+  EXPECT_CALL(dockerContainerizer, update(_, _, _))
     .WillRepeatedly(Return(Failure("Fail resource update")));
 
   driver.launchTasks(offers.get()[0].id(), {task});
@@ -4185,11 +4043,11 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_NoTransitionFromKillingToFinished)
 #endif // __WINDOWS__
 
 
+#ifdef __linux__
 // This test ensures that when `cgroups_enable_cfs` is set on agent,
 // the docker container launched through docker containerizer has
 // `cpuQuotas` limit.
 // Cgroups cpu quota is only available on Linux.
-#ifdef __linux__
 TEST_F(DockerContainerizerTest, ROOT_DOCKER_CGROUPS_CFS_CgroupsEnableCFS)
 {
   Try<Owned<cluster::Master>> master = StartMaster();
@@ -4295,6 +4153,335 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_CGROUPS_CFS_CgroupsEnableCFS)
 
   const Duration expectedCpuQuota = mesos::internal::slave::CPU_CFS_PERIOD * 1;
   EXPECT_EQ(expectedCpuQuota, cfsQuota.get());
+
+  Future<Option<ContainerTermination>> termination =
+    dockerContainerizer.wait(containerId.get());
+
+  driver.stop();
+  driver.join();
+
+  AWAIT_READY(termination);
+  EXPECT_SOME(termination.get());
+}
+
+
+// This test verifies that a task launched with resource limits specified
+// will have its CPU and memory's soft & hard limits and OOM score adjustment
+// set correctly.
+TEST_F(DockerContainerizerTest, ROOT_DOCKER_CGROUPS_CFS_CommandTaskLimits)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  MockDocker* mockDocker =
+    new MockDocker(tests::flags.docker, tests::flags.docker_socket);
+
+  Shared<Docker> docker(mockDocker);
+
+  // Start agent with 2 CPUs and total host memory.
+  Try<os::Memory> memory = os::memory();
+  ASSERT_SOME(memory);
+
+  uint64_t totalMemInMB = memory->total.bytes() / 1024 / 1024;
+
+  slave::Flags flags = CreateSlaveFlags();
+  flags.resources =
+    strings::format("cpus:2;mem:%d", totalMemInMB).get();
+
+  Fetcher fetcher(flags);
+
+  Try<ContainerLogger*> logger =
+    ContainerLogger::create(flags.container_logger);
+
+  ASSERT_SOME(logger);
+
+  MockDockerContainerizer dockerContainerizer(
+      flags,
+      &fetcher,
+      Owned<ContainerLogger>(logger.get()),
+      docker);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  Try<Owned<cluster::Slave>> slave =
+    StartSlave(detector.get(), &dockerContainerizer, flags);
+
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  Future<FrameworkID> frameworkId;
+  EXPECT_CALL(sched, registered(&driver, _, _))
+    .WillOnce(FutureArg<1>(&frameworkId));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(frameworkId);
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->empty());
+
+  // Launch a task with 1 cpu request, 2 cpu limit, half of host total
+  // memory as memory request and host total memory as memory limit.
+  string resourceRequests = strings::format(
+      "cpus:1;mem:%d;disk:1024",
+      totalMemInMB/2).get();
+
+  Value::Scalar cpuLimit, memLimit;
+  cpuLimit.set_value(2);
+  memLimit.set_value(totalMemInMB);
+
+  google::protobuf::Map<string, Value::Scalar> resourceLimits;
+  resourceLimits.insert({"cpus", cpuLimit});
+  resourceLimits.insert({"mem", memLimit});
+
+  TaskInfo task = createTask(
+      offers.get()[0].slave_id(),
+      Resources::parse(resourceRequests).get(),
+      SLEEP_COMMAND(1000),
+      None(),
+      "test-task",
+      id::UUID::random().toString(),
+      resourceLimits);
+
+  // TODO(tnachen): Use local image to test if possible.
+  task.mutable_container()->CopyFrom(createDockerInfo("alpine"));
+
+  Future<ContainerID> containerId;
+  EXPECT_CALL(dockerContainerizer, launch(_, _, _, _))
+    .WillOnce(DoAll(FutureArg<0>(&containerId),
+                    Invoke(&dockerContainerizer,
+                           &MockDockerContainerizer::_launch)));
+
+  Future<TaskStatus> statusStarting;
+  Future<TaskStatus> statusRunning;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
+    .WillOnce(FutureArg<1>(&statusRunning))
+    .WillRepeatedly(DoDefault());
+
+  driver.launchTasks(offers.get()[0].id(), {task});
+
+  AWAIT_READY_FOR(containerId, Seconds(60));
+  AWAIT_READY_FOR(statusStarting, Seconds(60));
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
+  AWAIT_READY_FOR(statusRunning, Seconds(60));
+  EXPECT_EQ(TASK_RUNNING, statusRunning->state());
+  ASSERT_TRUE(statusRunning->has_data());
+
+  string name = containerName(containerId.get());
+  Future<Docker::Container> inspect = docker->inspect(name);
+  AWAIT_READY(inspect);
+
+  Result<string> cpuHierarchy = cgroups::hierarchy("cpu");
+  Result<string> memoryHierarchy = cgroups::hierarchy("memory");
+
+  ASSERT_SOME(cpuHierarchy);
+  ASSERT_SOME(memoryHierarchy);
+
+  Option<pid_t> pid = inspect->pid;
+  ASSERT_SOME(pid);
+
+  Result<string> cpuCgroup = cgroups::cpu::cgroup(pid.get());
+  ASSERT_SOME(cpuCgroup);
+
+  EXPECT_SOME_EQ(
+      mesos::internal::slave::CPU_SHARES_PER_CPU,
+      cgroups::cpu::shares(cpuHierarchy.get(), cpuCgroup.get()));
+
+  Try<Duration> cfsQuota =
+    cgroups::cpu::cfs_quota_us(cpuHierarchy.get(), cpuCgroup.get());
+
+  ASSERT_SOME(cfsQuota);
+
+  const Duration expectedCpuQuota =
+    mesos::internal::slave::CPU_CFS_PERIOD * cpuLimit.value();
+
+  EXPECT_EQ(expectedCpuQuota, cfsQuota.get());
+
+  Result<string> memoryCgroup = cgroups::memory::cgroup(pid.get());
+  ASSERT_SOME(memoryCgroup);
+
+  EXPECT_SOME_EQ(
+      Megabytes(totalMemInMB/2),
+      cgroups::memory::soft_limit_in_bytes(
+          memoryHierarchy.get(), memoryCgroup.get()));
+
+  EXPECT_SOME_EQ(
+      Megabytes(memLimit.value()),
+      cgroups::memory::limit_in_bytes(
+          memoryHierarchy.get(), memoryCgroup.get()));
+
+  // Ensure the OOM score adjustment is correctly set for the container.
+  Try<string> read = os::read(
+      strings::format("/proc/%d/oom_score_adj", pid.get()).get());
+
+  ASSERT_SOME(read);
+
+  // Since the memory request is half of host total memory so the OOM score
+  // adjustment should be about 500.
+  Try<int32_t> oomScoreAdj = numify<int32_t>(strings::trim(read.get()));
+  ASSERT_SOME(oomScoreAdj);
+
+  EXPECT_GT(502, oomScoreAdj.get());
+  EXPECT_LT(498, oomScoreAdj.get());
+
+  Future<Option<ContainerTermination>> termination =
+    dockerContainerizer.wait(containerId.get());
+
+  driver.stop();
+  driver.join();
+
+  AWAIT_READY(termination);
+  EXPECT_SOME(termination.get());
+}
+
+
+// This test verifies that a task launched with infinite resource
+// limits specified will have its CPU and memory's hard limits set
+// correctly to infinite values.
+TEST_F(
+    DockerContainerizerTest,
+    ROOT_DOCKER_CGROUPS_CFS_CommandTaskInfiniteLimits)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  MockDocker* mockDocker =
+    new MockDocker(tests::flags.docker, tests::flags.docker_socket);
+
+  Shared<Docker> docker(mockDocker);
+
+  slave::Flags flags = CreateSlaveFlags();
+
+  Fetcher fetcher(flags);
+
+  Try<ContainerLogger*> logger =
+    ContainerLogger::create(flags.container_logger);
+
+  ASSERT_SOME(logger);
+
+  MockDockerContainerizer dockerContainerizer(
+      flags,
+      &fetcher,
+      Owned<ContainerLogger>(logger.get()),
+      docker);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  Try<Owned<cluster::Slave>> slave =
+    StartSlave(detector.get(), &dockerContainerizer, flags);
+
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  Future<FrameworkID> frameworkId;
+  EXPECT_CALL(sched, registered(&driver, _, _))
+    .WillOnce(FutureArg<1>(&frameworkId));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(frameworkId);
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->empty());
+
+  // Launch a task with infinite resource limits.
+  Value::Scalar cpuLimit, memLimit;
+  cpuLimit.set_value(std::numeric_limits<double>::infinity());
+  memLimit.set_value(std::numeric_limits<double>::infinity());
+
+  google::protobuf::Map<string, Value::Scalar> resourceLimits;
+  resourceLimits.insert({"cpus", cpuLimit});
+  resourceLimits.insert({"mem", memLimit});
+
+  TaskInfo task = createTask(
+      offers.get()[0].slave_id(),
+      offers.get()[0].resources(),
+      SLEEP_COMMAND(1000),
+      None(),
+      "test-task",
+      id::UUID::random().toString(),
+      resourceLimits);
+
+  // TODO(tnachen): Use local image to test if possible.
+  task.mutable_container()->CopyFrom(createDockerInfo("alpine"));
+
+  Future<ContainerID> containerId;
+  EXPECT_CALL(dockerContainerizer, launch(_, _, _, _))
+    .WillOnce(DoAll(FutureArg<0>(&containerId),
+                    Invoke(&dockerContainerizer,
+                           &MockDockerContainerizer::_launch)));
+
+  Future<TaskStatus> statusStarting;
+  Future<TaskStatus> statusRunning;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
+    .WillOnce(FutureArg<1>(&statusRunning))
+    .WillRepeatedly(DoDefault());
+
+  driver.launchTasks(offers.get()[0].id(), {task});
+
+  AWAIT_READY_FOR(containerId, Seconds(60));
+  AWAIT_READY_FOR(statusStarting, Seconds(60));
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
+  AWAIT_READY_FOR(statusRunning, Seconds(60));
+  EXPECT_EQ(TASK_RUNNING, statusRunning->state());
+  ASSERT_TRUE(statusRunning->has_data());
+
+  string name = containerName(containerId.get());
+  Future<Docker::Container> inspect = docker->inspect(name);
+  AWAIT_READY(inspect);
+
+  Result<string> cpuHierarchy = cgroups::hierarchy("cpu");
+  Result<string> memoryHierarchy = cgroups::hierarchy("memory");
+
+  ASSERT_SOME(cpuHierarchy);
+  ASSERT_SOME(memoryHierarchy);
+
+  Option<pid_t> pid = inspect->pid;
+  ASSERT_SOME(pid);
+
+  Result<string> cpuCgroup = cgroups::cpu::cgroup(pid.get());
+  ASSERT_SOME(cpuCgroup);
+
+  // The CFS quota should be -1 which means infinite quota.
+  Try<string> quota =
+    cgroups::read(cpuHierarchy.get(), cpuCgroup.get(), "cpu.cfs_quota_us");
+
+  ASSERT_SOME(quota);
+  EXPECT_EQ("-1", strings::trim(quota.get()));
+
+  Result<string> memoryCgroup = cgroups::memory::cgroup(pid.get());
+  ASSERT_SOME(memoryCgroup);
+
+  // Root cgroup (e.g., `/sys/fs/cgroup/memory/`) cannot have any limits set, so
+  // its hard limit must be infinity.
+  Try<Bytes> rootCgrouplimit =
+    cgroups::memory::limit_in_bytes(memoryHierarchy.get(), "");
+
+  ASSERT_SOME(rootCgrouplimit);
+
+  // The memory hard limit should be same as root cgroup's, i.e. infinity.
+  EXPECT_SOME_EQ(
+      rootCgrouplimit.get(),
+      cgroups::memory::limit_in_bytes(
+          memoryHierarchy.get(), memoryCgroup.get()));
 
   Future<Option<ContainerTermination>> termination =
     dockerContainerizer.wait(containerId.get());
@@ -4625,6 +4812,115 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_DefaultDNS)
 
   AWAIT_READY(termination);
   EXPECT_SOME(termination.get());
+}
+
+
+// This test verifies that the `MESOS_ALLOCATION_ROLE`
+// environment variable is set properly.
+TEST_F(DockerContainerizerTest, ROOT_DOCKER_AllocationRoleEnvironmentVariable)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  MockDocker* mockDocker =
+    new MockDocker(tests::flags.docker, tests::flags.docker_socket);
+
+  Shared<Docker> docker(mockDocker);
+
+  slave::Flags flags = CreateSlaveFlags();
+
+  Fetcher fetcher(flags);
+
+  Try<ContainerLogger*> logger =
+    ContainerLogger::create(flags.container_logger);
+
+  ASSERT_SOME(logger);
+
+  MockDockerContainerizer dockerContainerizer(
+      flags,
+      &fetcher,
+      Owned<ContainerLogger>(logger.get()),
+      docker);
+
+  // We skip stopping the docker container because stopping a container
+  // even when it terminated might not flush the logs and we end up
+  // not getting stdout/stderr in our tests.
+  EXPECT_CALL(*mockDocker, stop(_, _, _))
+    .WillRepeatedly(Return(Nothing()));
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  Try<Owned<cluster::Slave>> slave =
+    StartSlave(detector.get(), &dockerContainerizer, flags);
+  ASSERT_SOME(slave);
+
+  // Start the framework with a role specified.
+  FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
+  frameworkInfo.clear_roles();
+  frameworkInfo.add_roles("role1");
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, frameworkInfo, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  Future<FrameworkID> frameworkId;
+  EXPECT_CALL(sched, registered(&driver, _, _))
+    .WillOnce(FutureArg<1>(&frameworkId));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(frameworkId);
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->empty());
+
+  TaskInfo task = createTask(
+      offers->front().slave_id(),
+      offers->front().resources(),
+#ifdef __WINDOWS__
+      "if %MESOS_ALLOCATION_ROLE% == \"role1\" (exit 1)");
+#else
+      "if [ \"$MESOS_ALLOCATION_ROLE\" != \"role1\" ]; then exit 1; fi");
+#endif // __WINDOWS__
+
+  // TODO(tnachen): Use local image to test if possible.
+  task.mutable_container()->CopyFrom(createDockerInfo(DOCKER_TEST_IMAGE));
+
+  Future<ContainerID> containerId;
+  Future<ContainerConfig> containerConfig;
+  EXPECT_CALL(dockerContainerizer, launch(_, _, _, _))
+    .WillOnce(DoAll(FutureArg<0>(&containerId),
+                    FutureArg<1>(&containerConfig),
+                    Invoke(&dockerContainerizer,
+                           &MockDockerContainerizer::_launch)));
+
+  Future<TaskStatus> statusStarting;
+  Future<TaskStatus> statusRunning;
+  Future<TaskStatus> statusFinished;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
+    .WillOnce(FutureArg<1>(&statusRunning))
+    .WillOnce(FutureArg<1>(&statusFinished))
+    .WillRepeatedly(DoDefault());
+
+  driver.launchTasks(offers.get()[0].id(), {task});
+
+  AWAIT_READY_FOR(containerId, Seconds(60));
+  AWAIT_READY(containerConfig);
+  AWAIT_READY_FOR(statusStarting, Seconds(60));
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
+  AWAIT_READY_FOR(statusRunning, Seconds(60));
+  EXPECT_EQ(TASK_RUNNING, statusRunning->state());
+  AWAIT_READY_FOR(statusFinished, Seconds(60));
+  EXPECT_EQ(TASK_FINISHED, statusFinished->state());
+
+  driver.stop();
+  driver.join();
 }
 
 
@@ -5238,6 +5534,176 @@ TEST_F(HungDockerTest, ROOT_DOCKER_InspectHungDuringPull)
 
   driver.stop();
   driver.join();
+}
+
+
+// This test is disabled on windows due to the bash-specific
+// command used in the task below.
+TEST_F_TEMP_DISABLED_ON_WINDOWS(
+    DockerContainerizerTest, ROOT_DOCKER_OverrideKillPolicy)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  MockDocker* mockDocker =
+    new MockDocker(tests::flags.docker, tests::flags.docker_socket);
+
+  Shared<Docker> docker(mockDocker);
+
+  slave::Flags flags = CreateSlaveFlags();
+
+  Fetcher fetcher(flags);
+
+  Try<ContainerLogger*> logger =
+    ContainerLogger::create(flags.container_logger);
+
+  ASSERT_SOME(logger);
+
+  Future<SlaveRegisteredMessage> slaveRegisteredMessage =
+    FUTURE_PROTOBUF(SlaveRegisteredMessage(), _, _);
+
+  MockDockerContainerizer dockerContainerizer(
+      flags,
+      &fetcher,
+      Owned<ContainerLogger>(logger.get()),
+      docker);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  Try<Owned<cluster::Slave>> slave =
+    StartSlave(detector.get(), &dockerContainerizer, flags);
+  ASSERT_SOME(slave);
+
+  AWAIT_READY(slaveRegisteredMessage);
+
+  auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
+
+  EXPECT_CALL(*scheduler, connected(_))
+    .WillOnce(v1::scheduler::SendSubscribe(v1::DEFAULT_FRAMEWORK_INFO));
+
+  Future<v1::scheduler::Event::Subscribed> subscribed;
+  EXPECT_CALL(*scheduler, subscribed(_, _))
+    .WillOnce(FutureArg<1>(&subscribed));
+
+  Future<v1::scheduler::Event::Offers> offers;
+  EXPECT_CALL(*scheduler, offers(_, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return());
+
+  EXPECT_CALL(*scheduler, heartbeat(_))
+    .WillRepeatedly(Return()); // Ignore heartbeats.
+
+  v1::scheduler::TestMesos mesos(
+      master.get()->pid,
+      ContentType::PROTOBUF,
+      scheduler);
+
+  AWAIT_READY(subscribed);
+  v1::FrameworkID frameworkId(subscribed->framework_id());
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->offers().empty());
+
+  const v1::Offer& offer = offers->offers(0);
+  const v1::AgentID& agentId = offer.agent_id();
+
+  Try<v1::Resources> parsed =
+    v1::Resources::parse("cpus:0.1;mem:32;disk:32");
+
+  ASSERT_SOME(parsed);
+
+  v1::Resources resources = parsed.get();
+
+  // Create a task which ignores SIGTERM so that we can detect
+  // when the task receives SIGKILL.
+  v1::TaskInfo taskInfo = v1::createTask(
+      agentId,
+      resources,
+      "trap \"echo 'SIGTERM received'\" SIGTERM; sleep 999999");
+
+  // TODO(tnachen): Use local image to test if possible.
+  taskInfo.mutable_container()->CopyFrom(
+      evolve(createDockerInfo(DOCKER_TEST_IMAGE)));
+
+  {
+    // Set a long grace period on the task's kill policy so that we
+    // can detect if the override is effective.
+    mesos::v1::DurationInfo gracePeriod;
+    gracePeriod.set_nanoseconds(Minutes(10).ns());
+
+    mesos::v1::KillPolicy killPolicy;
+    killPolicy.mutable_grace_period()->CopyFrom(gracePeriod);
+
+    taskInfo.mutable_kill_policy()->CopyFrom(killPolicy);
+  }
+
+  Future<ContainerID> containerId;
+  EXPECT_CALL(dockerContainerizer, launch(_, _, _, _))
+    .WillOnce(DoAll(FutureArg<0>(&containerId),
+                    Invoke(&dockerContainerizer,
+                           &MockDockerContainerizer::_launch)));
+
+  Future<v1::scheduler::Event::Update> startingUpdate;
+  Future<v1::scheduler::Event::Update> runningUpdate;
+  EXPECT_CALL(*scheduler, update(_, _))
+    .WillOnce(DoAll(
+        FutureArg<1>(&startingUpdate),
+        v1::scheduler::SendAcknowledge(frameworkId, agentId)))
+    .WillOnce(DoAll(
+        FutureArg<1>(&runningUpdate),
+        v1::scheduler::SendAcknowledge(frameworkId, agentId)));
+
+  mesos.send(
+      v1::createCallAccept(
+          frameworkId,
+          offer,
+          {v1::LAUNCH({taskInfo})}));
+
+  AWAIT_READY_FOR(containerId, Seconds(60));
+  AWAIT_READY_FOR(startingUpdate, Seconds(60));
+  EXPECT_EQ(v1::TASK_STARTING, startingUpdate->status().state());
+  AWAIT_READY_FOR(runningUpdate, Seconds(60));
+  EXPECT_EQ(v1::TASK_RUNNING, runningUpdate->status().state());
+
+  ASSERT_TRUE(
+    exists(docker, containerId.get(), ContainerState::RUNNING));
+
+  Future<v1::scheduler::Event::Update> killedUpdate;
+  EXPECT_CALL(*scheduler, update(_, _))
+    .WillOnce(FutureArg<1>(&killedUpdate));
+
+  Future<Option<ContainerTermination>> termination =
+    dockerContainerizer.wait(containerId.get());
+
+  {
+    // Set a short grace period on the kill call so that we
+    // can detect if the override is effective.
+    mesos::v1::DurationInfo gracePeriod;
+    gracePeriod.set_nanoseconds(100);
+
+    mesos::v1::KillPolicy killPolicy;
+    killPolicy.mutable_grace_period()->CopyFrom(gracePeriod);
+
+    mesos.send(
+        v1::createCallKill(
+            frameworkId,
+            taskInfo.task_id(),
+            agentId,
+            killPolicy));
+  }
+
+  AWAIT_READY(killedUpdate);
+  EXPECT_EQ(v1::TASK_KILLED, killedUpdate->status().state());
+
+  AWAIT_READY(termination);
+  EXPECT_SOME(termination.get());
+
+  // Even though the task is killed, the executor should exit gracefully.
+  ASSERT_TRUE(termination.get()->has_status());
+  EXPECT_EQ(0, termination.get()->status());
+
+  ASSERT_FALSE(
+      exists(docker, containerId.get(), ContainerState::RUNNING, false));
 }
 
 } // namespace tests {

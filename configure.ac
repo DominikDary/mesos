@@ -18,7 +18,7 @@
 # Process this file with autoconf to produce a configure script.
 
 AC_PREREQ([2.61])
-AC_INIT([mesos], [1.8.0])
+AC_INIT([mesos], [1.11.0])
 
 # Have autoconf setup some variables related to the system.
 AC_CANONICAL_HOST
@@ -200,8 +200,6 @@ AC_CONFIG_FILES([include/mesos/version.hpp])
 
 AC_CONFIG_FILES([src/java/generated/org/apache/mesos/MesosNativeLibrary.java])
 
-AC_CONFIG_FILES([mpi/mpiexec-mesos], [chmod +x mpi/mpiexec-mesos])
-
 
 ###############################################################################
 # Optional features.
@@ -267,6 +265,11 @@ AC_ARG_ENABLE([java],
               AS_HELP_STRING([--disable-java],
                              [do not build Java bindings]),
               [], [enable_java=yes])
+
+AC_ARG_ENABLE([nvml],
+              AS_HELP_STRING([--disable-nvml],
+                             [do not use the NVML headers]),
+              [], [enable_nvml=yes])
 
 # TODO(bevers): Eventually make this enabled by default.
 AC_ARG_ENABLE([jemalloc-allocator],
@@ -854,6 +857,63 @@ else
   AC_CHECK_LIB(unwind, backtrace, LIBS="$LIBS -lunwind")
 fi
 
+
+# Check if libssl prefix path was provided, and if so, add it to
+# the CPPFLAGS and LDFLAGS with respective /include and /lib path
+# suffixes.
+if test -z "`echo $with_ssl`" &&
+   test "$OS_NAME" = "darwin" &&
+   test -n "`command -v brew`" &&
+   test -n "`brew list --versions openssl`"; then
+  with_ssl=`brew --prefix openssl`
+fi
+
+if test -n "`echo $with_ssl`"; then
+  SSL_CPPFLAGS="-I${with_ssl}/include"
+  SSL_LINKERFLAGS="-L${with_ssl}/lib"
+
+  CPPFLAGS="$SSL_CPPFLAGS $CPPFLAGS"
+  LDFLAGS="$SSL_LINKERFLAGS $LDFLAGS"
+fi
+
+AC_CHECK_LIB([crypto], [RAND_poll], [found_crypto=yes])
+
+AC_CHECK_HEADERS([openssl/ssl.h],
+                 [AC_CHECK_LIB([ssl],
+                               [SSL_CTX_new],
+                               [found_ssl=yes],
+                               [],
+                               [-lcrypto])])
+
+if test "x$enable_ssl" = "xyes"; then
+  if test "x$found_ssl" != "xyes"; then
+    AC_MSG_ERROR([cannot find libssl
+-------------------------------------------------------------------
+libssl is required for an SSL-enabled build.
+-------------------------------------------------------------------
+    ])
+  fi
+
+  if test "x$found_crypto" != "xyes"; then
+    AC_MSG_ERROR([cannot find libcrypto
+-------------------------------------------------------------------
+libcrypto is required for an SSL-enabled build.
+-------------------------------------------------------------------
+    ])
+  fi
+
+  LIBS="-lssl -lcrypto $LIBS"
+
+  AC_DEFINE([USE_SSL_SOCKET], [1])
+fi
+
+AM_CONDITIONAL([ENABLE_SSL],
+               [test "x$enable_ssl" = "xyes"])
+
+AC_SUBST([SSL_CPPFLAGS])
+AC_SUBST([SSL_LINKERFLAGS])
+
+
 # Check if gflags are present. If so, make sure we link against them
 # when building the Python module.
 AC_CHECK_LIB([gflags],
@@ -1027,7 +1087,7 @@ if test "x$without_bundled_elfio" = "xyes" || \
      CPPFLAGS="-I${with_elfio} $CPPFLAGS"
   fi
 
-  AC_CHECK_HEADERS([elfio/elfio.h], [],
+  AC_CHECK_HEADERS([elfio/elfio.hpp], [],
                    [AC_MSG_ERROR([Cannot find the ELFIO headers
 -------------------------------------------------------------------
 You have requested the use of a non-bundled ELFIO but no suitable
@@ -1328,10 +1388,10 @@ __EOF__
     dir="$JAVA_HOME/jre/lib/server"
     for dir in "$JAVA_HOME/lib/server" "$JAVA_HOME/jre/lib/server"; do
       if test -e "$dir"; then
-	# Note that these are libtool specific flags.
+        # Note that these are libtool specific flags.
         JAVA_TEST_LDFLAGS="-framework JavaVM"
         JAVA_JVM_LIBRARY=$dir/libjvm.dylib
-	break;
+        break;
       fi
     done
   elif test "$OS_NAME" = "linux"; then
@@ -1340,20 +1400,20 @@ __EOF__
       "$JAVA_HOME/jre/lib/"{amd64,i386,arm,aarch64,ppc64,ppc64le,s390,s390x}"/server"
     do
       if test -e "$dir"; then
-	# Note that these are libtool specific flags.
-	JAVA_TEST_LDFLAGS="-L$dir -R$dir -Wl,-ljvm"
-	JAVA_JVM_LIBRARY=$dir/libjvm.so
-	break;
+        # Note that these are libtool specific flags.
+        JAVA_TEST_LDFLAGS="-L$dir -R$dir -Wl,-ljvm"
+        JAVA_JVM_LIBRARY=$dir/libjvm.so
+        break;
       fi
     done
   elif test "$OS_NAME" = "freebsd"; then
     for arch in amd64 i386 arm; do
       dir="$JAVA_HOME/jre/lib/$arch/server"
       if test -e "$dir"; then
-	# Note that these are libtool specific flags.
-	JAVA_TEST_LDFLAGS="-L$dir -R$dir -pthread -Wl,-ljvm"
-	JAVA_JVM_LIBRARY=$dir/libjvm.so
-	break;
+        # Note that these are libtool specific flags.
+        JAVA_TEST_LDFLAGS="-L$dir -R$dir -pthread -Wl,-ljvm"
+        JAVA_JVM_LIBRARY=$dir/libjvm.so
+        break;
       fi
     done
   fi
@@ -1538,6 +1598,16 @@ if test "x$enable_libevent" = "xyes"; then
   else
     with_bundled_libevent=yes
   fi
+
+  AC_DEFINE([USE_LIBEVENT], [1])
+fi
+
+if test "x$enable_ssl" = "xyes"; then
+  if test "x$enable_libevent" = "xyes"; then
+    if test "x$with_bundled_libevent" != "xyes"; then
+      MESOS_HAVE_LIBEVENT_SSL()
+    fi
+  fi
 fi
 
 AM_CONDITIONAL([ENABLE_LIBEVENT],
@@ -1624,14 +1694,6 @@ AS_IF([test "x$enable_seccomp_isolator" = "xyes"], [
         [AC_MSG_ERROR([no Seccomp support on $OS_NAME
 -------------------------------------------------------------------
 The Seccomp isolator is only supported on Linux.
--------------------------------------------------------------------
-  ])])
-
-  AC_CHECK_HEADERS([linux/seccomp.h], [],
-                   [AC_MSG_ERROR([Cannot find seccomp system headers
--------------------------------------------------------------------
-Please install the Linux kernel headers and make sure that you have
-Linux kernel 3.5+ installed.
 -------------------------------------------------------------------
   ])])
 
@@ -1724,29 +1786,37 @@ AM_CONDITIONAL(
   [test "x$enable_network_ports_isolator" = "xyes" -o "x$enable_port_mapping_isolator" = "xyes"])
 
 
+AM_CONDITIONAL(
+  [ENABLE_NVML],
+  [test "x$enable_nvml" = "xyes"])
+
+AM_COND_IF([ENABLE_NVML], [AC_DEFINE([ENABLE_NVML])])
+
 # If the user has asked not to include the bundled NVML headers for
 # Nvidia GPU support, check to see if the path to the NVML headers has
 # been specified.  If it has, make sure that the path is absolute. If
 # everything is in order, add this path to the CPPFLAGS.
-if test "x$without_bundled_nvml" = "xyes" || \
-   test "x$enable_bundled" != "xyes"; then
-  if test -n "`echo $with_nvml`"; then
-    if test "$with_nvml" = "${with_nvml#/}"; then
-      AC_MSG_ERROR([The path passed to --with-nvml must be absolute.])
+if test "x$enable_nvml" = "xyes"; then
+  if test "x$without_bundled_nvml" = "xyes" || \
+     test "x$enable_bundled" != "xyes"; then
+    if test -n "`echo $with_nvml`"; then
+      if test "$with_nvml" = "${with_nvml#/}"; then
+        AC_MSG_ERROR([The path passed to --with-nvml must be absolute.])
+      fi
+       CPPFLAGS="-I${with_nvml} $CPPFLAGS"
     fi
-     CPPFLAGS="-I${with_nvml} $CPPFLAGS"
-  fi
 
-  AC_CHECK_HEADERS([nvidia/gdk/nvml.h], [],
-                   [AC_MSG_ERROR([Cannot find the Nvidia NVML headers
--------------------------------------------------------------------
-You have requested the use of a non-bundled NVML but no suitable
-NVML headers could be found. Make sure these headers are either
-installed on the system or the path passed via --with-nvml is correct.
--------------------------------------------------------------------
-  ])])
-else
-  with_bundled_nvml=yes
+    AC_CHECK_HEADERS([nvidia/gdk/nvml.h], [],
+                     [AC_MSG_ERROR([Cannot find the Nvidia NVML headers
+  -------------------------------------------------------------------
+  You have requested the use of a non-bundled NVML but no suitable
+  NVML headers could be found. Make sure these headers are either
+  installed on the system or the path passed via --with-nvml is correct.
+  -------------------------------------------------------------------
+    ])])
+  else
+    with_bundled_nvml=yes
+  fi
 fi
 
 AM_CONDITIONAL([WITH_BUNDLED_NVML],
@@ -1805,6 +1875,12 @@ if test "x$without_bundled_protobuf" = "xyes" || \
                     [AC_MSG_ERROR([cannot find PROTOBUF_JAR=$PROTOBUF_JAR])])
     fi
 
+    AC_CHECK_FILE([$PROTOBUFPREFIX/include/google/protobuf/wrappers.proto],
+                  [],
+                  [AC_MSG_ERROR([cannot find protobuf proto files])])
+
+    PROTOBUF_PROTOCFLAGS="-I${PROTOBUFPREFIX}/include"
+
     AC_CHECK_TOOL([PROTOCOMPILER_TEST], [protoc], [], [$PROTOBUFPREFIX/bin])
 
     if test -z "`echo $PROTOCOMPILER_TEST`"; then
@@ -1816,7 +1892,6 @@ if test "x$without_bundled_protobuf" = "xyes" || \
     if test "x$enable_python" = "xyes"; then
       AC_PYTHON_MODULE([google.protobuf], [yes])
     fi
-
   else
     AC_MSG_ERROR([cannot find protobuf
 -------------------------------------------------------------------
@@ -1840,6 +1915,7 @@ AM_CONDITIONAL([WITH_BUNDLED_PROTOBUF],
 AC_SUBST([PROTOBUF_CPPFLAGS])
 AC_SUBST([PROTOBUF_JAR])
 AC_SUBST([PROTOBUF_LINKERFLAGS])
+AC_SUBST([PROTOBUF_PROTOCFLAGS])
 AC_SUBST([PROTOCOMPILER])
 
 
@@ -2031,69 +2107,6 @@ We need CRAM-MD5 support for SASL authentication.
 -------------------------------------------------------------------])])
 
 
-# Check if libssl prefix path was provided, and if so, add it to
-# the CPPFLAGS and LDFLAGS with respective /include and /lib path
-# suffixes.
-if test -z "`echo $with_ssl`" &&
-   test "$OS_NAME" = "darwin" &&
-   test -n "`command -v brew`" &&
-   test -n "`brew list --versions openssl`"; then
-  with_ssl=`brew --prefix openssl`
-fi
-
-if test -n "`echo $with_ssl`"; then
-  SSL_CPPFLAGS="-I${with_ssl}/include"
-  SSL_LINKERFLAGS="-L${with_ssl}/lib"
-
-  CPPFLAGS="$SSL_CPPFLAGS $CPPFLAGS"
-  LDFLAGS="$SSL_LINKERFLAGS $LDFLAGS"
-fi
-
-AC_CHECK_LIB([crypto], [RAND_poll], [found_crypto=yes])
-
-AC_CHECK_HEADERS([openssl/ssl.h],
-                 [AC_CHECK_LIB([ssl],
-                               [SSL_CTX_new],
-                               [found_ssl=yes],
-                               [],
-                               [-lcrypto])])
-
-if test "x$enable_ssl" = "xyes"; then
-  if test "x$found_ssl" != "xyes"; then
-    AC_MSG_ERROR([cannot find libssl
--------------------------------------------------------------------
-libssl is required for an SSL-enabled build.
--------------------------------------------------------------------
-    ])
-  fi
-
-  if test "x$found_crypto" != "xyes"; then
-    AC_MSG_ERROR([cannot find libcrypto
--------------------------------------------------------------------
-libcrypto is required for an SSL-enabled build.
--------------------------------------------------------------------
-    ])
-  fi
-
-  LIBS="-lssl -lcrypto $LIBS"
-
-  if test "x$enable_libevent" = "xyes"; then
-    if test "x$with_bundled_libevent" != "xyes"; then
-      MESOS_HAVE_LIBEVENT_SSL()
-    fi
-  else
-    AC_MSG_ERROR([SSL is currently only supported with libevent])
-  fi
-  AC_DEFINE([USE_SSL_SOCKET], [1])
-fi
-
-AM_CONDITIONAL([ENABLE_SSL],
-               [test "x$enable_ssl" = "xyes"])
-
-AC_SUBST([SSL_CPPFLAGS])
-AC_SUBST([SSL_LINKERFLAGS])
-
-
 # Check if user has asked us to use a preinstalled stout, or if
 # they asked us to ignore all bundled libraries while compiling and
 # linking.
@@ -2190,6 +2203,9 @@ Please install the Linux kernel headers and xfsprogs development
 packages for XFS disk isolator support.
 -------------------------------------------------------------------
   ])])
+
+  # xfs_types.h is optional, depending on the build OS.
+  AC_CHECK_HEADERS([xfs/xfs_types.h])
 
   AC_CHECK_HEADERS([blkid/blkid.h], [], [AC_MSG_ERROR([missing libblkid headers
 -------------------------------------------------------------------
@@ -2494,6 +2510,12 @@ You may wish to set the PYTHON_3 environment variable to make sure
 that the right Python executable is found.
 -------------------------------------------------------------------
   ])])
+
+  # Find `tox` for testing `src/python/lib/`.
+  AC_CHECK_PROGS([tox], [tox])
+  if test "x$tox" = "x"; then
+    AC_MSG_ERROR(['tox' is required in order to run Mesos Python library tests.])
+  fi
 fi
 
 if test "x$enable_python" = "xyes"; then
@@ -2671,7 +2693,7 @@ There are two possible workarounds for this issue:
   PYTHON_LDFLAGS="$LDFLAGS $GFLAGS_LIBS"
 
   AS_IF([test "x$ax_cv_cxx_compiler_vendor" = "xclang"],
-	[PYTHON_CPPFLAGS="$PYTHON_CPPFLAGS -Qunused-arguments"
+        [PYTHON_CPPFLAGS="$PYTHON_CPPFLAGS -Qunused-arguments"
          PYTHON_CFLAGS="$PYTHON_CFLAGS -Qunused-arguments"])
 
   AC_SUBST([PYTHON_CPPFLAGS])

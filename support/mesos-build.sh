@@ -36,7 +36,10 @@ fi
 
 # NOTE: We chmod the directory here so that the docker containter can
 # copy out the test report xml files from the container file system.
-chmod 777 ${MESOS_DIR}
+chmod 777 "${MESOS_DIR}"
+
+# Update docker image
+docker pull "mesos/mesos-build:${OS//:/-}"
 
 docker run \
   --rm \

@@ -22,7 +22,9 @@
 #include "common/protobuf_utils.hpp"
 #include "common/resources_utils.hpp"
 
+#include "slave/containerizer/mesos/constants.hpp"
 #include "slave/containerizer/mesos/paths.hpp"
+
 #include "slave/state.hpp"
 
 #ifndef __WINDOWS__
@@ -258,6 +260,17 @@ Result<unix::Address> getContainerIOSwitchboardAddress(
   }
 
   return address.get();
+}
+
+
+string getHostProcMountPointPath(
+    const string& runtimeDir,
+    const ContainerID& containerId)
+{
+  return path::join(
+      getRuntimePath(runtimeDir, containerId),
+      MNT_DIRECTORY,
+      MNT_HOST_PROC);
 }
 #endif // __WINDOWS__
 
@@ -509,6 +522,136 @@ Try<ContainerID> parseSandboxPath(
   }
 
   return currentContainerId;
+}
+
+
+string getContainerShmPath(
+    const string& runtimeDir,
+    const ContainerID& containerId)
+{
+  return path::join(
+      getRuntimePath(runtimeDir, containerId),
+      CONTAINER_SHM_DIRECTORY);
+}
+
+
+Try<string> getParentShmPath(
+    const string runtimeDir,
+    const ContainerID& containerId)
+{
+  CHECK(containerId.has_parent());
+
+  ContainerID parentId = containerId.parent();
+
+  Result<ContainerConfig> parentConfig =
+    getContainerConfig(runtimeDir, parentId);
+
+  if (parentConfig.isNone()) {
+    return Error(
+        "Failed to find config for container " + stringify(parentId));
+  } else if (parentConfig.isError()) {
+    return Error(parentConfig.error());
+  }
+
+  string parentShmPath;
+
+  if (parentConfig->has_container_info() &&
+      parentConfig->container_info().has_linux_info() &&
+      parentConfig->container_info().linux_info().has_ipc_mode()) {
+    switch (parentConfig->container_info().linux_info().ipc_mode()) {
+      case LinuxInfo::PRIVATE: {
+        const string shmPath = getContainerShmPath(runtimeDir, parentId);
+        if (!os::exists(shmPath)) {
+          return Error(
+              "The shared memory path '" + shmPath + "' of container "
+              + stringify(parentId) + " does not exist");
+        }
+
+        parentShmPath = shmPath;
+        break;
+      }
+      case LinuxInfo::SHARE_PARENT: {
+        if (parentId.has_parent()) {
+          return getParentShmPath(runtimeDir, parentId);
+        }
+
+        parentShmPath = AGENT_SHM_DIRECTORY;
+        break;
+      }
+      case LinuxInfo::UNKNOWN: {
+        LOG(FATAL) << "The IPC mode of container " << parentId << " is UNKNOWN";
+      }
+    }
+  } else {
+    if (parentConfig->has_rootfs()) {
+      return Error(
+          "The shared memory of container " + stringify(parentId) +
+          " cannot be shared with any other containers because it"
+          " is only in the container's own mount namespace");
+    }
+
+    parentShmPath = AGENT_SHM_DIRECTORY;
+  }
+
+  return parentShmPath;
+}
+
+
+string getCgroupPath(
+    const string& cgroupsRoot,
+    const ContainerID& containerId)
+{
+  return path::join(
+      cgroupsRoot,
+      containerizer::paths::buildPath(
+          containerId,
+          CGROUP_SEPARATOR,
+          containerizer::paths::JOIN));
+}
+
+
+Option<ContainerID> parseCgroupPath(
+    const string& cgroupsRoot,
+    const string& cgroup)
+{
+  Option<ContainerID> current;
+
+  // Start not expecting to see a separator and adjust after each
+  // non-separator we see.
+  bool separator = false;
+
+  vector<string> tokens = strings::tokenize(
+      strings::remove(cgroup, cgroupsRoot, strings::PREFIX),
+      stringify(os::PATH_SEPARATOR));
+
+  for (size_t i = 0; i < tokens.size(); i++) {
+    if (separator && tokens[i] == CGROUP_SEPARATOR) {
+      separator = false;
+
+      // If the cgroup has CGROUP_SEPARATOR as the last segment,
+      // should just ignore it because this cgroup belongs to us.
+      if (i == tokens.size() - 1) {
+        return None();
+      } else {
+        continue;
+      }
+    } else if (separator) {
+      return None();
+    } else {
+      separator = true;
+    }
+
+    ContainerID id;
+    id.set_value(tokens[i]);
+
+    if (current.isSome()) {
+      id.mutable_parent()->CopyFrom(current.get());
+    }
+
+    current = id;
+  }
+
+  return current;
 }
 
 } // namespace paths {

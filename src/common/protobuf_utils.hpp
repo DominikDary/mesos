@@ -43,6 +43,8 @@
 #include <stout/try.hpp>
 #include <stout/uuid.hpp>
 
+#include "master/registry.hpp"
+
 #include "messages/messages.hpp"
 
 // Forward declaration (in lieu of an include).
@@ -63,6 +65,28 @@ struct Slave;
 } // namespace master {
 
 namespace protobuf {
+
+// Modeled after WireFormatLite from protobuf, but to provide
+// missing helpers.
+class WireFormatLite2
+{
+public:
+  // This is a wrapper to compute cached sizes before calling into
+  // `WireFormatLite::WriteMessage`, which assumes that sizes are
+  // already cached.
+  static void WriteMessageWithoutCachedSizes(
+      int field_number,
+      const google::protobuf::MessageLite& value,
+      google::protobuf::io::CodedOutputStream* output)
+  {
+    // Cache the sizes first.
+    value.ByteSizeLong();
+
+    google::protobuf::internal::WireFormatLite::WriteMessage(
+        field_number, value, output);
+  }
+};
+
 
 // Internal helper class for protobuf union validation.
 class UnionValidator
@@ -334,6 +358,12 @@ struct Capabilities
         case SlaveInfo::Capability::AGENT_OPERATION_FEEDBACK:
           agentOperationFeedback = true;
           break;
+        case SlaveInfo::Capability::AGENT_DRAINING:
+          agentDraining = true;
+          break;
+        case SlaveInfo::Capability::TASK_RESOURCE_LIMITS:
+          taskResourceLimits = true;
+          break;
         // If adding another case here be sure to update the
         // equality operator.
       }
@@ -347,6 +377,8 @@ struct Capabilities
   bool resourceProvider = false;
   bool resizeVolume = false;
   bool agentOperationFeedback = false;
+  bool agentDraining = false;
+  bool taskResourceLimits = false;
 
   google::protobuf::RepeatedPtrField<SlaveInfo::Capability>
   toRepeatedPtrField() const
@@ -370,6 +402,12 @@ struct Capabilities
     if (agentOperationFeedback) {
       result.Add()->set_type(SlaveInfo::Capability::AGENT_OPERATION_FEEDBACK);
     }
+    if (agentDraining) {
+      result.Add()->set_type(SlaveInfo::Capability::AGENT_DRAINING);
+    }
+    if (taskResourceLimits) {
+      result.Add()->set_type(SlaveInfo::Capability::TASK_RESOURCE_LIMITS);
+    }
 
     return result;
   }
@@ -389,6 +427,7 @@ mesos::slave::ContainerLimitation createContainerLimitation(
 
 mesos::slave::ContainerState createContainerState(
     const Option<ExecutorInfo>& executorInfo,
+    const Option<ContainerInfo>& containerInfo,
     const ContainerID& id,
     pid_t pid,
     const std::string& directory);
@@ -413,6 +452,25 @@ mesos::slave::ContainerMountInfo createContainerMount(
     const std::string& type,
     const std::string& options,
     unsigned long flags);
+
+
+mesos::slave::ContainerFileOperation containerSymlinkOperation(
+    const std::string& source,
+    const std::string& target);
+
+
+mesos::slave::ContainerFileOperation containerRenameOperation(
+    const std::string& source,
+    const std::string& target);
+
+
+mesos::slave::ContainerFileOperation containerMkdirOperation(
+    const std::string& target,
+    const bool recursive);
+
+
+mesos::slave::ContainerFileOperation containerMountOperation(
+    const mesos::slave::ContainerMountInfo& mnt);
 
 } // namespace slave {
 
@@ -454,6 +512,37 @@ mesos::maintenance::Schedule createSchedule(
 
 namespace master {
 
+// TODO(mzhu): Consolidate these helpers into `struct Capabilities`.
+// For example, to add a minimum capability for `QUOTA_V2`, we could do the
+// following in the call site:
+//
+//  Capabilities capabilities = registry->minimum_capabilities();
+//  capabilities.quotaV2 = needsV2;
+//  *registry->mutable_minimum_capabilities() = capabilities.toStrings();
+//
+// For this to work, we need to:
+//  - Add a constructor from repeated `MinimumCapability`
+//  - Add a toStrings() that goes back to repeated string
+//  - Note, unknown capabilities need to be carried in the struct.
+//
+// In addition, we should consolidate the helper
+// `Master::misingMinimumCapabilities` into the struct as well.
+
+// Helper to add a minimum capability, it is a noop if already set.
+void addMinimumCapability(
+    google::protobuf::RepeatedPtrField<Registry::MinimumCapability>*
+      capabilities,
+    const MasterInfo::Capability::Type& capability);
+
+
+// Helper to remove a minimum capability,
+// it is a noop if already absent.
+void removeMinimumCapability(
+    google::protobuf::RepeatedPtrField<Registry::MinimumCapability>*
+      capabilities,
+    const MasterInfo::Capability::Type& capability);
+
+
 // TODO(bmahler): Store the repeated field within this so that we
 // don't drop unknown capabilities.
 struct Capabilities
@@ -470,11 +559,19 @@ struct Capabilities
         case MasterInfo::Capability::AGENT_UPDATE:
           agentUpdate = true;
           break;
+        case MasterInfo::Capability::AGENT_DRAINING:
+          agentDraining = true;
+          break;
+        case MasterInfo::Capability::QUOTA_V2:
+          quotaV2 = true;
+          break;
       }
     }
   }
 
   bool agentUpdate = false;
+  bool agentDraining = false;
+  bool quotaV2 = false;
 };
 
 namespace event {
@@ -509,12 +606,16 @@ mesos::master::Event createFrameworkRemoved(const FrameworkInfo& frameworkInfo);
 // Helper for creating an `Agent` response.
 mesos::master::Response::GetAgents::Agent createAgentResponse(
     const mesos::internal::master::Slave& slave,
+    const Option<DrainInfo>& drainInfo,
+    bool deactivated,
     const Option<process::Owned<ObjectApprovers>>& approvers = None());
 
 
 // Helper for creating an `AGENT_ADDED` event from a `Slave`.
 mesos::master::Event createAgentAdded(
-    const mesos::internal::master::Slave& slave);
+    const mesos::internal::master::Slave& slave,
+    const Option<DrainInfo>& drainInfo,
+    bool deactivated);
 
 
 // Helper for creating an `AGENT_REMOVED` event from a `SlaveID`.

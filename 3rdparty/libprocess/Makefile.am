@@ -157,7 +157,7 @@ LIB_EV = -lev
 endif
 else
 if WITH_BUNDLED_LIBEVENT
-LIB_EVENT_INCLUDE_FLAGS = -I$(LIBEVENT)
+LIB_EVENT_INCLUDE_FLAGS = -I$(LIBEVENT)/include
 LIB_EVENT = $(LIBEVENT)/libevent_core.la $(LIBEVENT)/libevent_pthreads.la
 if ENABLE_SSL
 LIB_EVENT += $(LIBEVENT)/libevent_openssl.la
@@ -251,11 +251,20 @@ if ENABLE_SSL
 libprocess_la_SOURCES +=			\
   src/jwt.cpp					\
   src/jwt_authenticator.cpp			\
-  src/posix/libevent/libevent_ssl_socket.cpp	\
-  src/posix/libevent/libevent_ssl_socket.hpp	\
   src/openssl.cpp				\
   src/openssl.hpp				\
   src/ssl/utilities.cpp
+
+if ENABLE_LIBEVENT
+libprocess_la_SOURCES +=			\
+  src/posix/libevent/libevent_ssl_socket.cpp	\
+  src/posix/libevent/libevent_ssl_socket.hpp
+else
+libprocess_la_SOURCES +=			\
+  src/ssl/openssl_socket.cpp			\
+  src/ssl/openssl_socket.hpp
+endif
+
 endif
 
 

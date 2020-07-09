@@ -23,6 +23,8 @@
 #include <process/address.hpp>
 #include <process/future.hpp>
 
+#include <process/ssl/tls_config.hpp>
+
 #include <stout/abort.hpp>
 #include <stout/error.hpp>
 #include <stout/nothing.hpp>
@@ -149,7 +151,15 @@ public:
    */
   virtual Future<std::shared_ptr<SocketImpl>> accept() = 0;
 
-  virtual Future<Nothing> connect(const Address& address) = 0;
+  virtual Future<Nothing> connect(
+      const Address& address) = 0;
+
+#ifdef USE_SSL_SOCKET
+  virtual Future<Nothing> connect(
+      const Address& address,
+      const openssl::TLSClientConfig& config) = 0;
+#endif
+
   virtual Future<size_t> recv(char* data, size_t size) = 0;
   virtual Future<size_t> send(const char* data, size_t size) = 0;
   virtual Future<size_t> sendfile(int_fd fd, off_t offset, size_t size) = 0;
@@ -201,6 +211,12 @@ public:
 
 protected:
   explicit SocketImpl(int_fd _s) : s(_s) { CHECK(s >= 0); }
+
+#if defined(USE_SSL_SOCKET) && !defined(USE_LIBEVENT)
+  // Allows this class access to `release()` other types of sockets,
+  // like the `PollSocketImpl`.
+  friend class OpenSSLSocketImpl;
+#endif // USE_SSL_SOCKET && !USE_LIBEVENT
 
   /**
    * Releases ownership of the file descriptor. Not exposed
@@ -358,10 +374,23 @@ public:
       });
   }
 
+  // NOTE: Calling this overload when `kind() == SSL` will result
+  // in program termination.
   Future<Nothing> connect(const AddressType& address)
   {
     return impl->connect(address);
   }
+
+#ifdef USE_SSL_SOCKET
+  // NOTE: Calling this overload when `kind() == POLL` will result
+  // in program termination.
+  Future<Nothing> connect(
+      const AddressType& address,
+      const openssl::TLSClientConfig& config)
+  {
+    return impl->connect(address, config);
+  }
+#endif
 
   Future<size_t> recv(char* data, size_t size) const
   {

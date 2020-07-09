@@ -14,7 +14,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <atomic>
+#include <memory>
+#include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <gmock/gmock.h>
@@ -29,6 +33,7 @@
 #include <mesos/module/authorizer.hpp>
 
 #include <process/clock.hpp>
+#include <process/collect.hpp>
 #include <process/future.hpp>
 #include <process/http.hpp>
 #include <process/pid.hpp>
@@ -36,8 +41,15 @@
 
 #include <stout/gtest.hpp>
 #include <stout/try.hpp>
+#include <stout/unreachable.hpp>
 
 #include "authorizer/local/authorizer.hpp"
+
+#include "common/protobuf_utils.hpp"
+#include "common/resources_utils.hpp"
+
+#include "internal/devolve.hpp"
+#include "internal/evolve.hpp"
 
 #include "master/master.hpp"
 
@@ -57,11 +69,18 @@
 
 namespace http = process::http;
 
+using std::shared_ptr;
+using std::weak_ptr;
+
+using google::protobuf::RepeatedPtrField;
+
 using mesos::internal::master::Master;
 
 using mesos::internal::master::allocator::MesosAllocatorProcess;
 
 using mesos::internal::slave::Slave;
+
+using mesos::v1::master::Call;
 
 using mesos::master::detector::MasterDetector;
 using mesos::master::detector::StandaloneMasterDetector;
@@ -73,6 +92,7 @@ using process::Owned;
 using process::PID;
 using process::Promise;
 
+using process::http::Accepted;
 using process::http::Forbidden;
 using process::http::OK;
 using process::http::Response;
@@ -81,11 +101,16 @@ using std::string;
 using std::vector;
 
 using testing::_;
+using testing::AllOf;
 using testing::An;
 using testing::AtMost;
 using testing::DoAll;
 using testing::Eq;
+using testing::Ne;
+using testing::Invoke;
+using testing::InvokeWithoutArgs;
 using testing::Return;
+using testing::Truly;
 
 namespace mesos {
 namespace internal {
@@ -367,628 +392,6 @@ TEST_F(MasterAuthorizationTest, UnauthorizedTaskGroup)
   driver.join();
 }
 
-
-// This test verifies that a 'killTask()' that comes before
-// '_accept()' is called results in TASK_KILLED.
-TEST_F(MasterAuthorizationTest, KillTask)
-{
-  MockAuthorizer authorizer;
-  Try<Owned<cluster::Master>> master = StartMaster(&authorizer);
-  ASSERT_SOME(master);
-
-  MockExecutor exec(DEFAULT_EXECUTOR_ID);
-  TestContainerizer containerizer(&exec);
-
-  Owned<MasterDetector> detector = master.get()->createDetector();
-  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), &containerizer);
-  ASSERT_SOME(slave);
-
-  MockScheduler sched;
-  MesosSchedulerDriver driver(
-      &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
-
-  EXPECT_CALL(sched, registered(&driver, _, _));
-
-  Future<vector<Offer>> offers;
-  EXPECT_CALL(sched, resourceOffers(&driver, _))
-    .WillOnce(FutureArg<1>(&offers))
-    .WillRepeatedly(Return()); // Ignore subsequent offers.
-
-  driver.start();
-
-  AWAIT_READY(offers);
-  ASSERT_FALSE(offers->empty());
-
-  TaskInfo task = createTask(offers.get()[0], "", DEFAULT_EXECUTOR_ID);
-
-  // Return a pending future from authorizer.
-  Future<Nothing> authorize;
-  Promise<bool> promise;
-  EXPECT_CALL(authorizer, authorized(_))
-    .WillOnce(DoAll(FutureSatisfy(&authorize),
-                    Return(promise.future())));
-
-  driver.launchTasks(offers.get()[0].id(), {task});
-
-  // Wait until authorization is in progress.
-  AWAIT_READY(authorize);
-
-  Future<TaskStatus> status;
-  EXPECT_CALL(sched, statusUpdate(&driver, _))
-    .WillOnce(FutureArg<1>(&status));
-
-  // Now kill the task.
-  driver.killTask(task.task_id());
-
-  // Framework should get a TASK_KILLED right away.
-  AWAIT_READY(status);
-  EXPECT_EQ(TASK_KILLED, status->state());
-  EXPECT_EQ(TaskStatus::REASON_TASK_KILLED_DURING_LAUNCH, status->reason());
-
-  Future<Nothing> recoverResources =
-    FUTURE_DISPATCH(_, &MesosAllocatorProcess::recoverResources);
-
-  // Now complete authorization.
-  promise.set(true);
-
-  // No task launch should happen resulting in all resources being
-  // returned to the allocator.
-  AWAIT_READY(recoverResources);
-
-  // Make sure the task is not known to master anymore.
-  EXPECT_CALL(sched, statusUpdate(&driver, _))
-    .Times(0);
-
-  driver.reconcileTasks({});
-
-  // We settle the clock here to ensure any updates sent by the master
-  // are received. There shouldn't be any updates in this case.
-  Clock::pause();
-  Clock::settle();
-
-  driver.stop();
-  driver.join();
-}
-
-
-// This test verifies that if a pending task in a task group
-// is killed, then the entire group will be killed.
-TEST_F(MasterAuthorizationTest, KillPendingTaskInTaskGroup)
-{
-  MockAuthorizer authorizer;
-  Try<Owned<cluster::Master>> master = StartMaster(&authorizer);
-  ASSERT_SOME(master);
-
-  Owned<MasterDetector> detector = master.get()->createDetector();
-  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get());
-  ASSERT_SOME(slave);
-
-  MockScheduler sched;
-  MesosSchedulerDriver driver(
-      &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
-
-  Future<FrameworkID> frameworkId;
-  EXPECT_CALL(sched, registered(&driver, _, _))
-    .WillOnce(FutureArg<1>(&frameworkId));
-
-  Future<vector<Offer>> offers;
-  EXPECT_CALL(sched, resourceOffers(&driver, _))
-    .WillOnce(FutureArg<1>(&offers))
-    .WillRepeatedly(Return()); // Ignore subsequent offers.
-
-  driver.start();
-
-  AWAIT_READY(frameworkId);
-
-  AWAIT_READY(offers);
-  ASSERT_FALSE(offers->empty());
-
-  Resources resources =
-    Resources::parse("cpus:0.1;mem:32;disk:32").get();
-
-  ExecutorInfo executor;
-  executor.set_type(ExecutorInfo::DEFAULT);
-  executor.mutable_executor_id()->set_value("E");
-  executor.mutable_framework_id()->CopyFrom(frameworkId.get());
-  executor.mutable_resources()->CopyFrom(resources);
-
-  TaskInfo task1;
-  task1.set_name("1");
-  task1.mutable_task_id()->set_value("1");
-  task1.mutable_slave_id()->MergeFrom(offers.get()[0].slave_id());
-  task1.mutable_resources()->MergeFrom(resources);
-
-  TaskInfo task2;
-  task2.set_name("2");
-  task2.mutable_task_id()->set_value("2");
-  task2.mutable_slave_id()->MergeFrom(offers.get()[0].slave_id());
-  task2.mutable_resources()->MergeFrom(resources);
-
-  TaskGroupInfo taskGroup;
-  taskGroup.add_tasks()->CopyFrom(task1);
-  taskGroup.add_tasks()->CopyFrom(task2);
-
-  // Return a pending future from authorizer.
-  Future<Nothing> authorize1;
-  Future<Nothing> authorize2;
-  Promise<bool> promise1;
-  Promise<bool> promise2;
-  EXPECT_CALL(authorizer, authorized(_))
-    .WillOnce(DoAll(FutureSatisfy(&authorize1),
-                    Return(promise1.future())))
-    .WillOnce(DoAll(FutureSatisfy(&authorize2),
-                    Return(promise2.future())));
-
-  Future<TaskStatus> task1Status;
-  Future<TaskStatus> task2Status;
-  EXPECT_CALL(sched, statusUpdate(&driver, _))
-    .WillOnce(FutureArg<1>(&task1Status))
-    .WillOnce(FutureArg<1>(&task2Status));
-
-  Offer::Operation operation;
-  operation.set_type(Offer::Operation::LAUNCH_GROUP);
-
-  Offer::Operation::LaunchGroup* launchGroup =
-    operation.mutable_launch_group();
-
-  launchGroup->mutable_executor()->CopyFrom(executor);
-  launchGroup->mutable_task_group()->CopyFrom(taskGroup);
-
-  driver.acceptOffers({offers.get()[0].id()}, {operation});
-
-  // Wait until all authorizations are in progress.
-  AWAIT_READY(authorize1);
-  AWAIT_READY(authorize2);
-
-  // Now kill task1.
-  driver.killTask(task1.task_id());
-
-  AWAIT_READY(task1Status);
-  EXPECT_EQ(TASK_KILLED, task1Status->state());
-  EXPECT_TRUE(strings::contains(
-      task1Status->message(), "Killed before delivery to the agent"));
-  EXPECT_EQ(TaskStatus::REASON_TASK_KILLED_DURING_LAUNCH,
-            task1Status->reason());
-
-  Future<Nothing> recoverResources =
-    FUTURE_DISPATCH(_, &MesosAllocatorProcess::recoverResources);
-
-  // Now complete authorizations for task1 and task2.
-  promise1.set(true);
-  promise2.set(true);
-
-  AWAIT_READY(task2Status);
-  EXPECT_EQ(TASK_KILLED, task2Status->state());
-  EXPECT_TRUE(strings::contains(
-      task2Status->message(),
-      "A task within the task group was killed before delivery to the agent"));
-  EXPECT_EQ(TaskStatus::REASON_TASK_KILLED_DURING_LAUNCH,
-            task2Status->reason());
-
-  // No task launch should happen resulting in all resources being
-  // returned to the allocator.
-  AWAIT_READY(recoverResources);
-
-  // Make sure the task group is not known to master anymore.
-  EXPECT_CALL(sched, statusUpdate(&driver, _))
-    .Times(0);
-
-  driver.reconcileTasks({});
-
-  // We settle the clock here to ensure any updates sent by the master
-  // are received. There shouldn't be any updates in this case.
-  Clock::pause();
-  Clock::settle();
-
-  driver.stop();
-  driver.join();
-}
-
-
-// This test verifies that a slave removal that comes before
-// '_accept()' is called results in TASK_LOST for a framework that is
-// not partition-aware.
-TEST_F(MasterAuthorizationTest, SlaveRemovedLost)
-{
-  MockAuthorizer authorizer;
-  Try<Owned<cluster::Master>> master = StartMaster(&authorizer);
-  ASSERT_SOME(master);
-
-  MockExecutor exec(DEFAULT_EXECUTOR_ID);
-  TestContainerizer containerizer(&exec);
-
-  Owned<MasterDetector> detector = master.get()->createDetector();
-  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), &containerizer);
-  ASSERT_SOME(slave);
-
-  MockScheduler sched;
-  MesosSchedulerDriver driver(
-      &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
-
-  EXPECT_CALL(sched, registered(&driver, _, _));
-
-  Future<vector<Offer>> offers;
-  EXPECT_CALL(sched, resourceOffers(&driver, _))
-    .WillOnce(FutureArg<1>(&offers))
-    .WillRepeatedly(Return()); // Ignore subsequent offers.
-
-  driver.start();
-
-  AWAIT_READY(offers);
-  ASSERT_FALSE(offers->empty());
-
-  TaskInfo task = createTask(offers.get()[0], "", DEFAULT_EXECUTOR_ID);
-
-  // Return a pending future from authorizer.
-  Future<Nothing> authorize;
-  Promise<bool> promise;
-  EXPECT_CALL(authorizer, authorized(_))
-    .WillOnce(DoAll(FutureSatisfy(&authorize),
-                    Return(promise.future())));
-
-  driver.launchTasks(offers.get()[0].id(), {task});
-
-  // Wait until authorization is in progress.
-  AWAIT_READY(authorize);
-
-  Future<Nothing> slaveLost;
-  EXPECT_CALL(sched, slaveLost(&driver, _))
-    .WillOnce(FutureSatisfy(&slaveLost));
-
-  // Stop the slave with explicit shutdown as otherwise with
-  // checkpointing the master will wait for the slave to reconnect.
-  slave.get()->shutdown();
-  slave->reset();
-
-  AWAIT_READY(slaveLost);
-
-  Future<TaskStatus> status;
-  EXPECT_CALL(sched, statusUpdate(&driver, _))
-    .WillOnce(FutureArg<1>(&status));
-
-  Future<Nothing> recoverResources =
-    FUTURE_DISPATCH(_, &MesosAllocatorProcess::recoverResources);
-
-  // Now complete authorization.
-  promise.set(true);
-
-  // Framework should get a TASK_LOST.
-  AWAIT_READY(status);
-
-  EXPECT_EQ(TASK_LOST, status->state());
-  EXPECT_EQ(TaskStatus::SOURCE_MASTER, status->source());
-  EXPECT_EQ(TaskStatus::REASON_SLAVE_REMOVED, status->reason());
-
-  // No task launch should happen resulting in all resources being
-  // returned to the allocator.
-  AWAIT_READY(recoverResources);
-
-  // Check metrics.
-  JSON::Object stats = Metrics();
-  EXPECT_EQ(0u, stats.values["master/tasks_dropped"]);
-  EXPECT_EQ(1u, stats.values["master/tasks_lost"]);
-  EXPECT_EQ(
-      1u, stats.values["master/task_lost/source_master/reason_slave_removed"]);
-
-  // Make sure the task is not known to master anymore.
-  EXPECT_CALL(sched, statusUpdate(&driver, _))
-    .Times(0);
-
-  driver.reconcileTasks({});
-
-  // We settle the clock here to ensure any updates sent by the master
-  // are received. There shouldn't be any updates in this case.
-  Clock::pause();
-  Clock::settle();
-
-  driver.stop();
-  driver.join();
-}
-
-
-// This test verifies that a slave removal that comes before
-// '_accept()' is called results in TASK_DROPPED for a framework that
-// is partition-aware.
-TEST_F(MasterAuthorizationTest, SlaveRemovedDropped)
-{
-  MockAuthorizer authorizer;
-  Try<Owned<cluster::Master>> master = StartMaster(&authorizer);
-  ASSERT_SOME(master);
-
-  MockExecutor exec(DEFAULT_EXECUTOR_ID);
-  TestContainerizer containerizer(&exec);
-
-  Owned<MasterDetector> detector = master.get()->createDetector();
-  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), &containerizer);
-  ASSERT_SOME(slave);
-
-  FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
-  frameworkInfo.add_capabilities()->set_type(
-      FrameworkInfo::Capability::PARTITION_AWARE);
-
-  MockScheduler sched;
-  MesosSchedulerDriver driver(
-      &sched, frameworkInfo, master.get()->pid, DEFAULT_CREDENTIAL);
-
-  EXPECT_CALL(sched, registered(&driver, _, _));
-
-  Future<vector<Offer>> offers;
-  EXPECT_CALL(sched, resourceOffers(&driver, _))
-    .WillOnce(FutureArg<1>(&offers))
-    .WillRepeatedly(Return()); // Ignore subsequent offers.
-
-  driver.start();
-
-  AWAIT_READY(offers);
-  ASSERT_FALSE(offers->empty());
-
-  TaskInfo task = createTask(offers.get()[0], "", DEFAULT_EXECUTOR_ID);
-
-  // Return a pending future from authorizer.
-  Future<Nothing> authorize;
-  Promise<bool> promise;
-  EXPECT_CALL(authorizer, authorized(_))
-    .WillOnce(DoAll(FutureSatisfy(&authorize),
-                    Return(promise.future())));
-
-  driver.launchTasks(offers.get()[0].id(), {task});
-
-  // Wait until authorization is in progress.
-  AWAIT_READY(authorize);
-
-  Future<Nothing> slaveLost;
-  EXPECT_CALL(sched, slaveLost(&driver, _))
-    .WillOnce(FutureSatisfy(&slaveLost));
-
-  // Stop the slave with explicit shutdown as otherwise with
-  // checkpointing the master will wait for the slave to reconnect.
-  slave.get()->shutdown();
-  slave->reset();
-
-  AWAIT_READY(slaveLost);
-
-  Future<TaskStatus> status;
-  EXPECT_CALL(sched, statusUpdate(&driver, _))
-    .WillOnce(FutureArg<1>(&status));
-
-  Future<Nothing> recoverResources =
-    FUTURE_DISPATCH(_, &MesosAllocatorProcess::recoverResources);
-
-  // Now complete authorization.
-  promise.set(true);
-
-  // Framework should get a TASK_DROPPED.
-  AWAIT_READY(status);
-
-  EXPECT_EQ(TASK_DROPPED, status->state());
-  EXPECT_EQ(TaskStatus::SOURCE_MASTER, status->source());
-  EXPECT_EQ(TaskStatus::REASON_SLAVE_REMOVED, status->reason());
-
-  // No task launch should happen resulting in all resources being
-  // returned to the allocator.
-  AWAIT_READY(recoverResources);
-
-  // Check metrics.
-  JSON::Object stats = Metrics();
-  EXPECT_EQ(0u, stats.values["master/tasks_lost"]);
-  EXPECT_EQ(1u, stats.values["master/tasks_dropped"]);
-  EXPECT_EQ(
-      1u,
-      stats.values["master/task_dropped/source_master/reason_slave_removed"]);
-
-  // Make sure the task is not known to master anymore.
-  EXPECT_CALL(sched, statusUpdate(&driver, _))
-    .Times(0);
-
-  driver.reconcileTasks({});
-
-  // We settle the clock here to ensure any updates sent by the master
-  // are received. There shouldn't be any updates in this case.
-  Clock::pause();
-  Clock::settle();
-
-  driver.stop();
-  driver.join();
-}
-
-
-// This test verifies that a framework removal that comes before
-// '_accept()' is called results in recovery of resources.
-TEST_F(MasterAuthorizationTest, FrameworkRemoved)
-{
-  MockAuthorizer authorizer;
-  Try<Owned<cluster::Master>> master = StartMaster(&authorizer);
-  ASSERT_SOME(master);
-
-  MockExecutor exec(DEFAULT_EXECUTOR_ID);
-  TestContainerizer containerizer(&exec);
-
-  Owned<MasterDetector> detector = master.get()->createDetector();
-  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), &containerizer);
-  ASSERT_SOME(slave);
-
-  MockScheduler sched;
-  MesosSchedulerDriver driver(
-      &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
-
-  EXPECT_CALL(sched, registered(&driver, _, _));
-
-  Future<vector<Offer>> offers;
-  EXPECT_CALL(sched, resourceOffers(&driver, _))
-    .WillOnce(FutureArg<1>(&offers))
-    .WillRepeatedly(Return()); // Ignore subsequent offers.
-
-  driver.start();
-
-  AWAIT_READY(offers);
-  ASSERT_FALSE(offers->empty());
-
-  TaskInfo task = createTask(offers.get()[0], "", DEFAULT_EXECUTOR_ID);
-
-  // Return a pending future from authorizer.
-  Future<Nothing> authorize;
-  Promise<bool> promise;
-  EXPECT_CALL(authorizer, authorized(_))
-    .WillOnce(DoAll(FutureSatisfy(&authorize),
-                    Return(promise.future())));
-
-  driver.launchTasks(offers.get()[0].id(), {task});
-
-  // Wait until authorization is in progress.
-  AWAIT_READY(authorize);
-
-  Future<Nothing> removeFramework =
-    FUTURE_DISPATCH(_, &MesosAllocatorProcess::removeFramework);
-
-  // Now stop the framework.
-  driver.stop();
-  driver.join();
-
-  AWAIT_READY(removeFramework);
-
-  Future<Nothing> recoverResources =
-    FUTURE_DISPATCH(_, &MesosAllocatorProcess::recoverResources);
-
-  // Now complete authorization.
-  promise.set(true);
-
-  // No task launch should happen resulting in all resources being
-  // returned to the allocator.
-  AWAIT_READY(recoverResources);
-}
-
-
-// This test verifies that two tasks each launched on a different
-// slave with same executor id but different executor info are
-// allowed even when the first task is pending due to authorization.
-TEST_F(MasterAuthorizationTest, PendingExecutorInfoDiffersOnDifferentSlaves)
-{
-  MockAuthorizer authorizer;
-  Try<Owned<cluster::Master>> master = StartMaster(&authorizer);
-  ASSERT_SOME(master);
-
-  MockScheduler sched;
-  MesosSchedulerDriver driver(
-      &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
-
-  Future<Nothing> registered;
-  EXPECT_CALL(sched, registered(&driver, _, _))
-    .WillOnce(FutureSatisfy(&registered));
-
-  driver.start();
-
-  AWAIT_READY(registered);
-
-  Future<vector<Offer>> offers1;
-  EXPECT_CALL(sched, resourceOffers(&driver, _))
-    .WillOnce(FutureArg<1>(&offers1));
-
-  // Start the first slave.
-  MockExecutor exec1(DEFAULT_EXECUTOR_ID);
-  TestContainerizer containerizer1(&exec1);
-
-  Owned<MasterDetector> detector = master.get()->createDetector();
-  Try<Owned<cluster::Slave>> slave1 =
-    StartSlave(detector.get(), &containerizer1);
-  ASSERT_SOME(slave1);
-
-  AWAIT_READY(offers1);
-  ASSERT_FALSE(offers1->empty());
-
-  // Launch the first task with the default executor id.
-  ExecutorInfo executor1;
-  executor1 = DEFAULT_EXECUTOR_INFO;
-  executor1.mutable_command()->set_value("exit 1");
-
-  TaskInfo task1 = createTask(
-      offers1.get()[0], executor1.command().value(), executor1.executor_id());
-
-  // Return a pending future from authorizer.
-  // Note that we retire this expectation after its use because
-  // the authorizer will next be called when `slave2` registers and
-  // this expectation would be hit again (and be oversaturated) if
-  // we don't retire. New expectations on `authorizer` will be set
-  // after `slave2` is registered.
-  Future<Nothing> authorize;
-  Promise<bool> promise;
-  EXPECT_CALL(authorizer, authorized(_))
-    .WillOnce(DoAll(FutureSatisfy(&authorize),
-                    Return(promise.future())))
-    .RetiresOnSaturation();
-
-  driver.launchTasks(offers1.get()[0].id(), {task1});
-
-  // Wait until authorization is in progress.
-  AWAIT_READY(authorize);
-
-  Future<vector<Offer>> offers2;
-  EXPECT_CALL(sched, resourceOffers(&driver, _))
-    .WillOnce(FutureArg<1>(&offers2))
-    .WillRepeatedly(Return()); // Ignore subsequent offers.
-
-  // Now start the second slave.
-  MockExecutor exec2(DEFAULT_EXECUTOR_ID);
-  TestContainerizer containerizer2(&exec2);
-
-  Try<Owned<cluster::Slave>> slave2 =
-    StartSlave(detector.get(), &containerizer2);
-  ASSERT_SOME(slave2);
-
-  AWAIT_READY(offers2);
-  ASSERT_FALSE(offers2->empty());
-
-  // Now launch the second task with the same executor id but
-  // a different executor command.
-  ExecutorInfo executor2;
-  executor2 = executor1;
-  executor2.mutable_command()->set_value("exit 2");
-
-  TaskInfo task2 = createTask(
-      offers2.get()[0], executor2.command().value(), executor2.executor_id());
-
-  EXPECT_CALL(exec2, registered(_, _, _, _));
-
-  EXPECT_CALL(exec2, launchTask(_, _))
-    .WillOnce(SendStatusUpdateFromTask(TASK_RUNNING));
-
-  Future<TaskStatus> status2;
-  EXPECT_CALL(sched, statusUpdate(&driver, _))
-    .WillOnce(FutureArg<1>(&status2));
-
-  EXPECT_CALL(authorizer, authorized(_))
-    .WillOnce(Return(true));
-
-  driver.launchTasks(offers2.get()[0].id(), {task2});
-
-  AWAIT_READY(status2);
-  ASSERT_EQ(TASK_RUNNING, status2->state());
-
-  EXPECT_CALL(exec1, registered(_, _, _, _));
-
-  EXPECT_CALL(exec1, launchTask(_, _))
-    .WillOnce(SendStatusUpdateFromTask(TASK_RUNNING));
-
-  Future<TaskStatus> status1;
-  EXPECT_CALL(sched, statusUpdate(&driver, _))
-    .WillOnce(FutureArg<1>(&status1));
-
-  // Complete authorization of 'task1'.
-  promise.set(true);
-
-  AWAIT_READY(status1);
-  ASSERT_EQ(TASK_RUNNING, status1->state());
-
-  EXPECT_CALL(exec1, shutdown(_))
-    .Times(AtMost(1));
-
-  EXPECT_CALL(exec2, shutdown(_))
-    .Times(AtMost(1));
-
-  driver.stop();
-  driver.join();
-}
-
-
 // This test verifies that a framework registration with authorized
 // role is successful.
 TEST_F(MasterAuthorizationTest, AuthorizedRole)
@@ -1065,6 +468,59 @@ TEST_F(MasterAuthorizationTest, UnauthorizedRole)
   driver.join();
 }
 
+static shared_ptr<const ObjectApprover> getAcceptingObjectApprover()
+{
+  return std::make_shared<AcceptingObjectApprover>();
+}
+
+
+// This test verifies that disconnected frameworks do not own
+// `ObjectApprover`s.
+TEST_F(MasterAuthorizationTest, ObjectApproversDeletedOnDisconnection)
+{
+  shared_ptr<const ObjectApprover> approver = getAcceptingObjectApprover();
+
+  MockAuthorizer authorizer;
+  const weak_ptr<const ObjectApprover> weakApprover {approver};
+
+  EXPECT_CALL(authorizer, getApprover(_, _))
+    .WillRepeatedly(InvokeWithoutArgs([weakApprover]() {
+      auto approver = weakApprover.lock();
+      CHECK(approver);
+      return approver;
+    }));
+
+  const Try<Owned<cluster::Master>> master = StartMaster(&authorizer);
+  ASSERT_SOME(master);
+
+  FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
+  frameworkInfo.set_failover_timeout(Weeks(2).secs());
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, frameworkInfo, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  Future<Nothing> registered;
+  EXPECT_CALL(sched, registered(&driver, _, _))
+    .WillOnce(FutureSatisfy(&registered));
+
+  driver.start();
+
+  AWAIT_READY(registered);
+
+  // Disconnect framework but do not tear it down.
+  driver.stop(true);
+  driver.join();
+
+  Clock::pause();
+  Clock::settle();
+
+  // Make sure that the test itself doesn't store approver anymore.
+  approver.reset();
+
+  ASSERT_TRUE(weakApprover.expired());
+}
+
 
 // This test verifies that an authentication request that comes from
 // the same instance of the framework (e.g., ZK blip) before
@@ -1089,15 +545,18 @@ TEST_F(MasterAuthorizationTest, DuplicateRegistration)
 
   // Return pending futures from authorizer.
   Future<Nothing> authorize1;
-  Promise<bool> promise1;
+  Promise<shared_ptr<const ObjectApprover>> promise1;
   Future<Nothing> authorize2;
-  Promise<bool> promise2;
-  EXPECT_CALL(authorizer, authorized(_))
-    .WillOnce(DoAll(FutureSatisfy(&authorize1),
-                    Return(promise1.future())))
-    .WillOnce(DoAll(FutureSatisfy(&authorize2),
-                    Return(promise2.future())))
-    .WillRepeatedly(Return(true)); // Authorize subsequent registration retries.
+  Promise<shared_ptr<const ObjectApprover>> promise2;
+
+  // Expect requests for two approvers for REGISTER_FRAMEWORK.
+  EXPECT_CALL(authorizer, getApprover(_, authorization::REGISTER_FRAMEWORK))
+    .WillOnce(DoAll(FutureSatisfy(&authorize1), Return(promise1.future())))
+    .WillOnce(DoAll(FutureSatisfy(&authorize2), Return(promise2.future())));
+
+  // Handle requests for all other approvers.
+  EXPECT_CALL(authorizer, getApprover(_, Ne(authorization::REGISTER_FRAMEWORK)))
+    .WillRepeatedly(Return(getAcceptingObjectApprover()));
 
   // Pause the clock to avoid registration retries.
   Clock::pause();
@@ -1114,7 +573,7 @@ TEST_F(MasterAuthorizationTest, DuplicateRegistration)
   AWAIT_READY(authorize2);
 
   // Now complete the first authorization attempt.
-  promise1.set(true);
+  promise1.set(getAcceptingObjectApprover());
 
   // First registration request should succeed because the
   // framework PID did not change.
@@ -1124,7 +583,7 @@ TEST_F(MasterAuthorizationTest, DuplicateRegistration)
     FUTURE_PROTOBUF(FrameworkRegisteredMessage(), _, _);
 
   // Now complete the second authorization attempt.
-  promise2.set(true);
+  promise2.set(getAcceptingObjectApprover());
 
   // Master should acknowledge the second registration attempt too.
   AWAIT_READY(frameworkRegisteredMessage);
@@ -1157,16 +616,16 @@ TEST_F(MasterAuthorizationTest, DuplicateReregistration)
 
   // Return pending futures from authorizer after the first attempt.
   Future<Nothing> authorize2;
-  Promise<bool> promise2;
+  Promise<shared_ptr<const ObjectApprover>> promise2;
   Future<Nothing> authorize3;
-  Promise<bool> promise3;
-  EXPECT_CALL(authorizer, authorized(_))
-    .WillOnce(Return(true))
-    .WillOnce(DoAll(FutureSatisfy(&authorize2),
-                    Return(promise2.future())))
-    .WillOnce(DoAll(FutureSatisfy(&authorize3),
-                    Return(promise3.future())))
-    .WillRepeatedly(Return(true)); // Authorize subsequent registration retries.
+  Promise<shared_ptr<const ObjectApprover>> promise3;
+  EXPECT_CALL(authorizer, getApprover(_, authorization::REGISTER_FRAMEWORK))
+    .WillOnce(Return(getAcceptingObjectApprover()))
+    .WillOnce(DoAll(FutureSatisfy(&authorize2), Return(promise2.future())))
+    .WillOnce(DoAll(FutureSatisfy(&authorize3), Return(promise3.future())));
+
+  EXPECT_CALL(authorizer, getApprover(_, Ne(authorization::REGISTER_FRAMEWORK)))
+    .WillRepeatedly(Return(getAcceptingObjectApprover()));
 
   // Pause the clock to avoid re-registration retries.
   Clock::pause();
@@ -1195,7 +654,7 @@ TEST_F(MasterAuthorizationTest, DuplicateReregistration)
     .WillOnce(FutureSatisfy(&reregistered));
 
   // Now complete the second authorization attempt.
-  promise2.set(true);
+  promise2.set(getAcceptingObjectApprover());
 
   // First re-registration request should succeed because the
   // framework PID did not change.
@@ -1205,7 +664,7 @@ TEST_F(MasterAuthorizationTest, DuplicateReregistration)
     FUTURE_PROTOBUF(FrameworkReregisteredMessage(), _, _);
 
   // Now complete the third authorization attempt.
-  promise3.set(true);
+  promise3.set(getAcceptingObjectApprover());
 
   // Master should acknowledge the second re-registration attempt too.
   AWAIT_READY(frameworkReregisteredMessage);
@@ -1216,7 +675,7 @@ TEST_F(MasterAuthorizationTest, DuplicateReregistration)
 
 
 // This test ensures that a framework that is removed while
-// authorization for registration is in progress is properly handled.
+// obtaining ObjectApprovers during registration is properly handled.
 TEST_F(MasterAuthorizationTest, FrameworkRemovedBeforeRegistration)
 {
   MockAuthorizer authorizer;
@@ -1229,11 +688,13 @@ TEST_F(MasterAuthorizationTest, FrameworkRemovedBeforeRegistration)
 
   // Return a pending future from authorizer.
   Future<Nothing> authorize;
-  Promise<bool> promise;
-  EXPECT_CALL(authorizer, authorized(_))
-    .WillOnce(DoAll(FutureSatisfy(&authorize),
-                    Return(promise.future())))
-    .WillRepeatedly(Return(true)); // Authorize subsequent registration retries.
+  Promise<shared_ptr<const ObjectApprover>> promise;
+  EXPECT_CALL(authorizer, getApprover(_, authorization::REGISTER_FRAMEWORK))
+    .WillRepeatedly(DoAll(FutureSatisfy(&authorize), Return(promise.future())));
+
+  EXPECT_CALL(authorizer, getApprover(_, Ne(authorization::REGISTER_FRAMEWORK)))
+    .WillRepeatedly(Return(getAcceptingObjectApprover()));
+
 
   // Pause the clock to avoid scheduler registration retries.
   Clock::pause();
@@ -1257,8 +718,8 @@ TEST_F(MasterAuthorizationTest, FrameworkRemovedBeforeRegistration)
   Future<Nothing> removeFramework =
     FUTURE_DISPATCH(_, &MesosAllocatorProcess::removeFramework);
 
-  // Now complete authorization.
-  promise.set(true);
+  // Now make all the returned approvers ready.
+  promise.set(getAcceptingObjectApprover());
 
   // When the master tries to link to a non-existent framework PID
   // it should realize the framework is gone and remove it.
@@ -1286,13 +747,17 @@ TEST_F(MasterAuthorizationTest, FrameworkRemovedBeforeReregistration)
   EXPECT_CALL(sched, registered(&driver, _, _))
     .WillOnce(FutureSatisfy(&registered));
 
-  // Return a pending future from authorizer after first attempt.
+  // Return a pending future from authorizer after first request for
+  // REGISTER_FRAMEWORK approver
   Future<Nothing> authorize2;
-  Promise<bool> promise2;
-  EXPECT_CALL(authorizer, authorized(_))
-    .WillOnce(Return(true))
-    .WillOnce(DoAll(FutureSatisfy(&authorize2),
-                    Return(promise2.future())));
+  Promise<shared_ptr<const ObjectApprover>> promise2;
+  EXPECT_CALL(authorizer, getApprover(_, authorization::REGISTER_FRAMEWORK))
+    .WillOnce(Return(getAcceptingObjectApprover()))
+    .WillOnce(DoAll(FutureSatisfy(&authorize2), Return(promise2.future())));
+
+  // Handle all other actions.
+  EXPECT_CALL(authorizer, getApprover(_, Ne(authorization::REGISTER_FRAMEWORK)))
+    .WillRepeatedly(Return(getAcceptingObjectApprover()));
 
   // Pause the clock to avoid scheduler registration retries.
   Clock::pause();
@@ -1325,7 +790,7 @@ TEST_F(MasterAuthorizationTest, FrameworkRemovedBeforeReregistration)
   AWAIT_READY(removeFramework);
 
   // Now complete the second authorization attempt.
-  promise2.set(true);
+  promise2.set(getAcceptingObjectApprover());
 
   // Master should drop the second framework re-registration request
   // because the framework PID was removed from 'authenticated' map.
@@ -2746,6 +2211,786 @@ TEST_F(MasterAuthorizationTest, AuthorizedToRegisterNoStaticReservations)
   ASSERT_SOME(agent);
 
   AWAIT_READY(slaveRegisteredMessage);
+}
+
+// This test verifies that when reserving resources the correct
+// `RESERVE_RESOURCES` or `UNRESERVE_RESOURCES` authorization
+// requests are performed.
+TEST_F(MasterAuthorizationTest, ReserveResources)
+{
+  Clock::pause();
+
+  MockAuthorizer authorizer;
+
+  Try<Owned<cluster::Master>> master = StartMaster(&authorizer);
+  ASSERT_SOME(master);
+
+  Future<SlaveRegisteredMessage> slaveRegisteredMessage =
+    FUTURE_PROTOBUF(SlaveRegisteredMessage(), _, _);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  slave::Flags slaveFlags = CreateSlaveFlags();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), slaveFlags);
+  ASSERT_SOME(slave);
+
+  Clock::advance(slaveFlags.registration_backoff_factor);
+  AWAIT_READY(slaveRegisteredMessage);
+
+  const SlaveID& slaveId = slaveRegisteredMessage->slave_id();
+
+  // Reserve `cpus:0.1` for `foo`. This should trigger exactly one authorization
+  // request for `RESERVE_RESOURCES`. This is a base case.
+  {
+    Future<authorization::Request> request;
+    EXPECT_CALL(authorizer, authorized(_))
+      .WillOnce(DoAll(FutureArg<0>(&request), Return(true)));
+
+    Call call;
+    call.set_type(Call::RESERVE_RESOURCES);
+    Call::ReserveResources* reserveResources = call.mutable_reserve_resources();
+
+    reserveResources->mutable_agent_id()->set_value(slaveId.value());
+
+    v1::Resource resource = *v1::Resources::parse("cpus", "0.1", "*");
+    *reserveResources->add_source() = resource;
+
+    *resource.add_reservations() =
+      v1::createDynamicReservationInfo("foo", DEFAULT_CREDENTIAL.principal());
+    *reserveResources->add_resources() = resource;
+
+    Future<http::Response> response = http::post(
+        master.get()->pid,
+        "/api/v1",
+        createBasicAuthHeaders(DEFAULT_CREDENTIAL),
+        stringify(JSON::protobuf(call)),
+        stringify(ContentType::JSON));
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(Accepted().status, response);
+
+    AWAIT_READY(request);
+    ASSERT_EQ(authorization::Action::RESERVE_RESOURCES, request->action());
+    ASSERT_EQ(1, request->object().resource().reservations_size());
+    ASSERT_EQ("foo", request->object().resource().reservations(0).role());
+  }
+
+  // Reserve `cpus:0.1` for `foo` and refine to `foo/bar`. This should trigger
+  // two authorization requests, one for the reservation to `foo` and another
+  // one for the reservation refinement to `foo/bar`.
+  {
+    Future<authorization::Request> request1;
+    Future<authorization::Request> request2;
+    EXPECT_CALL(authorizer, authorized(_))
+      .WillOnce(DoAll(FutureArg<0>(&request1), Return(true)))
+      .WillOnce(DoAll(FutureArg<0>(&request2), Return(true)));
+
+    Call call;
+    call.set_type(Call::RESERVE_RESOURCES);
+    Call::ReserveResources* reserveResources = call.mutable_reserve_resources();
+
+    reserveResources->mutable_agent_id()->set_value(slaveId.value());
+
+    v1::Resource resource = *v1::Resources::parse("cpus", "0.1", "*");
+    *reserveResources->add_source() = resource;
+
+    *resource.add_reservations() =
+      v1::createDynamicReservationInfo("foo", DEFAULT_CREDENTIAL.principal());
+    *resource.add_reservations() = v1::createDynamicReservationInfo(
+        "foo/bar", DEFAULT_CREDENTIAL.principal());
+    *reserveResources->add_resources() = resource;
+
+    Future<http::Response> response = http::post(
+        master.get()->pid,
+        "/api/v1",
+        createBasicAuthHeaders(DEFAULT_CREDENTIAL),
+        stringify(JSON::protobuf(call)),
+        stringify(ContentType::JSON));
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(Accepted().status, response);
+
+    AWAIT_READY(request1);
+    ASSERT_EQ(authorization::Action::RESERVE_RESOURCES, request1->action());
+    ASSERT_EQ(1, request1->object().resource().reservations_size());
+    ASSERT_EQ("foo", request1->object().resource().reservations(0).role());
+
+    AWAIT_READY(request2);
+    ASSERT_EQ(authorization::Action::RESERVE_RESOURCES, request2->action());
+    ASSERT_EQ(2, request2->object().resource().reservations_size());
+    ASSERT_EQ("foo", request2->object().resource().reservations(0).role());
+    ASSERT_EQ("foo/bar", request2->object().resource().reservations(1).role());
+  }
+
+  // Re-reserve the `cpus:0.1` reserved above for `foo` and refined to `foo/bar`
+  // to `baz` and refined to `baz/bar`. This will trigger two authorization
+  // requests to unreserved the resource in the `foo` hierarchy, and two
+  // authorization request for the reservations in the `baz` hierarchy.
+  {
+    Future<authorization::Request> request1;
+    Future<authorization::Request> request2;
+    Future<authorization::Request> request3;
+    Future<authorization::Request> request4;
+    EXPECT_CALL(authorizer, authorized(_))
+      .WillOnce(DoAll(FutureArg<0>(&request1), Return(true)))
+      .WillOnce(DoAll(FutureArg<0>(&request2), Return(true)))
+      .WillOnce(DoAll(FutureArg<0>(&request3), Return(true)))
+      .WillOnce(DoAll(FutureArg<0>(&request4), Return(true)));
+
+    Call call;
+    call.set_type(Call::RESERVE_RESOURCES);
+    Call::ReserveResources* reserveResources = call.mutable_reserve_resources();
+
+    reserveResources->mutable_agent_id()->set_value(slaveId.value());
+
+    v1::Resource source = *v1::Resources::parse("cpus", "0.1", "*");
+    *source.add_reservations() =
+      v1::createDynamicReservationInfo("foo", DEFAULT_CREDENTIAL.principal());
+    *source.add_reservations() = v1::createDynamicReservationInfo(
+      "foo/bar", DEFAULT_CREDENTIAL.principal());
+
+    v1::Resource resource = *v1::Resources::parse("cpus", "0.1", "*");
+    *resource.add_reservations() =
+      v1::createDynamicReservationInfo("baz", DEFAULT_CREDENTIAL.principal());
+    *resource.add_reservations() = v1::createDynamicReservationInfo(
+      "baz/bar", DEFAULT_CREDENTIAL.principal());
+
+    *reserveResources->add_resources() = resource;
+    *reserveResources->add_source() = source;
+
+    Future<http::Response> response = http::post(
+        master.get()->pid,
+        "/api/v1",
+        createBasicAuthHeaders(DEFAULT_CREDENTIAL),
+        stringify(JSON::protobuf(call)),
+        stringify(ContentType::JSON));
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(Accepted().status, response);
+
+    AWAIT_READY(request1);
+    ASSERT_EQ(authorization::Action::UNRESERVE_RESOURCES, request1->action());
+    ASSERT_EQ(2, request1->object().resource().reservations_size());
+    ASSERT_EQ("foo", request1->object().resource().reservations(0).role());
+    ASSERT_EQ("foo/bar", request1->object().resource().reservations(1).role());
+
+    AWAIT_READY(request2);
+    ASSERT_EQ(authorization::Action::UNRESERVE_RESOURCES, request2->action());
+    ASSERT_EQ(1, request2->object().resource().reservations_size());
+    ASSERT_EQ("foo", request1->object().resource().reservations(0).role());
+
+    AWAIT_READY(request3);
+    ASSERT_EQ(authorization::Action::RESERVE_RESOURCES, request3->action());
+    ASSERT_EQ(1, request3->object().resource().reservations_size());
+    ASSERT_EQ("baz", request3->object().resource().reservations(0).role());
+
+    AWAIT_READY(request4);
+    ASSERT_EQ(authorization::Action::RESERVE_RESOURCES, request4->action());
+    ASSERT_EQ(2, request4->object().resource().reservations_size());
+    ASSERT_EQ("baz", request4->object().resource().reservations(0).role());
+    ASSERT_EQ("baz/bar", request4->object().resource().reservations(1).role());
+  }
+}
+
+class MasterOperationAuthorizationTest
+  : public MesosTest,
+    public ::testing::WithParamInterface<authorization::Action>
+{
+public:
+  static Resources createAgentResources(const Resources& resources)
+  {
+    Resources agentResources;
+    foreach (
+        Resource resource,
+        resources - resources.filter(&Resources::hasResourceProvider)) {
+      if (Resources::isPersistentVolume(resource)) {
+        if (resource.disk().has_source()) {
+          resource.mutable_disk()->clear_persistence();
+          resource.mutable_disk()->clear_volume();
+        } else {
+          resource.clear_disk();
+        }
+      }
+
+      agentResources += resource;
+    }
+
+    return agentResources;
+  }
+
+  static vector<v1::Offer::Operation> createOperations(
+      const v1::FrameworkID& frameworkId,
+      const v1::AgentID& agentId,
+      const authorization::Action& action)
+  {
+    switch (action) {
+      case authorization::RUN_TASK: {
+        const v1::Resources taskResources =
+          v1::Resources::parse("cpus:1;mem:32").get();
+
+        v1::ExecutorInfo executorInfo = v1::createExecutorInfo(
+            v1::DEFAULT_EXECUTOR_ID,
+            None(),
+            v1::Resources::parse("cpus:1;mem:32;disk:32").get(),
+            v1::ExecutorInfo::DEFAULT,
+            frameworkId);
+
+        return {v1::LAUNCH(
+                    {v1::createTask(agentId, taskResources, ""),
+                     v1::createTask(agentId, taskResources, "")}),
+                v1::LAUNCH_GROUP(
+                    executorInfo,
+                    v1::createTaskGroupInfo(
+                        {v1::createTask(agentId, taskResources, ""),
+                         v1::createTask(agentId, taskResources, "")}))};
+      }
+      case authorization::RESERVE_RESOURCES: {
+        v1::OperationID operationId;
+        operationId.set_value(id::UUID::random().toString());
+
+        v1::Resources reserved;
+        reserved += v1::createReservedResource(
+            "cpus", "1", v1::createDynamicReservationInfo(
+                "role", v1::DEFAULT_CREDENTIAL.principal()));
+        reserved += v1::createReservedResource(
+            "mem", "32", v1::createDynamicReservationInfo(
+                "role", v1::DEFAULT_CREDENTIAL.principal()));
+
+        return {v1::RESERVE(reserved, std::move(operationId))};
+      }
+      case authorization::UNRESERVE_RESOURCES: {
+        v1::OperationID operationId;
+        operationId.set_value(id::UUID::random().toString());
+
+        v1::Resources reserved;
+        reserved += v1::createReservedResource(
+            "cpus", "1", v1::createDynamicReservationInfo("role"));
+        reserved += v1::createReservedResource(
+            "mem", "32", v1::createDynamicReservationInfo("role"));
+
+        return {v1::UNRESERVE(reserved, std::move(operationId))};
+      }
+      case authorization::CREATE_VOLUME: {
+        v1::OperationID operationId;
+        operationId.set_value(id::UUID::random().toString());
+
+        v1::Resources volumes;
+        volumes += v1::createPersistentVolume(
+            Megabytes(32),
+            "role",
+            id::UUID::random().toString(),
+            "path",
+            None(),
+            None(),
+            v1::DEFAULT_CREDENTIAL.principal());
+        volumes += v1::createPersistentVolume(
+            Megabytes(32),
+            "role",
+            id::UUID::random().toString(),
+            "path",
+            None(),
+            None(),
+            v1::DEFAULT_CREDENTIAL.principal());
+
+        return {v1::CREATE(volumes, std::move(operationId))};
+      }
+      case authorization::DESTROY_VOLUME: {
+        v1::OperationID operationId;
+        operationId.set_value(id::UUID::random().toString());
+
+        v1::Resources volumes;
+        volumes += v1::createPersistentVolume(
+            Megabytes(32), "role", id::UUID::random().toString(), "path");
+        volumes += v1::createPersistentVolume(
+            Megabytes(32), "role", id::UUID::random().toString(), "path");
+
+        return {v1::DESTROY(volumes, std::move(operationId))};
+      }
+      case authorization::RESIZE_VOLUME: {
+        v1::OperationID operationId1;
+        operationId1.set_value(id::UUID::random().toString());
+
+        v1::OperationID operationId2;
+        operationId2.set_value(id::UUID::random().toString());
+
+        return {
+          v1::GROW_VOLUME(
+              v1::createPersistentVolume(
+                  Megabytes(32), "role", id::UUID::random().toString(), "path"),
+              v1::Resources::parse("disk", "32", "role").get(),
+              std::move(operationId1)),
+          v1::SHRINK_VOLUME(
+              v1::createPersistentVolume(
+                  Megabytes(64), "role", id::UUID::random().toString(), "path"),
+              mesos::v1::internal::values::parse("32")->scalar(),
+              std::move(operationId2))};
+      }
+      case authorization::CREATE_BLOCK_DISK: {
+        v1::OperationID operationId;
+        operationId.set_value(id::UUID::random().toString());
+
+        v1::Resource raw = v1::createDiskResource(
+            "32", "*", None(), None(), v1::createDiskSourceRaw(
+                None(), "profile"));
+        raw.mutable_provider_id()->set_value("provider");
+
+        return {v1::CREATE_DISK(
+            raw,
+            v1::Resource::DiskInfo::Source::BLOCK,
+            None(),
+            std::move(operationId))};
+      }
+      case authorization::DESTROY_BLOCK_DISK: {
+        v1::OperationID operationId;
+        operationId.set_value(id::UUID::random().toString());
+
+        v1::Resource block = v1::createDiskResource(
+            "32", "*", None(), None(), v1::createDiskSourceBlock(
+                id::UUID::random().toString(), "profile"));
+        block.mutable_provider_id()->set_value("provider");
+
+        return {v1::DESTROY_DISK(block, std::move(operationId))};
+      }
+      case authorization::CREATE_MOUNT_DISK: {
+        v1::OperationID operationId;
+        operationId.set_value(id::UUID::random().toString());
+
+        v1::Resource raw = v1::createDiskResource(
+            "32", "*", None(), None(), v1::createDiskSourceRaw(
+                None(), "profile"));
+        raw.mutable_provider_id()->set_value("provider");
+
+        return {v1::CREATE_DISK(
+            raw,
+            v1::Resource::DiskInfo::Source::MOUNT,
+            None(),
+            std::move(operationId))};
+      }
+      case authorization::DESTROY_MOUNT_DISK: {
+        v1::OperationID operationId;
+        operationId.set_value(id::UUID::random().toString());
+
+        v1::Resource mount = v1::createDiskResource(
+            "32", "*", None(), None(), v1::createDiskSourceMount(
+                None(), id::UUID::random().toString(), "profile"));
+        mount.mutable_provider_id()->set_value("provider");
+
+        return {v1::DESTROY_DISK(mount, std::move(operationId))};
+      }
+      case authorization::DESTROY_RAW_DISK: {
+        v1::OperationID operationId;
+        operationId.set_value(id::UUID::random().toString());
+
+        v1::Resource raw = v1::createDiskResource(
+            "32", "*", None(), None(), v1::createDiskSourceRaw(
+                id::UUID::random().toString(), "profile"));
+        raw.mutable_provider_id()->set_value("provider");
+
+        return {v1::DESTROY_DISK(raw, std::move(operationId))};
+      }
+      case authorization::UNKNOWN:
+      case authorization::REGISTER_FRAMEWORK:
+      case authorization::TEARDOWN_FRAMEWORK:
+      case authorization::GET_ENDPOINT_WITH_PATH:
+      case authorization::VIEW_ROLE:
+      case authorization::UPDATE_WEIGHT:
+      case authorization::GET_QUOTA:
+      case authorization::UPDATE_QUOTA:
+      case authorization::UPDATE_QUOTA_WITH_CONFIG:
+      case authorization::VIEW_FRAMEWORK:
+      case authorization::VIEW_TASK:
+      case authorization::VIEW_EXECUTOR:
+      case authorization::ACCESS_SANDBOX:
+      case authorization::ACCESS_MESOS_LOG:
+      case authorization::VIEW_FLAGS:
+      case authorization::LAUNCH_NESTED_CONTAINER:
+      case authorization::KILL_NESTED_CONTAINER:
+      case authorization::WAIT_NESTED_CONTAINER:
+      case authorization::LAUNCH_NESTED_CONTAINER_SESSION:
+      case authorization::ATTACH_CONTAINER_INPUT:
+      case authorization::ATTACH_CONTAINER_OUTPUT:
+      case authorization::VIEW_CONTAINER:
+      case authorization::SET_LOG_LEVEL:
+      case authorization::REMOVE_NESTED_CONTAINER:
+      case authorization::REGISTER_AGENT:
+      case authorization::UPDATE_MAINTENANCE_SCHEDULE:
+      case authorization::GET_MAINTENANCE_SCHEDULE:
+      case authorization::START_MAINTENANCE:
+      case authorization::STOP_MAINTENANCE:
+      case authorization::GET_MAINTENANCE_STATUS:
+      case authorization::DRAIN_AGENT:
+      case authorization::DEACTIVATE_AGENT:
+      case authorization::REACTIVATE_AGENT:
+      case authorization::MARK_AGENT_GONE:
+      case authorization::LAUNCH_STANDALONE_CONTAINER:
+      case authorization::KILL_STANDALONE_CONTAINER:
+      case authorization::WAIT_STANDALONE_CONTAINER:
+      case authorization::REMOVE_STANDALONE_CONTAINER:
+      case authorization::VIEW_STANDALONE_CONTAINER:
+      case authorization::MODIFY_RESOURCE_PROVIDER_CONFIG:
+      case authorization::MARK_RESOURCE_PROVIDER_GONE:
+      case authorization::VIEW_RESOURCE_PROVIDER:
+      case authorization::PRUNE_IMAGES:
+        return {};
+    }
+
+    UNREACHABLE();
+  }
+};
+
+
+class ControllableObjectApprover : public ObjectApprover
+{
+public:
+  ControllableObjectApprover(bool permissive_) : permissive(permissive_) {}
+  void disable() { permissive.store(false); }
+
+  Try<bool> approved(
+      const Option<ObjectApprover::Object>&) const noexcept override
+  {
+    return permissive.load();
+  }
+
+private:
+  std::atomic_bool permissive;
+};
+
+
+INSTANTIATE_TEST_CASE_P(
+    AllowedAction,
+    MasterOperationAuthorizationTest,
+    ::testing::Values(
+        authorization::RUN_TASK,
+        authorization::RESERVE_RESOURCES,
+        authorization::UNRESERVE_RESOURCES,
+        authorization::CREATE_VOLUME,
+        authorization::DESTROY_VOLUME,
+        authorization::RESIZE_VOLUME,
+        authorization::CREATE_BLOCK_DISK,
+        authorization::DESTROY_BLOCK_DISK,
+        authorization::CREATE_MOUNT_DISK,
+        authorization::DESTROY_MOUNT_DISK),
+    [](const testing::TestParamInfo<authorization::Action>& action) {
+      return authorization::Action_Name(action.param);
+    });
+
+
+// This test verifies that allowing or denying an action will only result in a
+// success or failure on specific operations but not other operations in an
+// accept call. This is a regression test for MESOS-9474 and MESOS-9480.
+TEST_P(MasterOperationAuthorizationTest, Accept)
+{
+  Clock::pause();
+
+  const auto controllableApprover =
+    std::make_shared<ControllableObjectApprover>(true);
+
+  MockAuthorizer authorizer;
+
+  const authorization::Action allowedAction = GetParam();
+  EXPECT_CALL(authorizer, getApprover(_, _))
+    .WillRepeatedly(Invoke([controllableApprover, allowedAction](
+                               const Option<authorization::Subject>&,
+                               const authorization::Action& action) {
+      return action == allowedAction ? getAcceptingObjectApprover()
+                                     : controllableApprover;
+    }));
+
+  Try<Owned<cluster::Master>> master = StartMaster(&authorizer);
+  ASSERT_SOME(master);
+
+  // First, we create a list of operations to exercise all authorization
+  // actions, and compute the total resources needed by these operations and set
+  // up their expected terminal states.
+  //
+  // NOTE: We create some `RUN_TASK` operations in the beginning and some in the
+  // end for two reasons: 1. These operations doesn't have operation IDs so
+  // needs to be handled differently. 2. By adding some operations for the
+  // `RUN_TASK` action in the end, we can verify that their results are not
+  // affected by preceding authorizations.
+  vector<v1::Offer::Operation> operations;
+  v1::Resources totalResources;
+  hashmap<v1::TaskID, v1::TaskState> expectedTaskStates;
+  hashmap<v1::OperationID, v1::OperationState> expectedOperationStates;
+
+  // NOTE: Because we create operations before getting an offer, we synthesize
+  // the framework ID and agent ID here and check them later.
+  v1::FrameworkID frameworkId;
+  frameworkId.set_value(master.get()->getMasterInfo().id() + "-0000");
+  v1::AgentID agentId;
+  agentId.set_value(master.get()->getMasterInfo().id() + "-S0");
+
+  auto addRunTaskOperations = [&] {
+    foreach (
+        v1::Offer::Operation& operation,
+        createOperations(frameworkId, agentId, authorization::RUN_TASK)) {
+      if (operation.type() == v1::Offer::Operation::LAUNCH) {
+        foreach (const v1::TaskInfo& task, operation.launch().task_infos()) {
+          totalResources += task.resources();
+          totalResources += task.executor().resources();
+
+          expectedTaskStates.put(
+              task.task_id(),
+              authorization::RUN_TASK == GetParam()
+                ? v1::TASK_FINISHED : v1::TASK_ERROR);
+        }
+      } else if (operation.type() == v1::Offer::Operation::LAUNCH_GROUP) {
+        totalResources += operation.launch_group().executor().resources();
+
+        foreach (
+            const v1::TaskInfo& task,
+            operation.launch_group().task_group().tasks()) {
+          totalResources += task.resources();
+
+          expectedTaskStates.put(
+              task.task_id(),
+              authorization::RUN_TASK == GetParam()
+                ? v1::TASK_FINISHED : v1::TASK_ERROR);
+        }
+      }
+
+      operations.push_back(std::move(operation));
+    }
+  };
+
+  addRunTaskOperations();
+
+  for (int i = 0; i < authorization::Action_descriptor()->value_count(); i++) {
+    const authorization::Action action = static_cast<authorization::Action>(
+        authorization::Action_descriptor()->value(i)->number());
+
+    // Skip `RUN_TASK` operations since they are handled separately.
+    if (action == authorization::RUN_TASK) {
+      continue;
+    }
+
+    foreach (
+        v1::Offer::Operation& operation,
+        createOperations(frameworkId, agentId, action)) {
+      Try<Resources> consumed =
+        protobuf::getConsumedResources(devolve(operation));
+      ASSERT_SOME(consumed);
+      totalResources += evolve(consumed.get());
+
+      ASSERT_TRUE(operation.has_id());
+      expectedOperationStates.put(
+          operation.id(),
+          action == GetParam() ? v1::OPERATION_FINISHED : v1::OPERATION_ERROR);
+
+      operations.push_back(std::move(operation));
+    }
+  }
+
+  addRunTaskOperations();
+
+  // Then, we register a mock agent that has sufficient resources to exercise
+  // all operations and simply replies `TASK_FINISHED` or `OPERATION_FINISHED`
+  // for all tasks or operations it receives.
+  //
+  // NOTE: Since dynamic reservations, persistent volumes and resource
+  // provider resources cannot be specified through the `--resources` flag, we
+  // intercept the `RegisterSlaveMessage` and `UpdateSlaveMessage` to inject
+  // resources required by all operations then forward them to the master.
+  Future<RegisterSlaveMessage> registerSlaveMessage =
+    DROP_PROTOBUF(RegisterSlaveMessage(), _, _);
+  Future<SlaveRegisteredMessage> slaveRegisteredMessage =
+    FUTURE_PROTOBUF(SlaveRegisteredMessage(), _, _);
+  Future<UpdateSlaveMessage> updateSlaveMessage =
+    DROP_PROTOBUF(UpdateSlaveMessage(), _, _);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  slave::Flags slaveFlags = CreateSlaveFlags();
+  Try<Owned<cluster::Slave>> slave =
+    StartSlave(detector.get(), slaveFlags, true);
+  ASSERT_SOME(slave);
+  ASSERT_NE(nullptr, slave.get()->mock());
+
+  EXPECT_CALL(*slave.get()->mock(), runTask(_, _, _, _, _, _, _))
+    .WillRepeatedly(Invoke([&](
+        const process::UPID& from,
+        const FrameworkInfo& frameworkInfo,
+        const FrameworkID& frameworkId,
+        const process::UPID& pid,
+        const TaskInfo& task,
+        const std::vector<ResourceVersionUUID>& resourceVersionUuids,
+        const Option<bool>& launchExecutor) {
+      ASSERT_TRUE(frameworkInfo.has_id());
+
+      StatusUpdateMessage message;
+      message.set_pid(slave.get()->pid);
+      *message.mutable_update() = protobuf::createStatusUpdate(
+          frameworkInfo.id(),
+          devolve(agentId),
+          task.task_id(),
+          TASK_FINISHED,
+          TaskStatus::SOURCE_SLAVE,
+          id::UUID::random());
+
+      process::post(slave.get()->pid, master.get()->pid, message);
+    }));
+
+  EXPECT_CALL(*slave.get()->mock(), runTaskGroup(_, _, _, _, _, _))
+    .WillRepeatedly(Invoke([&](
+        const process::UPID& from,
+        const FrameworkInfo& frameworkInfo,
+        const ExecutorInfo& executorInfo,
+        const TaskGroupInfo& taskGroup,
+        const std::vector<ResourceVersionUUID>& resourceVersionUuids,
+        const Option<bool>& launchExecutor) {
+      ASSERT_TRUE(frameworkInfo.has_id());
+
+      foreach (const TaskInfo& task, taskGroup.tasks()) {
+        StatusUpdateMessage message;
+        message.set_pid(slave.get()->pid);
+        *message.mutable_update() = protobuf::createStatusUpdate(
+            frameworkInfo.id(),
+            devolve(agentId),
+            task.task_id(),
+            TASK_FINISHED,
+            TaskStatus::SOURCE_SLAVE,
+            id::UUID::random());
+
+        process::post(slave.get()->pid, master.get()->pid, message);
+      }
+    }));
+
+  EXPECT_CALL(*slave.get()->mock(), applyOperation(_))
+    .WillRepeatedly(Invoke([&](const ApplyOperationMessage& message) {
+      ASSERT_TRUE(message.has_framework_id());
+      ASSERT_TRUE(message.operation_info().has_id());
+
+      process::post(
+          slave.get()->pid,
+          master.get()->pid,
+          protobuf::createUpdateOperationStatusMessage(
+              message.operation_uuid(),
+              protobuf::createOperationStatus(
+                  OPERATION_FINISHED,
+                  message.operation_info().id(),
+                  None(),
+                  None(),
+                  None(),
+                  devolve(agentId)),
+              None(),
+              message.framework_id(),
+              devolve(agentId)));
+    }));
+
+  slave.get()->start();
+
+  // Settle the clock to ensure that the master has been detected by the agent,
+  // then advance the clock to trigger an authentication and a registration.
+  Clock::settle();
+  Clock::advance(slaveFlags.registration_backoff_factor);
+
+  AWAIT_READY(registerSlaveMessage);
+
+  {
+    RegisterSlaveMessage message = registerSlaveMessage.get();
+    *message.mutable_slave()->mutable_resources() =
+      createAgentResources(devolve(totalResources));
+    *message.mutable_checkpointed_resources() =
+      devolve(totalResources).filter(needCheckpointing);
+
+    process::post(slave.get()->pid, master.get()->pid, message);
+  }
+
+  AWAIT_READY(slaveRegisteredMessage);
+  EXPECT_EQ(devolve(agentId), slaveRegisteredMessage->slave_id());
+
+  AWAIT_READY(updateSlaveMessage);
+
+  {
+    UpdateSlaveMessage message = updateSlaveMessage.get();
+    UpdateSlaveMessage::ResourceProvider* resourceProvider =
+      message.mutable_resource_providers()->add_providers();
+    resourceProvider->mutable_info()->mutable_id()->set_value("provider");
+    resourceProvider->mutable_info()->set_type("resource_provider_type");
+    resourceProvider->mutable_info()->set_name("resource_provider_name");
+    *resourceProvider->mutable_total_resources() =
+      devolve(totalResources).filter(&Resources::hasResourceProvider);
+    resourceProvider->mutable_operations();
+    resourceProvider->mutable_resource_version_uuid()->set_value(
+        id::UUID::random().toBytes());
+
+    process::post(slave.get()->pid, master.get()->pid, message);
+  }
+
+  // Settle the clock to ensure that the resource providers has been updated.
+  Clock::settle();
+
+  // Finally, we register a framework to exercise all operations, and check that
+  // only authorized tasks and operations are finished.
+  v1::FrameworkInfo frameworkInfo = v1::DEFAULT_FRAMEWORK_INFO;
+  frameworkInfo.set_roles(0, "role");
+
+  auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
+
+  EXPECT_CALL(*scheduler, connected(_))
+    .WillOnce(v1::scheduler::SendSubscribe(frameworkInfo));
+
+  Future<v1::scheduler::Event::Subscribed> subscribed;
+  EXPECT_CALL(*scheduler, subscribed(_, _)).WillOnce(FutureArg<1>(&subscribed));
+
+  EXPECT_CALL(*scheduler, heartbeat(_))
+    .WillRepeatedly(Return()); // Ignore heartbeats.
+
+  Future<v1::scheduler::Event::Offers> offers;
+  EXPECT_CALL(*scheduler, offers(_, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  v1::scheduler::TestMesos mesos(
+      master.get()->pid, ContentType::PROTOBUF, scheduler);
+
+  AWAIT_READY(subscribed);
+  EXPECT_EQ(frameworkId, subscribed->framework_id());
+
+  // Start to deny disallowed actions.
+  controllableApprover->disable();
+
+  AWAIT_READY(offers);
+  ASSERT_EQ(1, offers->offers_size());
+
+  hashmap<v1::TaskID, Future<v1::scheduler::Event::Update>>
+    actualTaskStatusUpdates;
+  hashmap<v1::OperationID, Future<v1::scheduler::Event::UpdateOperationStatus>>
+    actualOperationStatusUpdates;
+
+  foreachkey (const v1::TaskID& taskId, expectedTaskStates) {
+    EXPECT_CALL(*scheduler, update(_, AllOf(
+        TaskStatusUpdateTaskIdEq(taskId),
+        Truly([](const v1::scheduler::Event::Update& update) {
+          return protobuf::isTerminalState(devolve(update.status()).state());
+        }))))
+      .WillOnce(FutureArg<1>(&actualTaskStatusUpdates[taskId]));
+  }
+
+  foreachkey (const v1::OperationID& operationId, expectedOperationStates) {
+    EXPECT_CALL(*scheduler, updateOperationStatus(_, AllOf(
+        v1::scheduler::OperationStatusUpdateOperationIdEq(operationId),
+        Truly([](const v1::scheduler::Event::UpdateOperationStatus& update) {
+          return protobuf::isTerminalState(devolve(update.status()).state());
+        }))))
+      .WillOnce(FutureArg<1>(&actualOperationStatusUpdates[operationId]));
+  }
+
+  mesos.send(v1::createCallAccept(
+      subscribed->framework_id(),
+      offers->offers(0),
+      operations));
+
+  foreachpair (
+      const v1::TaskID& taskId,
+      const Future<v1::scheduler::Event::Update>& update,
+      actualTaskStatusUpdates) {
+    AWAIT_READY(update);
+    EXPECT_EQ(expectedTaskStates[taskId], update->status().state());
+  }
+
+  foreachpair (
+      const v1::OperationID& operationId,
+      const Future<v1::scheduler::Event::UpdateOperationStatus>& update,
+      actualOperationStatusUpdates) {
+    AWAIT_READY(update);
+    EXPECT_EQ(expectedOperationStates[operationId], update->status().state());
+  }
 }
 
 } // namespace tests {

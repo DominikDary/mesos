@@ -158,7 +158,7 @@ public:
         "local_" + strings::remove(id::UUID::random().toString(), "-");
 
       const string testCsiPluginPath =
-        path::join(tests::flags.build_dir, "src", "test-csi-plugin");
+        path::join(getTestHelperDir(), "test-csi-plugin");
 
       const string testCsiPluginWorkDir =
         path::join(sandbox.get(), testCsiPluginName);
@@ -760,7 +760,7 @@ TEST_P(AgentResourceProviderConfigApiTest, IdempotentUpdate)
 
 // This test checks that updating a nonexistent resource provider config is
 // rejected.
-TEST_P(AgentResourceProviderConfigApiTest, UpdateNotFound)
+TEST_P(AgentResourceProviderConfigApiTest, UpdateConflict)
 {
   const ContentType contentType = GetParam();
 
@@ -780,7 +780,7 @@ TEST_P(AgentResourceProviderConfigApiTest, UpdateNotFound)
   ResourceProviderInfo info = createResourceProviderInfo("volume1:4GB");
 
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(
-      http::NotFound().status,
+      http::Conflict().status,
       updateResourceProviderConfig(slave.get()->pid, contentType, info));
 
   // Check that no new config is created.

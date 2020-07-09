@@ -60,7 +60,10 @@ namespace paths {
 //           |   |-- pid
 //           |   |-- socket
 //           |-- launch_info
+//           |-- mnt
+//           |   |-- host_proc
 //           |-- pid
+//           |-- shm
 //           |-- standalone.marker
 //           |-- status
 //           |-- termination
@@ -73,10 +76,15 @@ constexpr char TERMINATION_FILE[] = "termination";
 constexpr char SOCKET_FILE[] = "socket";
 constexpr char FORCE_DESTROY_ON_RECOVERY_FILE[] = "force_destroy_on_recovery";
 constexpr char IO_SWITCHBOARD_DIRECTORY[] = "io_switchboard";
+constexpr char MNT_DIRECTORY[] = "mnt";
+constexpr char MNT_HOST_PROC[] = "host_proc";
 constexpr char CONTAINER_DIRECTORY[] = "containers";
 constexpr char CONTAINER_DEVICES_DIRECTORY[] = "devices";
 constexpr char CONTAINER_LAUNCH_INFO_FILE[] = "launch_info";
 constexpr char STANDALONE_MARKER_FILE[] = "standalone.marker";
+constexpr char CONTAINER_SHM_DIRECTORY[] = "shm";
+constexpr char AGENT_SHM_DIRECTORY[] = "/dev/shm";
+constexpr char SECRET_DIRECTORY[] = ".secret";
 
 
 enum Mode
@@ -173,6 +181,11 @@ std::string getContainerIOSwitchboardSocketProvisionalPath(
 Result<process::network::unix::Address> getContainerIOSwitchboardAddress(
     const std::string& runtimeDir,
     const ContainerID& containerId);
+
+// The helper method to get the host proc mount point path.
+std::string getHostProcMountPointPath(
+    const std::string& runtimeDir,
+    const ContainerID& containerId);
 #endif
 
 
@@ -248,6 +261,30 @@ Try<ContainerID> parseSandboxPath(
     const ContainerID& rootContainerId,
     const std::string& rootSandboxPath,
     const std::string& path);
+
+
+std::string getContainerShmPath(
+    const std::string& runtimeDir,
+    const ContainerID& containerId);
+
+
+Try<std::string> getParentShmPath(
+    const std::string runtimeDir,
+    const ContainerID& containerId);
+
+
+// Helper for determining the cgroup for a container (i.e., the path
+// in a cgroup subsystem).
+std::string getCgroupPath(
+    const std::string& cgroupsRoot,
+    const ContainerID& containerId);
+
+
+// Helper for parsing the cgroup path to determine the container ID
+// it belongs to.
+Option<ContainerID> parseCgroupPath(
+    const std::string& cgroupsRoot,
+    const std::string& cgroup);
 
 } // namespace paths {
 } // namespace containerizer {

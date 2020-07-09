@@ -15,11 +15,18 @@
 // limitations under the License.
 
 #include <map>
+#include <memory>
 #include <ostream>
 #include <set>
 #include <string>
 #include <utility>
 #include <vector>
+
+#include <google/protobuf/descriptor.h>
+#include <google/protobuf/descriptor.pb.h>
+#include <google/protobuf/message.h>
+#include <google/protobuf/reflection.h>
+#include <google/protobuf/repeated_field.h>
 
 #include <mesos/attributes.hpp>
 #include <mesos/http.hpp>
@@ -57,6 +64,7 @@
 using std::map;
 using std::ostream;
 using std::set;
+using std::shared_ptr;
 using std::string;
 using std::vector;
 
@@ -130,6 +138,290 @@ bool streamingMediaType(ContentType contentType)
   }
 
   UNREACHABLE();
+}
+
+
+string lowerSlaveToAgent(string s)
+{
+  size_t index = 0;
+
+  while (true) {
+    index = s.find("slave", index);
+    if (index == std::string::npos) break;
+    s.replace(index, 5, "agent");
+    index += 5;
+  }
+
+  return s;
+}
+
+
+string upperSlaveToAgent(string s)
+{
+  size_t index = 0;
+
+  while (true) {
+    index = s.find("SLAVE", index);
+    if (index == std::string::npos) break;
+    s.replace(index, 5, "AGENT");
+    index += 5;
+  }
+
+  return s;
+}
+
+
+// This is a copy of the version in stout:
+//
+//   https://github.com/apache/mesos/blob/1.9.0/3rdparty/
+//     stout/include/stout/protobuf.hpp#L816
+//
+// Except that we remap "slave" to "agent" in field names and
+// enum values.
+//
+// Therefore, this is pretty brittle! If we change the one in
+// stout we'll likely not realize this one should get a similar
+// change. Note however that this can be removed if we were to
+// keep up-to-date v1 state related objects in the master per
+// MESOS-10040.
+//
+// Hopefully keeping a copy of the stout code doesn't prove
+// too big of an issue since the stout version is pretty
+// stable. Tickets to change the stout code (MESOS-3449,
+// MESOS-6568, and MESOS-8727 have been updated with a note
+// to change this copy as well).
+void json(JSON::ObjectWriter* writer, const asV1Protobuf& protobuf)
+{
+  using google::protobuf::FieldDescriptor;
+
+  const google::protobuf::Message& message = protobuf;
+
+  const google::protobuf::Descriptor* descriptor = message.GetDescriptor();
+  const google::protobuf::Reflection* reflection = message.GetReflection();
+
+  // We first look through all the possible fields to determine both the set
+  // fields __and__ the optional fields with a default that are not set.
+  // `Reflection::ListFields()` alone will only include set fields and
+  // is therefore insufficient.
+  int fieldCount = descriptor->field_count();
+  std::vector<const FieldDescriptor*> fields;
+  fields.reserve(fieldCount);
+  for (int i = 0; i < fieldCount; ++i) {
+    const FieldDescriptor* field = descriptor->field(i);
+    if (field->is_repeated()) { // Repeated or Map.
+      if (reflection->FieldSize(message, field) > 0) {
+        // Has repeated field with members, output as JSON.
+        fields.push_back(field);
+      }
+    } else if (
+        reflection->HasField(message, field) ||
+        (field->has_default_value() && !field->options().deprecated())) {
+      // Field is set or has default, output as JSON.
+      fields.push_back(field);
+    }
+  }
+
+  foreach (const FieldDescriptor* field, fields) {
+    if (field->is_repeated() && !field->is_map()) {
+      writer->field(
+          lowerSlaveToAgent(field->name()),
+          [&field, &reflection, &message](JSON::ArrayWriter* writer) {
+            int fieldSize = reflection->FieldSize(message, field);
+            for (int i = 0; i < fieldSize; ++i) {
+              switch (field->cpp_type()) {
+                case FieldDescriptor::CPPTYPE_BOOL:
+                  writer->element(
+                      reflection->GetRepeatedBool(message, field, i));
+                  break;
+                case FieldDescriptor::CPPTYPE_INT32:
+                  writer->element(
+                      reflection->GetRepeatedInt32(message, field, i));
+                  break;
+                case FieldDescriptor::CPPTYPE_INT64:
+                  writer->element(
+                      reflection->GetRepeatedInt64(message, field, i));
+                  break;
+                case FieldDescriptor::CPPTYPE_UINT32:
+                  writer->element(
+                      reflection->GetRepeatedUInt32(message, field, i));
+                  break;
+                case FieldDescriptor::CPPTYPE_UINT64:
+                  writer->element(
+                      reflection->GetRepeatedUInt64(message, field, i));
+                  break;
+                case FieldDescriptor::CPPTYPE_FLOAT:
+                  writer->element(
+                      reflection->GetRepeatedFloat(message, field, i));
+                  break;
+                case FieldDescriptor::CPPTYPE_DOUBLE:
+                  writer->element(
+                      reflection->GetRepeatedDouble(message, field, i));
+                  break;
+                case FieldDescriptor::CPPTYPE_MESSAGE:
+                  writer->element(
+                      asV1Protobuf(
+                          reflection->GetRepeatedMessage(message, field, i)));
+                  break;
+                case FieldDescriptor::CPPTYPE_ENUM:
+                  writer->element(
+                      upperSlaveToAgent(
+                          reflection->GetRepeatedEnum(message, field, i)
+                            ->name()));
+                  break;
+                case FieldDescriptor::CPPTYPE_STRING:
+                  const std::string& s = reflection->GetRepeatedStringReference(
+                      message, field, i, nullptr);
+                  if (field->type() == FieldDescriptor::TYPE_BYTES) {
+                    writer->element(base64::encode(s));
+                  } else {
+                    writer->element(s);
+                  }
+                  break;
+              }
+            }
+          });
+    } else { // field->is_map() || !field->is_repeated()
+      auto writeField = [&writer](
+                            const std::string& fieldName,
+                            const google::protobuf::Reflection* reflection,
+                            const google::protobuf::Message& message,
+                            const FieldDescriptor* field) {
+        switch (field->cpp_type()) {
+          case FieldDescriptor::CPPTYPE_BOOL:
+            writer->field(fieldName, reflection->GetBool(message, field));
+            break;
+          case FieldDescriptor::CPPTYPE_INT32:
+            writer->field(fieldName, reflection->GetInt32(message, field));
+            break;
+          case FieldDescriptor::CPPTYPE_INT64:
+            writer->field(fieldName, reflection->GetInt64(message, field));
+            break;
+          case FieldDescriptor::CPPTYPE_UINT32:
+            writer->field(fieldName, reflection->GetUInt32(message, field));
+            break;
+          case FieldDescriptor::CPPTYPE_UINT64:
+            writer->field(fieldName, reflection->GetUInt64(message, field));
+            break;
+          case FieldDescriptor::CPPTYPE_FLOAT:
+            writer->field(fieldName, reflection->GetFloat(message, field));
+            break;
+          case FieldDescriptor::CPPTYPE_DOUBLE:
+            writer->field(fieldName, reflection->GetDouble(message, field));
+            break;
+          case FieldDescriptor::CPPTYPE_MESSAGE:
+            writer->field(
+                fieldName,
+                asV1Protobuf(reflection->GetMessage(message, field)));
+            break;
+          case FieldDescriptor::CPPTYPE_ENUM:
+            writer->field(
+                fieldName,
+                upperSlaveToAgent(reflection->GetEnum(message, field)->name()));
+            break;
+          case FieldDescriptor::CPPTYPE_STRING:
+            const std::string& s =
+              reflection->GetStringReference(message, field, nullptr);
+            if (field->type() == FieldDescriptor::TYPE_BYTES) {
+              writer->field(fieldName, base64::encode(s));
+            } else {
+              writer->field(fieldName, s);
+            }
+            break;
+        }
+      };
+
+      if (!field->is_repeated()) { // Singular field.
+        writeField(
+            lowerSlaveToAgent(field->name()), reflection, message, field);
+      } else { // Map field.
+        CHECK(field->is_map());
+        writer->field(
+            lowerSlaveToAgent(field->name()),
+            [&field, &reflection, &message, &writeField](
+                JSON::ObjectWriter* writer) {
+              foreach (
+                  const auto& mapEntry,
+                  reflection->GetRepeatedFieldRef<google::protobuf::Message>(
+                      message, field)) {
+                const google::protobuf::Descriptor* mapEntryDescriptor =
+                  mapEntry.GetDescriptor();
+                const google::protobuf::Reflection* mapEntryReflection =
+                  mapEntry.GetReflection();
+
+                // Map entry must contain exactly two fields: `key` and `value`.
+                CHECK_EQ(mapEntryDescriptor->field_count(), 2);
+
+                const FieldDescriptor* keyField = mapEntryDescriptor->field(0);
+                const FieldDescriptor* valueField =
+                  mapEntryDescriptor->field(1);
+
+                switch (keyField->cpp_type()) {
+                  case FieldDescriptor::CPPTYPE_BOOL:
+                    writeField(
+                        jsonify(
+                            mapEntryReflection->GetBool(mapEntry, keyField)),
+                        mapEntryReflection,
+                        mapEntry,
+                        valueField);
+                    break;
+                  case FieldDescriptor::CPPTYPE_INT32:
+                    writeField(
+                        jsonify(
+                            mapEntryReflection->GetInt32(mapEntry, keyField)),
+                        mapEntryReflection,
+                        mapEntry,
+                        valueField);
+                    break;
+                  case FieldDescriptor::CPPTYPE_INT64:
+                    writeField(
+                        jsonify(
+                            mapEntryReflection->GetInt64(mapEntry, keyField)),
+                        mapEntryReflection,
+                        mapEntry,
+                        valueField);
+                    break;
+                  case FieldDescriptor::CPPTYPE_UINT32:
+                    writeField(
+                        jsonify(
+                            mapEntryReflection->GetUInt32(mapEntry, keyField)),
+                        mapEntryReflection,
+                        mapEntry,
+                        valueField);
+                    break;
+                  case FieldDescriptor::CPPTYPE_UINT64:
+                    writeField(
+                        jsonify(
+                            mapEntryReflection->GetUInt64(mapEntry, keyField)),
+                        mapEntryReflection,
+                        mapEntry,
+                        valueField);
+                    break;
+                  case FieldDescriptor::CPPTYPE_STRING:
+                    if (keyField->type() == FieldDescriptor::TYPE_BYTES) {
+                      LOG(FATAL)
+                        << "Unexpected key field type in protobuf Map: "
+                        << keyField->type_name();
+                    }
+
+                    writeField(
+                        mapEntryReflection->GetStringReference(
+                            mapEntry, keyField, nullptr),
+                        mapEntryReflection,
+                        mapEntry,
+                        valueField);
+                    break;
+                  case FieldDescriptor::CPPTYPE_FLOAT:
+                  case FieldDescriptor::CPPTYPE_DOUBLE:
+                  case FieldDescriptor::CPPTYPE_MESSAGE:
+                  case FieldDescriptor::CPPTYPE_ENUM:
+                    LOG(FATAL) << "Unexpected key field type in protobuf Map: "
+                               << keyField->cpp_type_name();
+                }
+              }
+            });
+      }
+    }
+  }
 }
 
 
@@ -341,6 +633,10 @@ JSON::Object model(const Task& task)
   object.values["state"] = TaskState_Name(task.state());
   object.values["resources"] = model(task.resources());
 
+  if (!task.limits().empty()) {
+    object.values["limits"] = model(task.limits());
+  }
+
   if (task.has_user()) {
     object.values["user"] = task.user();
   }
@@ -494,20 +790,19 @@ JSON::Object model(const FileInfo& fileInfo)
 }
 
 
-JSON::Object model(const quota::QuotaInfo& quotaInfo)
+JSON::Object model(const google::protobuf::Map<string, Value_Scalar>& map)
 {
-  JSON::Object object;
+  JSON::Object result, scalar;
 
-  object.values["guarantee"] = model(quotaInfo.guarantee());
-  object.values["role"] = quotaInfo.role();
-  if (quotaInfo.has_principal()) {
-    object.values["principal"] = quotaInfo.principal();
+  foreach (auto item, map) {
+    result.values[item.first] = item.second.value();
   }
 
-  return object;
+  return result;
 }
 
 }  // namespace internal {
+
 
 void json(JSON::ObjectWriter* writer, const Attributes& attributes)
 {
@@ -766,6 +1061,22 @@ void json(
 }
 
 
+void json(JSON::ObjectWriter* writer, const ResourceQuantities& quantities)
+{
+  foreachpair (const string& name, const Value::Scalar& scalar, quantities) {
+    writer->field(name, scalar.value());
+  }
+}
+
+
+void json(JSON::ObjectWriter* writer, const ResourceLimits& limits)
+{
+  foreachpair (const string& name, const Value::Scalar& scalar, limits) {
+    writer->field(name, scalar.value());
+  }
+}
+
+
 void json(JSON::ObjectWriter* writer, const SlaveInfo& slaveInfo)
 {
   writer->field("id", slaveInfo.id().value());
@@ -787,6 +1098,17 @@ void json(
 }
 
 
+// Used to include resource limits in JSON output.
+void json(
+    JSON::ObjectWriter* writer,
+    const google::protobuf::Map<string, Value_Scalar>& map)
+{
+  foreach (auto item, map) {
+    writer->field(item.first, item.second.value());
+  }
+}
+
+
 void json(JSON::ObjectWriter* writer, const Task& task)
 {
   writer->field("id", task.task_id().value());
@@ -796,6 +1118,10 @@ void json(JSON::ObjectWriter* writer, const Task& task)
   writer->field("slave_id", task.slave_id().value());
   writer->field("state", TaskState_Name(task.state()));
   writer->field("resources", task.resources());
+
+  if (!task.limits().empty()) {
+    writer->field("limits", task.limits());
+  }
 
   // Tasks are not allowed to mix resources allocated to
   // different roles, see MESOS-6636.
@@ -868,6 +1194,13 @@ static void json(JSON::StringWriter* writer, const Value::Text& text)
 }
 
 
+void json(JSON::ObjectWriter* writer, const Quota& quota)
+{
+  writer->field("guarantees", quota.guarantees);
+  writer->field("limits", quota.limits);
+}
+
+
 Future<Owned<ObjectApprovers>> ObjectApprovers::create(
     const Option<Authorizer*>& authorizer,
     const Option<Principal>& principal,
@@ -882,12 +1215,10 @@ Future<Owned<ObjectApprovers>> ObjectApprovers::create(
     authorization::createSubject(principal);
 
   if (authorizer.isNone()) {
-    hashmap<authorization::Action, Owned<ObjectApprover>> approvers;
+    hashmap<authorization::Action, shared_ptr<const ObjectApprover>> approvers;
 
     foreach (authorization::Action action, _actions) {
-      approvers.put(
-          action,
-          Owned<ObjectApprover>(new AcceptingObjectApprover()));
+      approvers.put(action, std::make_shared<AcceptingObjectApprover>());
     }
 
     return Owned<ObjectApprovers>(
@@ -895,11 +1226,11 @@ Future<Owned<ObjectApprovers>> ObjectApprovers::create(
   }
 
   return process::collect(lambda::map<vector>(
-      [&](authorization::Action action) -> Future<Owned<ObjectApprover>> {
-        return authorizer.get()->getObjectApprover(subject, action);
+      [&](authorization::Action action) {
+        return authorizer.get()->getApprover(subject, action);
       },
       _actions))
-    .then([=](const vector<Owned<ObjectApprover>>& _approvers) {
+    .then([=](const vector<shared_ptr<const ObjectApprover>>& _approvers) {
       return Owned<ObjectApprovers>(
           new ObjectApprovers(lambda::zip(_actions, _approvers), principal));
     });

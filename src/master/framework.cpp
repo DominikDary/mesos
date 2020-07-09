@@ -19,6 +19,13 @@
 #include "common/heartbeater.hpp"
 #include "common/protobuf_utils.hpp"
 
+using process::Failure;
+using process::Future;
+using process::Owned;
+using process::http::authentication::Principal;
+
+using mesos::authorization::ActionObject;
+
 namespace mesos {
 namespace internal {
 namespace master {
@@ -27,11 +34,12 @@ Framework::Framework(
     Master* const master,
     const Flags& masterFlags,
     const FrameworkInfo& info,
-    const process::UPID& _pid,
+    const process::UPID& pid,
+    const Owned<ObjectApprovers>& approvers,
     const process::Time& time)
-  : Framework(master, masterFlags, info, ACTIVE, time)
+  : Framework(master, masterFlags, info, CONNECTED, true, approvers, time)
 {
-  pid = _pid;
+  pid_ = pid;
 }
 
 
@@ -39,11 +47,12 @@ Framework::Framework(
     Master* const master,
     const Flags& masterFlags,
     const FrameworkInfo& info,
-    const StreamingHttpConnection<v1::scheduler::Event>& _http,
+    const StreamingHttpConnection<v1::scheduler::Event>& http,
+    const Owned<ObjectApprovers>& approvers,
     const process::Time& time)
-  : Framework(master, masterFlags, info, ACTIVE, time)
+  : Framework(master, masterFlags, info, CONNECTED, true, approvers, time)
 {
-  http = _http;
+  http_ = http;
 }
 
 
@@ -51,7 +60,8 @@ Framework::Framework(
     Master* const master,
     const Flags& masterFlags,
     const FrameworkInfo& info)
-  : Framework(master, masterFlags, info, RECOVERED, process::Time())
+  : Framework(
+      master, masterFlags, info, RECOVERED, false, nullptr, process::Time())
 {}
 
 
@@ -60,21 +70,25 @@ Framework::Framework(
     const Flags& masterFlags,
     const FrameworkInfo& _info,
     State state,
+    bool active_,
+    const Owned<ObjectApprovers>& approvers,
     const process::Time& time)
   : master(_master),
     info(_info),
     roles(protobuf::framework::getRoles(_info)),
     capabilities(_info.capabilities()),
-    state(state),
     registeredTime(time),
     reregisteredTime(time),
     completedTasks(masterFlags.max_completed_tasks_per_framework),
     unreachableTasks(masterFlags.max_unreachable_tasks_per_framework),
-    metrics(_info, masterFlags.publish_per_framework_metrics)
+    metrics(_info, masterFlags.publish_per_framework_metrics),
+    active_(active_),
+    state(state),
+    objectApprovers(approvers)
 {
   CHECK(_info.has_id());
 
-  setFrameworkState(state);
+  setState(state);
 
   foreach (const std::string& role, roles) {
     // NOTE: It's possible that we're already being tracked under the role
@@ -89,9 +103,7 @@ Framework::Framework(
 
 Framework::~Framework()
 {
-  if (http.isSome()) {
-    closeHttpConnection();
-  }
+  disconnect();
 }
 
 
@@ -501,77 +513,21 @@ void Framework::update(const FrameworkInfo& newInfo)
   // We only merge 'info' from the same framework 'id'.
   CHECK_EQ(info.id(), newInfo.id());
 
-  // We copy over the new (potentially empty) map of per-role filters.
-  *info.mutable_offer_filters() = newInfo.offer_filters();
+  // Fields 'principal', 'user' and 'update' are immutable.
+  // They should be validated before calling this method.
+  //
+  // TODO(asekretenko): Make it possible to update 'user'
+  // and 'checkpoint' as per design doc in MESOS-703.
+  CHECK_EQ(info.principal(), newInfo.principal());
+  CHECK_EQ(info.user(), newInfo.user());
+  CHECK_EQ(info.checkpoint(), newInfo.checkpoint());
+
+  info.CopyFrom(newInfo);
 
   // Save the old list of roles for later.
   std::set<std::string> oldRoles = roles;
-
-  // TODO(jmlvanre): Merge other fields as per design doc in
-  // MESOS-703.
-
-  info.clear_role();
-  info.clear_roles();
-
-  if (newInfo.has_role()) {
-    info.set_role(newInfo.role());
-  }
-
-  if (newInfo.roles_size() > 0) {
-    info.mutable_roles()->CopyFrom(newInfo.roles());
-  }
-
-  roles = protobuf::framework::getRoles(newInfo);
-
-  if (newInfo.user() != info.user()) {
-    LOG(WARNING) << "Cannot update FrameworkInfo.user to '" << newInfo.user()
-                 << "' for framework " << id() << ". Check MESOS-703";
-  }
-
-  info.set_name(newInfo.name());
-
-  if (newInfo.has_failover_timeout()) {
-    info.set_failover_timeout(newInfo.failover_timeout());
-  } else {
-    info.clear_failover_timeout();
-  }
-
-  if (newInfo.checkpoint() != info.checkpoint()) {
-    LOG(WARNING) << "Cannot update FrameworkInfo.checkpoint to '"
-                 << stringify(newInfo.checkpoint()) << "' for framework "
-                 << id() << ". Check MESOS-703";
-  }
-
-  if (newInfo.has_hostname()) {
-    info.set_hostname(newInfo.hostname());
-  } else {
-    info.clear_hostname();
-  }
-
-  if (newInfo.principal() != info.principal()) {
-    LOG(WARNING) << "Cannot update FrameworkInfo.principal to '"
-                 << newInfo.principal() << "' for framework " << id()
-                 << ". Check MESOS-703";
-  }
-
-  if (newInfo.has_webui_url()) {
-    info.set_webui_url(newInfo.webui_url());
-  } else {
-    info.clear_webui_url();
-  }
-
-  if (newInfo.capabilities_size() > 0) {
-    info.mutable_capabilities()->CopyFrom(newInfo.capabilities());
-  } else {
-    info.clear_capabilities();
-  }
+  roles = protobuf::framework::getRoles(info);
   capabilities = protobuf::framework::Capabilities(info.capabilities());
-
-  if (newInfo.has_labels()) {
-    info.mutable_labels()->CopyFrom(newInfo.labels());
-  } else {
-    info.clear_labels();
-  }
 
   const std::set<std::string>& newRoles = roles;
 
@@ -615,56 +571,86 @@ void Framework::update(const FrameworkInfo& newInfo)
 }
 
 
-void Framework::updateConnection(const process::UPID& newPid)
+void Framework::updateConnection(
+    const process::UPID& newPid,
+    const Owned<ObjectApprovers>& objectApprovers_)
 {
-  // Cleanup the HTTP connnection if this is a downgrade from HTTP
-  // to PID. Note that the connection may already be closed.
-  if (http.isSome()) {
-    closeHttpConnection();
-  }
+  // Cleanup the old connection state if exists.
+  disconnect();
+  CHECK_NONE(http_);
 
   // TODO(benh): unlink(oldPid);
-  pid = newPid;
+  pid_ = newPid;
+  objectApprovers = objectApprovers_;
+  setState(State::CONNECTED);
 }
 
 
 void Framework::updateConnection(
-    const StreamingHttpConnection<v1::scheduler::Event>& newHttp)
+    const StreamingHttpConnection<v1::scheduler::Event>& newHttp,
+    const Owned<ObjectApprovers>& objectApprovers_)
 {
-  if (pid.isSome()) {
-    // Wipe the PID if this is an upgrade from PID to HTTP.
-    // TODO(benh): unlink(oldPid);
-    pid = None();
-  } else if (http.isSome()) {
-    // Cleanup the old HTTP connection.
-    // Note that master creates a new HTTP connection for every
-    // subscribe request, so 'newHttp' should always be different
-    // from 'http'.
-    closeHttpConnection();
-  }
+  // Note that master creates a new HTTP connection for every
+  // subscribe request, so 'newHttp' should always be different
+  // from 'http'.
+  CHECK(http_.isNone() || newHttp.writer != http_->writer);
 
-  CHECK_NONE(http);
+  // Cleanup the old connection state if exists.
+  disconnect();
 
-  http = newHttp;
+  // TODO(benh): unlink(oldPid) if this is an upgrade from PID to HTTP.
+  pid_ = None();
+
+  CHECK_NONE(http_);
+  http_ = newHttp;
+  objectApprovers = objectApprovers_;
+  setState(State::CONNECTED);
 }
 
 
-void Framework::closeHttpConnection()
+bool Framework::activate()
 {
-  CHECK_SOME(http);
+  bool noop = active_;
+  active_ = true;
+  return !noop;
+}
 
-  if (connected() && !http->close()) {
+
+bool Framework::deactivate()
+{
+  bool noop = !active_;
+  active_ = false;
+  return !noop;
+}
+
+
+bool Framework::disconnect()
+{
+  if (state != State::CONNECTED) {
+    CHECK(http_.isNone());
+    return false;
+  }
+
+  if (http_.isSome() && connected() && !http_->close()) {
     LOG(WARNING) << "Failed to close HTTP pipe for " << *this;
   }
 
-  http = None();
+  http_ = None();
   heartbeater.reset();
+
+  // `ObjectApprover`s are kept up-to-date by authorizer, which potentially
+  // entails continious interaction with an external IAM. Hence, we do not
+  // want to keep them alive if there is no subscribed scheduler.
+  objectApprovers.reset();
+
+  setState(State::DISCONNECTED);
+  return true;
 }
 
 
 void Framework::heartbeat()
 {
-  CHECK_SOME(http);
+  CHECK_SOME(http_);
 
   // TODO(vinod): Make heartbeat interval configurable and include
   // this information in the SUBSCRIBED response.
@@ -675,7 +661,7 @@ void Framework::heartbeat()
       new ResponseHeartbeater<scheduler::Event, v1::scheduler::Event>(
           "framework " + stringify(info.id()),
           event,
-          http.get(),
+          http_.get(),
           DEFAULT_HEARTBEAT_INTERVAL,
           None(),
           [this, event]() {
@@ -702,7 +688,7 @@ void Framework::trackUnderRole(const std::string& role)
   CHECK(!isTrackedUnderRole(role));
 
   if (!master->roles.contains(role)) {
-    master->roles[role] = new Role(role);
+    master->roles[role] = new Role(master, role);
   }
   master->roles.at(role)->addFramework(this);
 }
@@ -734,11 +720,48 @@ void Framework::untrackUnderRole(const std::string& role)
 }
 
 
-void Framework::setFrameworkState(const Framework::State& _state)
+void Framework::setState(Framework::State _state)
 {
   state = _state;
-  metrics.subscribed = state == Framework::State::ACTIVE ? 1 : 0;
+  metrics.subscribed = state == Framework::State::CONNECTED ? 1 : 0;
 }
+
+
+Try<bool> Framework::approved(const ActionObject& actionObject) const
+{
+  CHECK(objectApprovers.get() != nullptr)
+    << "Framework " << *this << " has no ObjectApprovers"
+    << " (attempt to call approved() for a disconnected framework?)";
+
+  return objectApprovers->approved(
+      actionObject.action(),
+      actionObject.object().getOrElse(authorization::Object()));
+}
+
+
+Future<Owned<ObjectApprovers>> Framework::createObjectApprovers(
+    const Option<Authorizer*>& authorizer,
+    const FrameworkInfo& frameworkInfo)
+{
+  return ObjectApprovers::create(
+      authorizer,
+      frameworkInfo.has_principal()
+        ? Option<Principal>(frameworkInfo.principal())
+        : Option<Principal>::none(),
+      {authorization::REGISTER_FRAMEWORK,
+       authorization::RUN_TASK,
+       authorization::UNRESERVE_RESOURCES,
+       authorization::RESERVE_RESOURCES,
+       authorization::CREATE_VOLUME,
+       authorization::DESTROY_VOLUME,
+       authorization::RESIZE_VOLUME,
+       authorization::CREATE_MOUNT_DISK,
+       authorization::CREATE_BLOCK_DISK,
+       authorization::DESTROY_MOUNT_DISK,
+       authorization::DESTROY_BLOCK_DISK,
+       authorization::DESTROY_RAW_DISK});
+}
+
 
 } // namespace master {
 } // namespace internal {

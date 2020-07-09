@@ -26,7 +26,8 @@ endif ()
 set(BOOST_URL           ${FETCH_URL}/boost-${BOOST_VERSION}.tar.gz)
 set(BZIP2_URL           ${FETCH_URL}/bzip2-${BZIP2_VERSION}.tar.gz)
 set(CONCURRENTQUEUE_URL ${FETCH_URL}/concurrentqueue-${CONCURRENTQUEUE_VERSION}.tar.gz)
-set(CSI_URL             ${FETCH_URL}/csi-${CSI_VERSION}.tar.gz)
+set(CSI_V0_URL          ${FETCH_URL}/csi-${CSI_V0_VERSION}.tar.gz)
+set(CSI_V1_URL          ${FETCH_URL}/csi-${CSI_V1_VERSION}.tar.gz)
 set(ELFIO_URL           ${FETCH_URL}/elfio-${ELFIO_VERSION}.tar.gz)
 set(GLOG_URL            ${FETCH_URL}/glog-${GLOG_VERSION}.tar.gz)
 set(GOOGLETEST_URL      ${FETCH_URL}/googletest-release-${GOOGLETEST_VERSION}.tar.gz)
@@ -57,10 +58,6 @@ if (WIN32)
   set(ZLIB_URL    ${3RDPARTY_DEPENDENCIES}/zlib-${ZLIB_VERSION}.tar.gz)
   set(SASL2_URL   ${3RDPARTY_DEPENDENCIES}/cyrus-sasl-${SASL2_VERSION}.tar.gz)
   set(WCLAYER_URL ${3RDPARTY_DEPENDENCIES}/wclayer.exe)
-
-  # NOTE: The Windows version of Glog is patched and only available in the
-  # 3rdparty repo, not the local repo.
-  set(GLOG_URL   ${3RDPARTY_DEPENDENCIES}/glog-${GLOG_VERSION}.tar.gz)
 endif ()
 
 if (NOT WIN32)
@@ -101,6 +98,15 @@ else ()
   set(LIBRARY_LINKAGE STATIC)
   set(LIBRARY_SUFFIX ${CMAKE_STATIC_LIBRARY_SUFFIX})
 endif ()
+
+if (WIN32 AND BUILD_SHARED_LIBS)
+  set(3RDPARTY_LIBS_INSTALL_DIR ${MESOS_INSTALL_RUNTIME})
+else()
+  set(3RDPARTY_LIBS_INSTALL_DIR ${MESOS_INSTALL_LIBRARIES})
+endif()
+
+set(LIBPROCESS_INSTALL_RUNTIME ${MESOS_INSTALL_RUNTIME})
+set(LIBPROCESS_INSTALL_LIBRARIES ${MESOS_INSTALL_LIBRARIES})
 
 # Sets a variable CMAKE_NOOP as noop operation.
 #
@@ -197,29 +203,40 @@ endfunction()
 # Boost: C++ Libraries.
 # http://www.boost.org
 #######################
-EXTERNAL(boost ${BOOST_VERSION} ${CMAKE_CURRENT_BINARY_DIR})
-add_library(boost INTERFACE)
-add_dependencies(boost ${BOOST_TARGET})
-if (CMAKE_CXX_COMPILER_ID MATCHES GNU OR CMAKE_CXX_COMPILER_ID MATCHES Clang)
-  # Headers including Boost 1.65.0 fail to compile with GCC 7.2 and
-  # CLang 3.6 without `-Wno-unused-local-typedefs`.
-  # TODO(andschwa): Remove this when Boost has a resolution.
-  target_compile_options(boost INTERFACE -Wno-unused-local-typedefs)
+if ("${BOOST_ROOT_DIR}" STREQUAL "")
+  EXTERNAL(boost ${BOOST_VERSION} ${CMAKE_CURRENT_BINARY_DIR})
+  add_library(boost INTERFACE)
+  add_dependencies(boost ${BOOST_TARGET})
+  if (CMAKE_CXX_COMPILER_ID MATCHES GNU OR CMAKE_CXX_COMPILER_ID MATCHES Clang)
+    # Headers including Boost 1.65.0 fail to compile with GCC 7.2 and
+    # CLang 3.6 without `-Wno-unused-local-typedefs`.
+    # TODO(andschwa): Remove this when Boost has a resolution.
+    target_compile_options(boost INTERFACE -Wno-unused-local-typedefs)
+  endif ()
+  target_include_directories(boost INTERFACE ${BOOST_ROOT})
+
+  # Patch Boost to avoid repeated "Unknown compiler warnings" on Windows.
+  PATCH_CMD(BOOST_PATCH_CMD boost-${BOOST_VERSION}.patch)
+
+  ExternalProject_Add(
+    ${BOOST_TARGET}
+    PREFIX            ${BOOST_CMAKE_ROOT}
+    PATCH_COMMAND     ${BOOST_PATCH_CMD}
+    CONFIGURE_COMMAND ${CMAKE_NOOP}
+    BUILD_COMMAND     ${CMAKE_NOOP}
+    INSTALL_COMMAND   ${CMAKE_NOOP}
+    URL               ${BOOST_URL}
+    URL_HASH          ${BOOST_HASH})
+
+  if (ENABLE_INSTALL_MODULE_DEPENDENCIES)
+    install(
+      DIRECTORY ${BOOST_ROOT}/
+      DESTINATION ${MESOS_INSTALL_HEADERS})
+  endif ()
+else ()
+  add_library(boost INTERFACE)
+  target_include_directories(boost INTERFACE ${BOOST_ROOT_DIR}/include)
 endif ()
-target_include_directories(boost INTERFACE ${BOOST_ROOT})
-
-# Patch Boost to avoid repeated "Unknown compiler warnings" on Windows.
-PATCH_CMD(BOOST_PATCH_CMD boost-${BOOST_VERSION}.patch)
-
-ExternalProject_Add(
-  ${BOOST_TARGET}
-  PREFIX            ${BOOST_CMAKE_ROOT}
-  PATCH_COMMAND     ${BOOST_PATCH_CMD}
-  CONFIGURE_COMMAND ${CMAKE_NOOP}
-  BUILD_COMMAND     ${CMAKE_NOOP}
-  INSTALL_COMMAND   ${CMAKE_NOOP}
-  URL               ${BOOST_URL}
-  URL_HASH          ${BOOST_HASH})
 
 
 # moodycamel::ConcurrentQueue: An industrial-strength lock-free queue.
@@ -279,6 +296,8 @@ if (WIN32)
     INSTALL_COMMAND   ${CMAKE_NOOP}
     URL               ${SASL2_URL}
     URL_HASH          ${SASL2_HASH})
+
+  install(FILES $<TARGET_FILE:sasl2> DESTINATION ${3RDPARTY_LIBS_INSTALL_DIR})
 else ()
   find_library(SASL2_LIB sasl2)
 
@@ -294,21 +313,45 @@ endif ()
 # CSI: Container Storage Interface Specification.
 # https://github.com/container-storage-interface/spec
 #####################################################
-EXTERNAL(csi ${CSI_VERSION} ${CMAKE_CURRENT_BINARY_DIR})
-add_library(csi INTERFACE)
-add_dependencies(csi ${CSI_TARGET})
-target_include_directories(csi INTERFACE ${CSI_ROOT})
+EXTERNAL(csi_v0 ${CSI_V0_VERSION} ${CMAKE_CURRENT_BINARY_DIR})
+add_library(csi_v0 INTERFACE)
+add_dependencies(csi_v0 ${CSI_V0_TARGET})
+target_include_directories(csi_v0 INTERFACE ${CSI_V0_ROOT})
 
-# NOTE: We hard-code `csi.proto` as a byproduct since it exists in the tarball.
+EXTERNAL(csi_v1 ${CSI_V1_VERSION} ${CMAKE_CURRENT_BINARY_DIR})
+add_library(csi_v1 INTERFACE)
+add_dependencies(csi_v1 ${CSI_V1_TARGET})
+target_include_directories(csi_v1 INTERFACE ${CSI_V1_ROOT})
+
+# NOTE: To support multiple CSI versions, we move the CSI proto files to
+# version-qualified paths so `protoc` can find them.
+set(CSI_V0_CONFIG_CMD
+  ${CMAKE_COMMAND} -E make_directory ${CSI_V0_ROOT}/csi/v0 &&
+  ${CMAKE_COMMAND} -E rename ${CSI_V0_ROOT}/csi.proto ${CSI_V0_ROOT}/csi/v0/csi.proto)
+
+set(CSI_V1_CONFIG_CMD
+  ${CMAKE_COMMAND} -E make_directory ${CSI_V1_ROOT}/csi/v1 &&
+  ${CMAKE_COMMAND} -E rename ${CSI_V1_ROOT}/csi.proto ${CSI_V1_ROOT}/csi/v1/csi.proto)
+
 ExternalProject_Add(
-  ${CSI_TARGET}
-  PREFIX            ${CSI_CMAKE_ROOT}
-  BUILD_BYPRODUCTS  ${CSI_ROOT}/csi.proto
-  CONFIGURE_COMMAND ${CMAKE_NOOP}
+  ${CSI_V0_TARGET}
+  PREFIX            ${CSI_V0_CMAKE_ROOT}
+  BUILD_BYPRODUCTS  ${CSI_V0_ROOT}/csi/v0/csi.proto
+  CONFIGURE_COMMAND ${CSI_V0_CONFIG_CMD}
   BUILD_COMMAND     ${CMAKE_NOOP}
   INSTALL_COMMAND   ${CMAKE_NOOP}
-  URL               ${CSI_URL}
-  URL_HASH          ${CSI_HASH})
+  URL               ${CSI_V0_URL}
+  URL_HASH          ${CSI_V0_HASH})
+
+ExternalProject_Add(
+  ${CSI_V1_TARGET}
+  PREFIX            ${CSI_V1_CMAKE_ROOT}
+  BUILD_BYPRODUCTS  ${CSI_V1_ROOT}/csi/v1/csi.proto
+  CONFIGURE_COMMAND ${CSI_V1_CONFIG_CMD}
+  BUILD_COMMAND     ${CMAKE_NOOP}
+  INSTALL_COMMAND   ${CMAKE_NOOP}
+  URL               ${CSI_V1_URL}
+  URL_HASH          ${CSI_V1_HASH})
 
 
 # ELFIO: library for reading and generating ELF files.
@@ -341,9 +384,9 @@ add_dependencies(glog ${GLOG_TARGET})
 # On Windows, patch it to enable stack tracing.
 PATCH_CMD(GLOG_PATCH_CMD glog-${GLOG_VERSION}.patch)
 
-if (WIN32)
-  set(GLOG_INSTALL_CMD ${CMAKE_NOOP})
+set(GLOG_LIBRARY_NAME libglog)
 
+if (WIN32)
   # NOTE: Windows-specific workaround for a glog issue documented here[1].
   # Basically, Windows.h and glog/logging.h both define ERROR. Since we don't
   # need the Windows ERROR, we can use this flag to avoid defining it at all.
@@ -360,38 +403,49 @@ if (WIN32)
 
   set_target_properties(
     glog PROPERTIES
-    INTERFACE_INCLUDE_DIRECTORIES ${GLOG_ROOT}/src/windows
     # TODO(andschwa): Remove this when glog is updated.
     IMPORTED_LINK_INTERFACE_LIBRARIES DbgHelp
     INTERFACE_COMPILE_DEFINITIONS "${GLOG_COMPILE_DEFINITIONS}")
 
-  if (CMAKE_GENERATOR MATCHES "Visual Studio")
-    set_target_properties(
-      glog PROPERTIES
-      IMPORTED_LOCATION_DEBUG ${GLOG_ROOT}-build/Debug/glog${LIBRARY_SUFFIX}
-      IMPORTED_LOCATION_RELEASE ${GLOG_ROOT}-build/Release/glog${LIBRARY_SUFFIX}
-      IMPORTED_IMPLIB_DEBUG ${GLOG_ROOT}-build/Debug/glog${CMAKE_IMPORT_LIBRARY_SUFFIX}
-      IMPORTED_IMPLIB_RELEASE ${GLOG_ROOT}-build/Release/glog${CMAKE_IMPORT_LIBRARY_SUFFIX})
-  else ()
-    set_target_properties(
-      glog PROPERTIES
-      IMPORTED_LOCATION ${GLOG_ROOT}-build/glog${LIBRARY_SUFFIX}
-      IMPORTED_IMPLIB ${GLOG_ROOT}-build/glog${CMAKE_IMPORT_LIBRARY_SUFFIX})
-  endif ()
+endif ()
+
+set(GLOG_INSTALL_DIR ${GLOG_ROOT}-install)
+
+if (CMAKE_GENERATOR MATCHES "Visual Studio")
+  set_target_properties(
+    glog PROPERTIES
+    IMPORTED_LOCATION_DEBUG ${GLOG_INSTALL_DIR}/lib/glogd${LIBRARY_SUFFIX}
+    IMPORTED_IMPLIB_DEBUG ${GLOG_INSTALL_DIR}/lib/glogd${CMAKE_IMPORT_LIBRARY_SUFFIX}
+    IMPORTED_LOCATION_RELEASE ${GLOG_INSTALL_DIR}/lib/glog${LIBRARY_SUFFIX}
+    IMPORTED_IMPLIB_RELEASE ${GLOG_INSTALL_DIR}/lib/glog${CMAKE_IMPORT_LIBRARY_SUFFIX}
+  )
 else ()
-  # TODO(andschwa): Build with CMake instead when glog is updated.
-  set(GLOG_CONFIG_CMD  ${GLOG_ROOT}/src/../configure --with-pic GTEST_CONFIG=no --prefix=${GLOG_ROOT}-build)
-  if (FREEBSD)
-    list(APPEND GLOG_CONFIG_CMD LDFLAGS=-lexecinfo)
+  # This is for single-configuration generators such as GNU Make.
+  if (CMAKE_BUILD_TYPE MATCHES Debug)
+    set(GLOG_SUFFIX d)
   endif ()
-  set(GLOG_BUILD_CMD   ${MAKE_PROGRAM})
-  set(GLOG_INSTALL_CMD ${MAKE_PROGRAM} install)
 
   set_target_properties(
     glog PROPERTIES
-    IMPORTED_LOCATION ${GLOG_ROOT}-build/lib/libglog${LIBRARY_SUFFIX}
-    INTERFACE_INCLUDE_DIRECTORIES ${GLOG_ROOT}-build/include)
+    IMPORTED_LOCATION ${GLOG_INSTALL_DIR}/lib/libglog${GLOG_SUFFIX}${LIBRARY_SUFFIX}
+    IMPORTED_IMPLIB ${GLOG_INSTALL_DIR}/lib/libglog${GLOG_SUFFIX}${CMAKE_IMPORT_LIBRARY_SUFFIX}
+  )
 endif ()
+
+set_target_properties(
+  glog PROPERTIES
+  INTERFACE_INCLUDE_DIRECTORIES ${GLOG_INSTALL_DIR}/include
+)
+
+set(
+  GLOG_CMAKE_ARGS
+  ${CMAKE_CXX_FORWARD_ARGS}
+  -DBUILD_TESTING=OFF
+  -DCMAKE_INSTALL_BINDIR=${GLOG_INSTALL_DIR}/bin
+  -DCMAKE_INSTALL_INCLUDEDIR=${GLOG_INSTALL_DIR}/include
+  -DCMAKE_INSTALL_LIBDIR=${GLOG_INSTALL_DIR}/lib
+  -DWITH_GFLAGS=OFF
+)
 
 MAKE_INCLUDE_DIR(glog)
 GET_BYPRODUCTS(glog)
@@ -401,13 +455,27 @@ ExternalProject_Add(
   PREFIX            ${GLOG_CMAKE_ROOT}
   BUILD_BYPRODUCTS  ${GLOG_BYPRODUCTS}
   PATCH_COMMAND     ${GLOG_PATCH_CMD}
-  CMAKE_ARGS        ${CMAKE_CXX_FORWARD_ARGS};-DBUILD_TESTING=OFF
-  CONFIGURE_COMMAND ${GLOG_CONFIG_CMD}
-  BUILD_COMMAND     ${GLOG_BUILD_CMD}
-  INSTALL_COMMAND   ${GLOG_INSTALL_CMD}
+  CMAKE_ARGS        ${GLOG_CMAKE_ARGS}
+  INSTALL_DIR       ${GLOG_INSTALL_DIR}
   URL               ${GLOG_URL}
   URL_HASH          ${GLOG_HASH})
 
+if (WIN32 AND BUILD_SHARED_LIBS)
+  # NOTE: glog's install step places DLLs into ${GLOG_INSTALL_DIR}/bin .
+  install(
+    DIRECTORY ${GLOG_INSTALL_DIR}/bin/
+    DESTINATION ${MESOS_INSTALL_RUNTIME})
+endif()
+
+install(
+  DIRECTORY ${GLOG_INSTALL_DIR}/lib/
+  DESTINATION ${MESOS_INSTALL_LIBRARIES})
+
+if (ENABLE_INSTALL_MODULE_DEPENDENCIES)
+  install(
+    DIRECTORY ${GLOG_INSTALL_DIR}/include/glog
+    DESTINATION ${MESOS_INSTALL_HEADERS})
+endif ()
 
 # PicoJSON: JSON parser / serializer.
 # https://github.com/kazuho/picojson
@@ -437,6 +505,11 @@ ExternalProject_Add(
   URL               ${PICOJSON_URL}
   URL_HASH          ${PICOJSON_HASH})
 
+if (ENABLE_INSTALL_MODULE_DEPENDENCIES)
+  install(
+    FILES ${PICOJSON_CMAKE_ROOT}/src/picojson-${PICOJSON_VERSION}/picojson.h
+    DESTINATION ${MESOS_INSTALL_HEADERS})
+endif ()
 
 # RapidJSON: JSON parser / serializer.
 # https://github.com/Tencent/rapidjson
@@ -449,32 +522,42 @@ target_include_directories(
     rapidjson INTERFACE
     ${RAPIDJSON_ROOT}/include)
 
+PATCH_CMD(RAPIDJSON_PATCH_CMD rapidjson-${RAPIDJSON_VERSION}.patch)
+
 ExternalProject_Add(
   ${RAPIDJSON_TARGET}
   PREFIX            ${RAPIDJSON_CMAKE_ROOT}
+  PATCH_COMMAND     ${RAPIDJSON_PATCH_CMD}
   CONFIGURE_COMMAND ${CMAKE_NOOP}
   BUILD_COMMAND     ${CMAKE_NOOP}
   INSTALL_COMMAND   ${CMAKE_NOOP}
   URL               ${RAPIDJSON_URL}
   URL_HASH          ${RAPIDJSON_HASH})
 
+if (ENABLE_INSTALL_MODULE_DEPENDENCIES)
+  install(
+    DIRECTORY ${RAPIDJSON_CMAKE_ROOT}/src/rapidjson-${RAPIDJSON_VERSION}/include/rapidjson
+    DESTINATION ${MESOS_INSTALL_HEADERS})
+endif ()
 
-# NVML: NVIDIA Management Library.
-# https://developer.nvidia.com/nvidia-management-library-nvml
-#############################################################
-EXTERNAL(nvml ${NVML_VERSION} ${CMAKE_CURRENT_BINARY_DIR})
-add_library(nvml INTERFACE)
-add_dependencies(nvml ${NVML_TARGET})
-target_include_directories(nvml INTERFACE ${NVML_ROOT})
+if (ENABLE_NVML)
+  # NVML: NVIDIA Management Library.
+  # https://developer.nvidia.com/nvidia-management-library-nvml
+  #############################################################
+  EXTERNAL(nvml ${NVML_VERSION} ${CMAKE_CURRENT_BINARY_DIR})
+  add_library(nvml INTERFACE)
+  add_dependencies(nvml ${NVML_TARGET})
+  target_include_directories(nvml INTERFACE ${NVML_ROOT})
 
-ExternalProject_Add(
-  ${NVML_TARGET}
-  PREFIX            ${NVML_CMAKE_ROOT}
-  CONFIGURE_COMMAND ${CMAKE_NOOP}
-  BUILD_COMMAND     ${CMAKE_NOOP}
-  INSTALL_COMMAND   ${CMAKE_NOOP}
-  URL               ${NVML_URL}
-  URL_HASH          ${NVML_HASH})
+  ExternalProject_Add(
+    ${NVML_TARGET}
+    PREFIX            ${NVML_CMAKE_ROOT}
+    CONFIGURE_COMMAND ${CMAKE_NOOP}
+    BUILD_COMMAND     ${CMAKE_NOOP}
+    INSTALL_COMMAND   ${CMAKE_NOOP}
+    URL               ${NVML_URL}
+    URL_HASH          ${NVML_HASH})
+endif ()
 
 
 # HTTP Parser: HTTP request/response parser for C.
@@ -586,6 +669,11 @@ if (ENABLE_LIBEVENT)
       INSTALL_COMMAND   ${CMAKE_NOOP}
       URL               ${LIBEVENT_URL}
       URL_HASH          ${LIBEVENT_HASH})
+
+    install(
+      FILES $<TARGET_FILE:libevent>
+      DESTINATION ${3RDPARTY_LIBS_INSTALL_DIR})
+
   else ()
     find_package(LIBEVENT REQUIRED)
     add_library(libevent INTERFACE)
@@ -628,6 +716,10 @@ elseif (NOT WIN32) # Windows defaults to `libwinio`, a native implementation.
     INSTALL_COMMAND   ${MAKE_PROGRAM} install
     URL               ${LIBEV_URL}
     URL_HASH          ${LIBEV_HASH})
+
+  install(
+    DIRECTORY ${LIBEV_ROOT}-build/lib/
+    DESTINATION ${3RDPARTY_LIBS_INSTALL_DIR})
 endif ()
 
 
@@ -660,6 +752,11 @@ if (ENABLE_SECCOMP_ISOLATOR)
       INSTALL_COMMAND   ${CMAKE_NOOP}
       URL               ${LIBSECCOMP_URL}
       URL_HASH          ${LIBSECCOMP_HASH})
+
+    install(
+      FILES $<TARGET_FILE:libseccomp>
+      DESTINATION ${3RDPARTY_LIBS_INSTALL_DIR})
+
   else ()
     find_package(LIBSECCOMP REQUIRED)
     add_library(libseccomp SHARED IMPORTED GLOBAL)
@@ -706,6 +803,8 @@ if (WIN32)
     INSTALL_COMMAND   ${CMAKE_NOOP}
     URL               ${LIBAPR_URL}
     URL_HASH          ${LIBAPR_HASH})
+
+  install(FILES $<TARGET_FILE:apr> DESTINATION ${3RDPARTY_LIBS_INSTALL_DIR})
 else ()
   find_package(APR REQUIRED)
   add_library(apr SHARED IMPORTED)
@@ -819,14 +918,28 @@ if (WIN32)
 
   # This copies the file `curl.exe` from the `3rdparty` build folder to
   # `build/src`, next to the other produced executables. This is necessary for
-  # code that shells out to cURL on Windows.
-  #
-  # TODO(andschwa): Change this to an `INSTALL` step.
+  # code that shells out to cURL on Windows (in particular, for running Mesos
+  # tests without running cmake install).
   ExternalProject_Add_Step(${CURL_TARGET} copy
     COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:curl> ${CMAKE_BINARY_DIR}/src/curl.exe
     DEPENDEES build)
+
+  install(FILES $<TARGET_FILE:libcurl> DESTINATION ${3RDPARTY_LIBS_INSTALL_DIR})
+  install(FILES $<TARGET_FILE:curl> DESTINATION ${MESOS_INSTALL_RUNTIME})
 else ()
-  find_package(CURL REQUIRED)
+  if ("${CURL_ROOT_DIR}" STREQUAL "")
+    find_package(CURL REQUIRED)
+  else ()
+    set(POSSIBLE_CURL_INCLUDE_DIRS ${CURL_ROOT_DIR}/include)
+    set(POSSIBLE_CURL_LIB_DIRS ${CURL_ROOT_DIR}/lib)
+
+    set(CURL_LIBRARY_NAMES curl)
+
+    FIND_PACKAGE_HELPER(CURL curl/curl.h)
+    SET(CURL_INCLUDE_DIRS ${CURL_INCLUDE_DIR})
+    SET(CURL_LIBRARIES ${CURL_LIBS})
+  endif ()
+
   add_library(libcurl SHARED IMPORTED)
 
   set_target_properties(
@@ -863,8 +976,10 @@ if (WIN32)
     CONFIGURE_COMMAND   ${CMAKE_NOOP}
     BUILD_COMMAND       ${CMAKE_NOOP}
     INSTALL_COMMAND     ${WCLAYER_INSTALL_CMD}
-    DOWNLOAD_NO_EXTRACT FALSE
+    DOWNLOAD_NO_EXTRACT TRUE
     URL                 ${WCLAYER_URL})
+
+  install(FILES $<TARGET_FILE:wclayer> DESTINATION ${MESOS_INSTALL_RUNTIME})
 endif ()
 
 # bzip2: A high-quality data compressor.
@@ -911,6 +1026,8 @@ if (WIN32)
     INSTALL_DIR       ${BZIP2_ROOT}-lib
     URL               ${BZIP2_URL}
     URL_HASH          ${BZIP2_HASH})
+
+  install(FILES $<TARGET_FILE:bzip2> DESTINATION ${3RDPARTY_LIBS_INSTALL_DIR})
 endif ()
 
 # xz: A Massively Spiffy Yet Delicately Unobtrusive Compression Library.
@@ -1018,6 +1135,8 @@ if (WIN32)
     INSTALL_DIR       ${ZLIB_ROOT}-lib
     URL               ${ZLIB_URL}
     URL_HASH          ${ZLIB_HASH})
+
+  install(FILES $<TARGET_FILE:zlib> DESTINATION ${3RDPARTY_LIBS_INSTALL_DIR})
 else ()
   find_package(ZLIB REQUIRED)
   add_library(zlib SHARED IMPORTED)
@@ -1218,6 +1337,7 @@ EXTERNAL(protobuf ${PROTOBUF_VERSION} ${CMAKE_CURRENT_BINARY_DIR})
 
 # TODO(andschwa): Move protobufs so these don't have to be GLOBAL.
 add_library(protobuf ${LIBRARY_LINKAGE} IMPORTED GLOBAL)
+add_library(libprotoc ${LIBRARY_LINKAGE} IMPORTED GLOBAL)
 
 add_dependencies(protobuf ${PROTOBUF_TARGET})
 add_executable(protoc IMPORTED GLOBAL)
@@ -1272,6 +1392,10 @@ else ()
     IMPORTED_LOCATION ${PROTOBUF_ROOT}-build/libprotobuf${PROTOBUF_SUFFIX}${LIBRARY_SUFFIX})
 
   set_target_properties(
+    libprotoc PROPERTIES
+    IMPORTED_LOCATION ${PROTOBUF_ROOT}-build/libprotoc${PROTOBUF_SUFFIX}${LIBRARY_SUFFIX})
+
+  set_target_properties(
     protoc PROPERTIES
     IMPORTED_LOCATION ${PROTOBUF_ROOT}-build/protoc)
 endif ()
@@ -1290,6 +1414,16 @@ ExternalProject_Add(
   URL               ${PROTOBUF_URL}
   URL_HASH          ${PROTOBUF_HASH})
 
+install(FILES $<TARGET_FILE:protobuf> DESTINATION ${3RDPARTY_LIBS_INSTALL_DIR})
+install(FILES $<TARGET_FILE:libprotoc> DESTINATION ${3RDPARTY_LIBS_INSTALL_DIR})
+install(PROGRAMS $<TARGET_FILE:protoc> DESTINATION ${MESOS_INSTALL_RUNTIME})
+
+if (ENABLE_INSTALL_MODULE_DEPENDENCIES)
+  install(
+    DIRECTORY ${PROTOBUF_ROOT}/src/google
+    DESTINATION ${MESOS_INSTALL_HEADERS}
+    FILES_MATCHING PATTERN "*.h")
+endif ()
 
 # gRPC: Google's high performance, open-source universal RPC framework.
 # https://grpc.io/
@@ -1423,6 +1557,11 @@ ExternalProject_Add(
   URL              ${GRPC_URL}
   URL_HASH         ${GRPC_HASH})
 
+install(
+  FILES $<TARGET_FILE:libgpr> $<TARGET_FILE:libgrpc> $<TARGET_FILE:libgrpc++>
+  DESTINATION ${3RDPARTY_LIBS_INSTALL_DIR})
+
+
 
 # Jemalloc: General-purpose malloc implementation.
 # http://jemalloc.net
@@ -1518,6 +1657,24 @@ ExternalProject_Add(
   URL               ${ZOOKEEPER_URL}
   URL_HASH          ${ZOOKEEPER_HASH})
 
+if (ENABLE_INSTALL_MODULE_DEPENDENCIES)
+  install(
+    FILES
+      ${ZOOKEEPER_CMAKE_ROOT}/src/zookeeper-${ZOOKEEPER_VERSION}/src/c/generated/zookeeper.jute.h
+      ${ZOOKEEPER_CMAKE_ROOT}/src/zookeeper-${ZOOKEEPER_VERSION}/src/c/include/config.h
+      ${ZOOKEEPER_CMAKE_ROOT}/src/zookeeper-${ZOOKEEPER_VERSION}/src/c/include/proto.h
+      ${ZOOKEEPER_CMAKE_ROOT}/src/zookeeper-${ZOOKEEPER_VERSION}/src/c/include/recordio.h
+      ${ZOOKEEPER_CMAKE_ROOT}/src/zookeeper-${ZOOKEEPER_VERSION}/src/c/include/winconfig.h
+      ${ZOOKEEPER_CMAKE_ROOT}/src/zookeeper-${ZOOKEEPER_VERSION}/src/c/include/zookeeper_log.h
+      ${ZOOKEEPER_CMAKE_ROOT}/src/zookeeper-${ZOOKEEPER_VERSION}/src/c/include/zookeeper_version.h
+      ${ZOOKEEPER_CMAKE_ROOT}/src/zookeeper-${ZOOKEEPER_VERSION}/src/c/include/zookeeper.h
+    DESTINATION ${MESOS_INSTALL_HEADERS}/zookeeper)
+
+  # NOTE: `zookeeper` is always built statically, hence it is always installed
+  # into ${MESOS_INSTALL_LIBRARIES}, even on Windows.
+  install(FILES $<TARGET_FILE:zookeeper> DESTINATION ${MESOS_INSTALL_LIBRARIES})
+  install(FILES $<TARGET_FILE:zk-hashtable> DESTINATION ${MESOS_INSTALL_LIBRARIES})
+endif ()
 
 # LevelDB: A fast key-value storage library.
 # https://github.com/google/leveldb

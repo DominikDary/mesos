@@ -119,11 +119,20 @@ Try<vector<TResourceConversion>> getResourceConversions(
       return Error("Operation not supported");
 
     case TOperation::RESERVE: {
-      foreach (const TResource& reserved, operation.reserve().resources()) {
-        // Note that we only allow "pushing" a single reservation at time.
-        TResources consumed = TResources(reserved).popReservation();
-        conversions.emplace_back(consumed, reserved);
+      TResources reserved(operation.reserve().resources());
+
+      // If the operation explicitly specifies a `source` we use that,
+      // otherwise we assume that the operation is "pushing" a single
+      // reservation. At this point, the resources in the operation
+      // should have been already sanity checked, so we don't have to
+      // repeat that here.
+      TResources consumed;
+      if (operation.reserve().source_size() > 0) {
+        consumed = TResources(operation.reserve().source());
+      } else {
+        consumed = reserved.popReservation();
       }
+      conversions.emplace_back(consumed, reserved);
       break;
     }
 
@@ -618,6 +627,12 @@ Option<Error> validateAndUpgradeResources(Offer::Operation* operation)
         return error;
       }
 
+      error = Resources::validate(operation->reserve().source());
+
+      if (error.isSome()) {
+        return error;
+      }
+
       break;
     }
     case Offer::Operation::UNRESERVE: {
@@ -903,5 +918,73 @@ Try<Nothing> downgradeResources(Message* message)
   return internal::convertResourcesImpl(
       message, downgradeResource, resourcesContainment);
 }
+
+
+Resources shrinkResources(const Resources& resources, ResourceQuantities target)
+{
+  if (target.empty()) {
+    return Resources();
+  }
+
+  // TODO(mzhu): Add a `shuffle()` method in `Resources` to avoid this copy.
+  google::protobuf::RepeatedPtrField<Resource> resourceVector = resources;
+
+  std::random_shuffle(resourceVector.begin(), resourceVector.end());
+
+  Resources result;
+  foreach (Resource& resource, resourceVector) {
+    Value::Scalar scalar = target.get(resource.name());
+
+    if (scalar == Value::Scalar()) {
+      // Resource that has zero quantity is dropped (shrunk to zero).
+      continue;
+    }
+
+    // Target can only be explicitly specified for scalar resources.
+    CHECK_EQ(Value::SCALAR, resource.type()) << " Resources: " << resources;
+
+    if (Resources::shrink(&resource, scalar)) {
+      target -= ResourceQuantities::fromScalarResource(resource);
+      result += std::move(resource);
+    }
+  }
+
+  return result;
+}
+
+
+Resources shrinkResources(const Resources& resources, ResourceLimits target)
+{
+  if (target.empty()) {
+    return resources;
+  }
+
+  // TODO(mzhu): Add a `shuffle()` method in `Resources` to avoid this copy.
+  google::protobuf::RepeatedPtrField<Resource> resourceVector = resources;
+
+  std::random_shuffle(resourceVector.begin(), resourceVector.end());
+
+  Resources result;
+  foreach (Resource resource, resourceVector) {
+    Option<Value::Scalar> limit = target.get(resource.name());
+
+    if (limit.isNone()) {
+      // Resource that has infinite limit is kept as is.
+      result += std::move(resource);
+      continue;
+    }
+
+    // Target can only be explicitly specified for scalar resources.
+    CHECK_EQ(Value::SCALAR, resource.type()) << " Resources: " << resources;
+
+    if (Resources::shrink(&resource, *limit)) {
+      target -= ResourceQuantities::fromScalarResource(resource);
+      result += std::move(resource);
+    }
+  }
+
+  return result;
+}
+
 
 } // namespace mesos {

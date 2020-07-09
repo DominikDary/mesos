@@ -16,6 +16,7 @@
 
 #include "authorizer/local/authorizer.hpp"
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -43,12 +44,12 @@
 #include "common/parse.hpp"
 #include "common/protobuf_utils.hpp"
 
+using std::shared_ptr;
 using std::string;
 using std::vector;
 
 using process::Failure;
 using process::Future;
-using process::Owned;
 
 using process::dispatch;
 
@@ -412,6 +413,9 @@ public:
         case authorization::START_MAINTENANCE:
         case authorization::STOP_MAINTENANCE:
         case authorization::UPDATE_MAINTENANCE_SCHEDULE:
+        case authorization::DRAIN_AGENT:
+        case authorization::DEACTIVATE_AGENT:
+        case authorization::REACTIVATE_AGENT:
         case authorization::MODIFY_RESOURCE_PROVIDER_CONFIG:
         case authorization::MARK_RESOURCE_PROVIDER_GONE:
         case authorization::VIEW_RESOURCE_PROVIDER:
@@ -424,6 +428,7 @@ public:
         case authorization::GET_QUOTA:
         case authorization::RESERVE_RESOURCES:
         case authorization::UPDATE_QUOTA:
+        case authorization::UPDATE_QUOTA_WITH_CONFIG:
         case authorization::UPDATE_WEIGHT:
         case authorization::VIEW_ROLE:
         case authorization::REGISTER_FRAMEWORK:
@@ -431,6 +436,7 @@ public:
         case authorization::DESTROY_BLOCK_DISK:
         case authorization::CREATE_MOUNT_DISK:
         case authorization::DESTROY_MOUNT_DISK:
+        case authorization::DESTROY_RAW_DISK:
           return Error("Authorization for action " + stringify(action_) +
                        " requires a specialized approver object.");
         case authorization::UNKNOWN:
@@ -607,7 +613,8 @@ public:
         case authorization::CREATE_BLOCK_DISK:
         case authorization::DESTROY_BLOCK_DISK:
         case authorization::CREATE_MOUNT_DISK:
-        case authorization::DESTROY_MOUNT_DISK: {
+        case authorization::DESTROY_MOUNT_DISK:
+        case authorization::DESTROY_RAW_DISK: {
           entityObject.set_type(ACL::Entity::SOME);
           if (object->resource) {
             if (object->resource->reservations_size() > 0) {
@@ -648,9 +655,7 @@ public:
         }
         case authorization::GET_QUOTA: {
           entityObject.set_type(mesos::ACL::Entity::SOME);
-          if (object->quota_info) {
-            entityObject.add_values(object->quota_info->role());
-          } else if (object->value) {
+          if (object->value) {
             entityObject.add_values(*(object->value));
           } else {
             entityObject.set_type(mesos::ACL::Entity::ANY);
@@ -663,6 +668,15 @@ public:
           CHECK_NOTNULL(object->quota_info);
 
           entityObject.add_values(object->quota_info->role());
+          entityObject.set_type(mesos::ACL::Entity::SOME);
+
+          break;
+        }
+        case authorization::UPDATE_QUOTA_WITH_CONFIG: {
+          // Check object has the required types set.
+          CHECK_NOTNULL(object->value);
+
+          entityObject.add_values(*(object->value));
           entityObject.set_type(mesos::ACL::Entity::SOME);
 
           break;
@@ -722,6 +736,9 @@ public:
         case authorization::SET_LOG_LEVEL:
         case authorization::START_MAINTENANCE:
         case authorization::STOP_MAINTENANCE:
+        case authorization::DRAIN_AGENT:
+        case authorization::DEACTIVATE_AGENT:
+        case authorization::REACTIVATE_AGENT:
         case authorization::TEARDOWN_FRAMEWORK:
         case authorization::UNRESERVE_RESOURCES:
         case authorization::UPDATE_MAINTENANCE_SCHEDULE:
@@ -816,19 +833,24 @@ public:
       subject = request.subject();
     }
 
-    return getObjectApprover(subject, request.action())
-      .then([=](const Owned<ObjectApprover>& objectApprover) -> Future<bool> {
-        Option<ObjectApprover::Object> object = None();
-        if (request.has_object()) {
-          object = ObjectApprover::Object(request.object());
-        }
+    Option<ObjectApprover::Object> object = None();
+    if (request.has_object()) {
+      object = ObjectApprover::Object(request.object());
+    }
 
-        Try<bool> result = objectApprover->approved(object);
-        if (result.isError()) {
-          return Failure(result.error());
-        }
-        return result.get();
-      });
+    const Try<shared_ptr<const ObjectApprover>> approver =
+      getApprover(subject, request.action());
+
+    if (approver.isError()) {
+      return Failure(approver.error());
+    }
+
+    Try<bool> result = (*approver)->approved(object);
+    if (result.isError()) {
+      return Failure(result.error());
+    }
+
+    return result.get();
   }
 
   template <typename SomeACL>
@@ -879,7 +901,7 @@ public:
     return acls;
   }
 
-  Future<Owned<ObjectApprover>> getHierarchicalRoleApprover(
+  shared_ptr<const ObjectApprover> getHierarchicalRoleApprover(
       const Option<authorization::Subject>& subject,
       const authorization::Action& action) const
   {
@@ -920,7 +942,8 @@ public:
             createHierarchicalRoleACLs(acls.register_frameworks());
         break;
       }
-      case authorization::UPDATE_QUOTA: {
+      case authorization::UPDATE_QUOTA:
+      case authorization::UPDATE_QUOTA_WITH_CONFIG: {
         hierarchicalRoleACLs =
             createHierarchicalRoleACLs(acls.update_quotas());
         break;
@@ -945,6 +968,11 @@ public:
           createHierarchicalRoleACLs(acls.destroy_mount_disks());
         break;
       }
+      case authorization::DESTROY_RAW_DISK: {
+        hierarchicalRoleACLs =
+          createHierarchicalRoleACLs(acls.destroy_raw_disks());
+        break;
+      }
       case authorization::ACCESS_MESOS_LOG:
       case authorization::ACCESS_SANDBOX:
       case authorization::ATTACH_CONTAINER_INPUT:
@@ -967,6 +995,9 @@ public:
       case authorization::SET_LOG_LEVEL:
       case authorization::START_MAINTENANCE:
       case authorization::STOP_MAINTENANCE:
+      case authorization::DRAIN_AGENT:
+      case authorization::DEACTIVATE_AGENT:
+      case authorization::REACTIVATE_AGENT:
       case authorization::TEARDOWN_FRAMEWORK:
       case authorization::UNKNOWN:
       case authorization::UNRESERVE_RESOURCES:
@@ -985,12 +1016,11 @@ public:
         UNREACHABLE();
     }
 
-    return Owned<ObjectApprover>(
-        new LocalHierarchicalRoleApprover(
-            hierarchicalRoleACLs, subject, action, acls.permissive()));
+    return std::make_shared<LocalHierarchicalRoleApprover>(
+        hierarchicalRoleACLs, subject, action, acls.permissive());
   }
 
-  Future<Owned<ObjectApprover>> getNestedContainerObjectApprover(
+  shared_ptr<const ObjectApprover> getNestedContainerObjectApprover(
       const Option<authorization::Subject>& subject,
       const authorization::Action& action) const
   {
@@ -1039,15 +1069,15 @@ public:
       }
     }
 
-    return Owned<ObjectApprover>(new LocalNestedContainerObjectApprover(
+    return std::make_shared<LocalNestedContainerObjectApprover>(
         runAsUserAcls,
         parentRunningAsUserAcls,
         subject,
         action,
-        acls.permissive()));
+        acls.permissive());
   }
 
-  Future<Owned<ObjectApprover>> getImplicitExecutorObjectApprover(
+  shared_ptr<const ObjectApprover> getImplicitExecutorObjectApprover(
       const Option<authorization::Subject>& subject,
       const authorization::Action& action)
   {
@@ -1073,14 +1103,14 @@ public:
     if (subjectContainerId.isNone()) {
       // If the subject's claims do not include a ContainerID,
       // we deny all objects.
-      return Owned<ObjectApprover>(new RejectingObjectApprover());
+      return std::make_shared<RejectingObjectApprover>();
     }
 
-    return Owned<ObjectApprover>(new LocalImplicitExecutorObjectApprover(
-        subjectContainerId.get()));
+    return std::make_shared<LocalImplicitExecutorObjectApprover>(
+        subjectContainerId.get());
   }
 
-  Future<Owned<ObjectApprover>> getImplicitResourceProviderObjectApprover(
+  shared_ptr<const ObjectApprover> getImplicitResourceProviderObjectApprover(
       const Option<authorization::Subject>& subject,
       const authorization::Action& action)
   {
@@ -1103,15 +1133,14 @@ public:
     if (subjectPrefix.isNone()) {
       // If the subject's claims do not include a namespace string,
       // we deny all objects.
-      return Owned<ObjectApprover>(new RejectingObjectApprover());
+      return std::make_shared<RejectingObjectApprover>();
     }
 
-    return Owned<ObjectApprover>(
-        new LocalImplicitResourceProviderObjectApprover(
-            subjectPrefix.get()));
+    return std::make_shared<LocalImplicitResourceProviderObjectApprover>(
+        subjectPrefix.get());
   }
 
-  Future<Owned<ObjectApprover>> getObjectApprover(
+  Try<shared_ptr<const ObjectApprover>> getApprover(
       const Option<authorization::Subject>& subject,
       const authorization::Action& action)
   {
@@ -1148,7 +1177,7 @@ public:
     // subjects that do not have the `value` field set. If the previous case was
     // not true and `value` is not set, then we should fail all requests.
     if (subject.isSome() && !subject->has_value()) {
-      return Owned<ObjectApprover>(new RejectingObjectApprover());
+      return std::make_shared<RejectingObjectApprover>();
     }
 
     switch (action) {
@@ -1164,10 +1193,12 @@ public:
       case authorization::GET_QUOTA:
       case authorization::REGISTER_FRAMEWORK:
       case authorization::UPDATE_QUOTA:
+      case authorization::UPDATE_QUOTA_WITH_CONFIG:
       case authorization::CREATE_BLOCK_DISK:
       case authorization::DESTROY_BLOCK_DISK:
       case authorization::CREATE_MOUNT_DISK:
-      case authorization::DESTROY_MOUNT_DISK: {
+      case authorization::DESTROY_MOUNT_DISK:
+      case authorization::DESTROY_RAW_DISK: {
         return getHierarchicalRoleApprover(subject, action);
       }
       case authorization::ACCESS_MESOS_LOG:
@@ -1193,6 +1224,9 @@ public:
       case authorization::TEARDOWN_FRAMEWORK:
       case authorization::UNRESERVE_RESOURCES:
       case authorization::UPDATE_MAINTENANCE_SCHEDULE:
+      case authorization::DRAIN_AGENT:
+      case authorization::DEACTIVATE_AGENT:
+      case authorization::REACTIVATE_AGENT:
       case authorization::VIEW_CONTAINER:
       case authorization::VIEW_EXECUTOR:
       case authorization::VIEW_FLAGS:
@@ -1208,16 +1242,15 @@ public:
         Result<vector<GenericACL>> genericACLs =
           createGenericACLs(action, acls);
         if (genericACLs.isError()) {
-          return Failure(genericACLs.error());
+          return Error(genericACLs.error());
         }
         if (genericACLs.isNone()) {
           // If we could not create acls, we deny all objects.
-          return Owned<ObjectApprover>(new RejectingObjectApprover());
+          return std::make_shared<RejectingObjectApprover>();
         }
 
-        return Owned<ObjectApprover>(
-            new LocalAuthorizerObjectApprover(
-                genericACLs.get(), subject, action, acls.permissive()));
+        return std::make_shared<LocalAuthorizerObjectApprover>(
+            genericACLs.get(), subject, action, acls.permissive());
       }
     }
 
@@ -1482,6 +1515,40 @@ private:
         }
 
         return acls_;
+
+      case authorization::DRAIN_AGENT:
+        foreach (const ACL::DrainAgent& acl,
+                 acls.drain_agents()) {
+          GenericACL acl_;
+          acl_.subjects = acl.principals();
+          acl_.objects = acl.agents();
+
+          acls_.push_back(acl_);
+        }
+
+        return acls_;
+      case authorization::DEACTIVATE_AGENT:
+        foreach (const ACL::DeactivateAgent& acl,
+                 acls.deactivate_agents()) {
+          GenericACL acl_;
+          acl_.subjects = acl.principals();
+          acl_.objects = acl.agents();
+
+          acls_.push_back(acl_);
+        }
+
+        return acls_;
+      case authorization::REACTIVATE_AGENT:
+        foreach (const ACL::ReactivateAgent& acl,
+                 acls.reactivate_agents()) {
+          GenericACL acl_;
+          acl_.subjects = acl.principals();
+          acl_.objects = acl.agents();
+
+          acls_.push_back(acl_);
+        }
+
+        return acls_;
       case authorization::MARK_AGENT_GONE:
         foreach (const ACL::MarkAgentGone& acl,
                  acls.mark_agents_gone()) {
@@ -1600,12 +1667,14 @@ private:
       case authorization::VIEW_ROLE:
       case authorization::GET_QUOTA:
       case authorization::UPDATE_QUOTA:
+      case authorization::UPDATE_QUOTA_WITH_CONFIG:
       case authorization::LAUNCH_NESTED_CONTAINER_SESSION:
       case authorization::LAUNCH_NESTED_CONTAINER:
       case authorization::CREATE_BLOCK_DISK:
       case authorization::DESTROY_BLOCK_DISK:
       case authorization::CREATE_MOUNT_DISK:
       case authorization::DESTROY_MOUNT_DISK:
+      case authorization::DESTROY_RAW_DISK:
         return Error("Extracting ACLs for " + stringify(action) + " requires "
                      "a specialized function");
       case authorization::UNKNOWN:
@@ -1724,6 +1793,24 @@ Option<Error> LocalAuthorizer::validate(const ACLs& acls)
            acls.get_maintenance_statuses()) {
     if (acl.machines().type() == ACL::Entity::SOME) {
       return Error("ACL.GetMaintenanceStatus type must be either NONE or ANY");
+    }
+  }
+
+  foreach (const ACL::DrainAgent& acl, acls.drain_agents()) {
+    if (acl.agents().type() == ACL::Entity::SOME) {
+      return Error("ACL.DrainAgent type must be either NONE or ANY");
+    }
+  }
+
+  foreach (const ACL::DeactivateAgent& acl, acls.deactivate_agents()) {
+    if (acl.agents().type() == ACL::Entity::SOME) {
+      return Error("ACL.DeactivateAgent type must be either NONE or ANY");
+    }
+  }
+
+  foreach (const ACL::ReactivateAgent& acl, acls.reactivate_agents()) {
+    if (acl.agents().type() == ACL::Entity::SOME) {
+      return Error("ACL.ReactivateAgent type must be either NONE or ANY");
     }
   }
 
@@ -1860,15 +1947,24 @@ process::Future<bool> LocalAuthorizer::authorized(
 }
 
 
-Future<Owned<ObjectApprover>> LocalAuthorizer::getObjectApprover(
-      const Option<authorization::Subject>& subject,
-      const authorization::Action& action)
+Future<shared_ptr<const ObjectApprover>> LocalAuthorizer::getApprover(
+    const Option<authorization::Subject>& subject,
+    const authorization::Action& action)
 {
   return dispatch(
       process,
-      &LocalAuthorizerProcess::getObjectApprover,
+      &LocalAuthorizerProcess::getApprover,
       subject,
-      action);
+      action)
+    .then(
+        [](const Try<shared_ptr<const ObjectApprover>>& approver)
+          -> Future<shared_ptr<const ObjectApprover>> {
+          if (approver.isError()) {
+            return Failure(approver.error());
+          }
+
+          return *approver;
+        });
 }
 
 } // namespace internal {

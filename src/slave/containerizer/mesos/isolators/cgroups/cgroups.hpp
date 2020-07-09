@@ -70,7 +70,9 @@ public:
 
   process::Future<Nothing> update(
       const ContainerID& containerId,
-      const Resources& resources) override;
+      const Resources& resourceRequests,
+      const google::protobuf::Map<
+          std::string, Value::Scalar>& resourceLimits = {}) override;
 
   process::Future<ResourceStatistics> usage(
       const ContainerID& containerId) override;
@@ -130,7 +132,9 @@ private:
       const mesos::slave::ContainerConfig& containerConfig);
 
   process::Future<Nothing> _isolate(
-      const std::vector<process::Future<Nothing>>& futures);
+      const std::vector<process::Future<Nothing>>& futures,
+      const ContainerID& containerId,
+      pid_t pid);
 
   void _watch(
       const ContainerID& containerId,
@@ -146,6 +150,8 @@ private:
   process::Future<Nothing> __cleanup(
       const ContainerID& containerId,
       const std::vector<process::Future<Nothing>>& futures);
+
+  process::Owned<Info> findCgroupInfo(const ContainerID& containerId) const;
 
   const Flags flags;
 

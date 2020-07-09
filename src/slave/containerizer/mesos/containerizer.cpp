@@ -70,8 +70,10 @@
 
 #include "slave/containerizer/mesos/constants.hpp"
 #include "slave/containerizer/mesos/containerizer.hpp"
+#include "slave/containerizer/mesos/isolator_tracker.hpp"
 #include "slave/containerizer/mesos/launch.hpp"
 #include "slave/containerizer/mesos/launcher.hpp"
+#include "slave/containerizer/mesos/launcher_tracker.hpp"
 #include "slave/containerizer/mesos/paths.hpp"
 #include "slave/containerizer/mesos/utils.hpp"
 
@@ -103,9 +105,9 @@
 #include "slave/containerizer/mesos/isolators/docker/volume/isolator.hpp"
 #include "slave/containerizer/mesos/isolators/filesystem/linux.hpp"
 #include "slave/containerizer/mesos/isolators/filesystem/shared.hpp"
-#include "slave/containerizer/mesos/isolators/gpu/nvidia.hpp"
 #include "slave/containerizer/mesos/isolators/linux/capabilities.hpp"
 #include "slave/containerizer/mesos/isolators/linux/devices.hpp"
+#include "slave/containerizer/mesos/isolators/linux/nnp.hpp"
 #include "slave/containerizer/mesos/isolators/namespaces/ipc.hpp"
 #include "slave/containerizer/mesos/isolators/namespaces/pid.hpp"
 #include "slave/containerizer/mesos/isolators/network/cni/cni.hpp"
@@ -177,7 +179,8 @@ Try<MesosContainerizer*> MesosContainerizer::create(
     GarbageCollector* gc,
     SecretResolver* secretResolver,
     const Option<NvidiaComponents>& nvidia,
-    VolumeGidManager* volumeGidManager)
+    VolumeGidManager* volumeGidManager,
+    PendingFutureTracker* futureTracker)
 {
   Try<hashset<string>> isolations = [&flags]() -> Try<hashset<string>> {
     const vector<string> tokens(strings::tokenize(flags.isolation, ","));
@@ -314,7 +317,7 @@ Try<MesosContainerizer*> MesosContainerizer::create(
   LOG(INFO) << "Using isolation " << stringify(isolations.get());
 
   // Create the launcher for the MesosContainerizer.
-  Try<Launcher*> launcher = [&flags]() -> Try<Launcher*> {
+  Try<Launcher*> _launcher = [&flags]() -> Try<Launcher*> {
 #ifdef __linux__
     if (flags.launcher == "linux") {
       return LinuxLauncher::create(flags);
@@ -338,8 +341,14 @@ Try<MesosContainerizer*> MesosContainerizer::create(
 #endif // __linux__
   }();
 
-  if (launcher.isError()) {
-    return Error("Failed to create launcher: " + launcher.error());
+  if (_launcher.isError()) {
+    return Error("Failed to create launcher: " + _launcher.error());
+  }
+
+  Owned<Launcher> launcher = Owned<Launcher>(_launcher.get());
+
+  if (futureTracker != nullptr) {
+    launcher = Owned<Launcher>(new LauncherTracker(launcher, futureTracker));
   }
 
   Try<Owned<Provisioner>> _provisioner =
@@ -407,7 +416,6 @@ Try<MesosContainerizer*> MesosContainerizer::create(
 #endif // __WINDOWS__
 
 #ifdef __WINDOWS__
-    {"docker/runtime", &DockerRuntimeIsolatorProcess::create},
     {"windows/cpu", &WindowsCpuIsolatorProcess::create},
     {"windows/mem", &WindowsMemIsolatorProcess::create},
 #endif // __WINDOWS__
@@ -430,6 +438,7 @@ Try<MesosContainerizer*> MesosContainerizer::create(
 
     {"linux/devices", &LinuxDevicesIsolatorProcess::create},
     {"linux/capabilities", &LinuxCapabilitiesIsolatorProcess::create},
+    {"linux/nnp", &LinuxNNPIsolatorProcess::create},
 
     {"namespaces/ipc", &NamespacesIPCIsolatorProcess::create},
     {"namespaces/pid", &NamespacesPidIsolatorProcess::create},
@@ -538,26 +547,40 @@ Try<MesosContainerizer*> MesosContainerizer::create(
       cgroupsIsolatorCreated = true;
     }
 
-    Try<Isolator*> isolator = creator.second(flags);
-    if (isolator.isError()) {
+    Try<Isolator*> _isolator = creator.second(flags);
+    if (_isolator.isError()) {
       return Error("Failed to create isolator '" + creator.first + "': " +
-                   isolator.error());
+                   _isolator.error());
     }
 
-    isolators.push_back(Owned<Isolator>(isolator.get()));
+    Owned<Isolator> isolator(_isolator.get());
+
+    if (futureTracker != nullptr) {
+      isolator = Owned<Isolator>(
+          new IsolatorTracker(isolator, creator.first, futureTracker));
+    }
+
+    isolators.push_back(isolator);
   }
 
   // Next, apply any custom isolators in the order given by the flags.
   foreach (const string& name, strings::tokenize(flags.isolation, ",")) {
     if (ModuleManager::contains<Isolator>(name)) {
-      Try<Isolator*> isolator = ModuleManager::create<Isolator>(name);
+      Try<Isolator*> _isolator = ModuleManager::create<Isolator>(name);
 
-      if (isolator.isError()) {
+      if (_isolator.isError()) {
         return Error("Failed to create isolator '" + name + "': " +
-                    isolator.error());
+                    _isolator.error());
       }
 
-      isolators.push_back(Owned<Isolator>(isolator.get()));
+      Owned<Isolator> isolator(_isolator.get());
+
+      if (futureTracker != nullptr) {
+        isolator = Owned<Isolator>(
+            new IsolatorTracker(isolator, name, futureTracker));
+      }
+
+      isolators.push_back(isolator);
       continue;
     }
 
@@ -582,7 +605,7 @@ Try<MesosContainerizer*> MesosContainerizer::create(
       local,
       fetcher,
       gc,
-      Owned<Launcher>(launcher.get()),
+      launcher,
       provisioner,
       isolators,
       volumeGidManager);
@@ -711,12 +734,14 @@ Future<Connection> MesosContainerizer::attach(
 
 Future<Nothing> MesosContainerizer::update(
     const ContainerID& containerId,
-    const Resources& resources)
+    const Resources& resourceRequests,
+    const google::protobuf::Map<string, Value::Scalar>& resourceLimits)
 {
   return dispatch(process.get(),
                   &MesosContainerizerProcess::update,
                   containerId,
-                  resources);
+                  resourceRequests,
+                  resourceLimits);
 }
 
 
@@ -870,6 +895,7 @@ Future<Nothing> MesosContainerizerProcess::recover(
         ContainerState executorRunState =
           protobuf::slave::createContainerState(
               executorInfo,
+              None(),
               run->id.get(),
               run->forkedPid.get(),
               directory);
@@ -880,7 +906,7 @@ Future<Nothing> MesosContainerizerProcess::recover(
   }
 
   // Recover the containers from 'SlaveState'.
-  foreach (const ContainerState& state, recoverable) {
+  foreach (ContainerState& state, recoverable) {
     const ContainerID& containerId = state.container_id();
 
     // Contruct the structure for containers from the 'SlaveState'
@@ -907,6 +933,10 @@ Future<Nothing> MesosContainerizerProcess::recover(
 
     if (config.isSome()) {
       container->config = config.get();
+
+      // Copy the ephemeral volume paths to the ContainerState, since this
+      // information is otherwise only available to the prepare() callback.
+      *state.mutable_ephemeral_volumes() = config->ephemeral_volumes();
     } else {
       VLOG(1) << "No config is recovered for container " << containerId
               << ", this means image pruning will be disabled.";
@@ -1066,9 +1096,18 @@ Future<Nothing> MesosContainerizerProcess::recover(
       ContainerState state =
         protobuf::slave::createContainerState(
             None(),
+            config.isSome() && config->has_container_info() ?
+                Option<ContainerInfo>(config->container_info()) :
+                Option<ContainerInfo>::none(),
             containerId,
             container->pid.get(),
             container->directory.get());
+
+      if (config.isSome()) {
+        // Copy the ephemeral volume paths to the ContainerState, since this
+        // information is otherwise only available to the prepare() callback.
+        *state.mutable_ephemeral_volumes() = config->ephemeral_volumes();
+      }
 
       recoverable.push_back(state);
       continue;
@@ -1410,9 +1449,9 @@ Future<Containerizer::LaunchResult> MesosContainerizerProcess::launch(
   }
 
   Owned<Container> container(new Container());
-  container->state = PROVISIONING;
   container->config = containerConfig;
-  container->resources = containerConfig.resources();
+  container->resourceRequests = containerConfig.resources();
+  container->resourceLimits = containerConfig.limits();
   container->directory = containerConfig.directory();
 
   // Maintain the 'children' list in the parent's 'Container' struct,
@@ -1423,6 +1462,7 @@ Future<Containerizer::LaunchResult> MesosContainerizerProcess::launch(
   }
 
   containers_.put(containerId, container);
+  transition(containerId, PROVISIONING);
 
   Future<Nothing> _prepare;
 
@@ -1492,6 +1532,12 @@ Future<Nothing> MesosContainerizerProcess::prepare(
 
   if (provisionInfo.isSome()) {
     container->config->set_rootfs(provisionInfo->rootfs);
+
+    if (provisionInfo->ephemeralVolumes.isSome()) {
+      foreach (const Path& path, provisionInfo->ephemeralVolumes.get()) {
+        container->config->add_ephemeral_volumes(path);
+      }
+    }
 
     if (provisionInfo->dockerManifest.isSome() &&
         provisionInfo->appcManifest.isSome()) {
@@ -2363,7 +2409,8 @@ Future<Option<ContainerTermination>> MesosContainerizerProcess::wait(
 
 Future<Nothing> MesosContainerizerProcess::update(
     const ContainerID& containerId,
-    const Resources& resources)
+    const Resources& resourceRequests,
+    const google::protobuf::Map<string, Value::Scalar>& resourceLimits)
 {
   CHECK(!containerId.has_parent());
 
@@ -2386,7 +2433,8 @@ Future<Nothing> MesosContainerizerProcess::update(
 
   // NOTE: We update container's resources before isolators are updated
   // so that subsequent containerizer->update can be handled properly.
-  container->resources = resources;
+  container->resourceRequests = resourceRequests;
+  container->resourceLimits = resourceLimits;
 
   // Update each isolator.
   vector<Future<Nothing>> futures;
@@ -2398,7 +2446,8 @@ Future<Nothing> MesosContainerizerProcess::update(
       continue;
     }
 
-    futures.push_back(isolator->update(containerId, resources));
+    futures.push_back(
+        isolator->update(containerId, resourceRequests, resourceLimits));
   }
 
   // Wait for all isolators to complete.
@@ -2407,12 +2456,11 @@ Future<Nothing> MesosContainerizerProcess::update(
 }
 
 
-// Resources are used to set the limit fields in the statistics but
-// are optional because they aren't known after recovery until/unless
-// update() is called.
 Future<ResourceStatistics> _usage(
     const ContainerID& containerId,
-    const Option<Resources>& resources,
+    const Option<Resources>& resourceRequests,
+    const Option<google::protobuf::Map<string, Value::Scalar>>& resourceLimits,
+    bool enableCfsQuota,
     const vector<Future<ResourceStatistics>>& statistics)
 {
   ResourceStatistics result;
@@ -2431,17 +2479,76 @@ Future<ResourceStatistics> _usage(
     }
   }
 
-  if (resources.isSome()) {
-    // Set the resource allocations.
-    Option<Bytes> mem = resources->mem();
-    if (mem.isSome()) {
-      result.set_mem_limit_bytes(mem->bytes());
+  Option<double> cpuRequest, cpuLimit, memLimit;
+  Option<Bytes> memRequest;
+
+  if (resourceRequests.isSome()) {
+    cpuRequest = resourceRequests->cpus();
+    memRequest = resourceRequests->mem();
+  }
+
+  if (resourceLimits.isSome()) {
+    foreach (auto&& limit, resourceLimits.get()) {
+      if (limit.first == "cpus") {
+        cpuLimit = limit.second.value();
+      } else if (limit.first == "mem") {
+        memLimit = limit.second.value();
+      }
+    }
+  }
+
+  if (cpuRequest.isSome()) {
+    result.set_cpus_soft_limit(cpuRequest.get());
+  }
+
+  if (cpuLimit.isSome()) {
+    // Get the total CPU numbers of this node, we will use it to set container's
+    // hard CPU limit if the CPU limit specified by framework is infinity.
+    static Option<long> totalCPUs;
+    if (totalCPUs.isNone()) {
+      Try<long> cpus = os::cpus();
+      if (cpus.isError()) {
+        return Failure(
+            "Failed to auto-detect the number of cpus: " + cpus.error());
+      }
+
+      totalCPUs = cpus.get();
     }
 
-    Option<double> cpus = resources->cpus();
-    if (cpus.isSome()) {
-      result.set_cpus_limit(cpus.get());
+    CHECK_SOME(totalCPUs);
+
+    result.set_cpus_limit(
+        std::isinf(cpuLimit.get()) ? totalCPUs.get() : cpuLimit.get());
+  } else if (enableCfsQuota && cpuRequest.isSome()) {
+    result.set_cpus_limit(cpuRequest.get());
+  }
+
+  if (memRequest.isSome()) {
+    result.set_mem_soft_limit_bytes(memRequest->bytes());
+  }
+
+  if (memLimit.isSome()) {
+    // Get the total memory of this node, we will use it to set container's hard
+    // memory limit if the memory limit specified by framework is infinity.
+    static Option<Bytes> totalMem;
+    if (totalMem.isNone()) {
+      Try<os::Memory> mem = os::memory();
+      if (mem.isError()) {
+        return Failure(
+            "Failed to auto-detect the size of main memory: " + mem.error());
+      }
+
+      totalMem = mem->total;
     }
+
+    CHECK_SOME(totalMem);
+
+    result.set_mem_limit_bytes(
+        std::isinf(memLimit.get())
+          ? totalMem->bytes()
+          : Megabytes(static_cast<uint64_t>(memLimit.get())).bytes());
+  } else if (memRequest.isSome()) {
+    result.set_mem_limit_bytes(memRequest->bytes());
   }
 
   return result;
@@ -2467,14 +2574,39 @@ Future<ResourceStatistics> MesosContainerizerProcess::usage(
     futures.push_back(isolator->usage(containerId));
   }
 
+  Option<Resources> resourceRequests;
+  Option<google::protobuf::Map<string, Value::Scalar>> resourceLimits;
+
+  // TODO(idownes): After recovery top-level container's resource requests and
+  // limits won't be known until after an update() because they aren't part of
+  // the SlaveState.
+  //
+  // For nested containers, we will get their resource requests and limits from
+  // their `ContainerConfig` since the `resourceRequests` and `resourceLimits`
+  // fields in the `Container` struct won't be recovered for nested containers
+  // after agent restart and update() won't be called for nested containers.
+  if (containerId.has_parent()) {
+    if (containers_.at(containerId)->config.isSome()) {
+      resourceRequests = containers_.at(containerId)->config->resources();
+      resourceLimits = containers_.at(containerId)->config->limits();
+    }
+  } else {
+    resourceRequests = containers_.at(containerId)->resourceRequests;
+    resourceLimits = containers_.at(containerId)->resourceLimits;
+  }
+
   // Use await() here so we can return partial usage statistics.
-  // TODO(idownes): After recovery resources won't be known until
-  // after an update() because they aren't part of the SlaveState.
   return await(futures)
     .then(lambda::bind(
           _usage,
           containerId,
-          containers_.at(containerId)->resources,
+          resourceRequests,
+          resourceLimits,
+#ifdef __linux__
+          flags.cgroups_enable_cfs,
+#else
+          false,
+#endif
           lambda::_1));
 }
 
@@ -2635,20 +2767,11 @@ void MesosContainerizerProcess::_destroy(
   }
 
   if (previousState == PROVISIONING) {
-    VLOG(1) << "Waiting for the provisioner to complete provisioning "
-            << "before destroying container " << containerId;
+    VLOG(1) << "Discarding the provisioning for container " << containerId;
 
-    // Wait for the provisioner to finish provisioning before we
-    // start destroying the container.
-    container->provisioning
-      .onAny(defer(
-          self(),
-          &Self::_____destroy,
-          containerId,
-          termination,
-          vector<Future<Nothing>>()));
+    container->provisioning.discard();
 
-    return;
+    return _____destroy(containerId, termination, vector<Future<Nothing>>());
   }
 
   if (previousState == PREPARING) {
@@ -2919,10 +3042,12 @@ void MesosContainerizerProcess::______destroy(
 
       CHECK(containers_.contains(rootContainerId));
 
-      const string sandboxPath = containerizer::paths::getSandboxPath(
-        containers_[rootContainerId]->directory.get(), containerId);
+      if (containers_[rootContainerId]->directory.isSome()) {
+        const string sandboxPath = containerizer::paths::getSandboxPath(
+          containers_[rootContainerId]->directory.get(), containerId);
 
-      garbageCollect(sandboxPath);
+        garbageCollect(sandboxPath);
+      }
     }
   } else if (os::exists(runtimePath)) {
     Try<Nothing> rmdir = os::rmdir(runtimePath);
@@ -3039,21 +3164,23 @@ Future<Nothing> MesosContainerizerProcess::remove(
     }
   }
 
-  const string sandboxPath = containerizer::paths::getSandboxPath(
-      containers_[rootContainerId]->directory.get(), containerId);
+  if (containers_[rootContainerId]->directory.isSome()) {
+    const string sandboxPath = containerizer::paths::getSandboxPath(
+        containers_[rootContainerId]->directory.get(), containerId);
 
-  if (os::exists(sandboxPath)) {
-    // Unschedule the nested container sandbox from garbage collection
-    // to prevent potential double-deletion in future.
-    if (flags.gc_non_executor_container_sandboxes) {
-      CHECK_NOTNULL(gc);
-      gc->unschedule(sandboxPath);
-    }
+    if (os::exists(sandboxPath)) {
+      // Unschedule the nested container sandbox from garbage collection
+      // to prevent potential double-deletion in future.
+      if (flags.gc_non_executor_container_sandboxes) {
+        CHECK_NOTNULL(gc);
+        gc->unschedule(sandboxPath);
+      }
 
-    Try<Nothing> rmdir = os::rmdir(sandboxPath);
-    if (rmdir.isError()) {
-      return Failure(
-          "Failed to remove the sandbox directory: " + rmdir.error());
+      Try<Nothing> rmdir = os::rmdir(sandboxPath);
+      if (rmdir.isError()) {
+        return Failure(
+            "Failed to remove the sandbox directory: " + rmdir.error());
+      }
     }
   }
 
@@ -3273,13 +3400,16 @@ void MesosContainerizerProcess::transition(
 {
   CHECK(containers_.contains(containerId));
 
+  Time now = Clock::now();
   const Owned<Container>& container = containers_.at(containerId);
 
   LOG_BASED_ON_CLASS(container->containerClass())
     << "Transitioning the state of container " << containerId << " from "
-    << container->state << " to " << state;
+    << container->state << " to " << state
+    << " after " << (now - container->lastStateTransition);
 
   container->state = state;
+  container->lastStateTransition = now;
 }
 
 
@@ -3319,6 +3449,8 @@ std::ostream& operator<<(
     const MesosContainerizerProcess::State& state)
 {
   switch (state) {
+    case MesosContainerizerProcess::STARTING:
+      return stream << "STARTING";
     case MesosContainerizerProcess::PROVISIONING:
       return stream << "PROVISIONING";
     case MesosContainerizerProcess::PREPARING:
@@ -3331,9 +3463,9 @@ std::ostream& operator<<(
       return stream << "RUNNING";
     case MesosContainerizerProcess::DESTROYING:
       return stream << "DESTROYING";
-    default:
-      UNREACHABLE();
   }
+
+  UNREACHABLE();
 };
 
 } // namespace slave {

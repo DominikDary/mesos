@@ -112,6 +112,24 @@ Option<Error> validateOfferFilters(const FrameworkInfo& frameworkInfo);
 // Validate a FrameworkInfo.
 Option<Error> validate(const mesos::FrameworkInfo& frameworkInfo);
 
+// Validate that the immutable fields of two FrameworkInfos are identical.
+// Currently these fields are 'principal', 'user' and 'checkpoint'.
+Option<Error> validateUpdate(
+    const FrameworkInfo& oldInfo,
+    const FrameworkInfo& newInfo);
+
+// Adjusts `newInfo` to ensure that the `user` and `checkpoint` fields
+// are not modified and logs a warning if they were modified.
+//
+// NOTE: This is a legacy function used to preserve the behavior of
+// re-subscription silently ignoring these fields. It should not be
+// used in new code.
+//
+// TODO(asekretenko): Remove this function (see MESOS-9747).
+void preserveImmutableFields(
+    const FrameworkInfo& oldInfo,
+    FrameworkInfo* newInfo);
+
 } // namespace framework {
 
 
@@ -137,6 +155,11 @@ Option<Error> validateSingleResourceProvider(
     const google::protobuf::RepeatedPtrField<Resource>& resources);
 
 } // namespace internal {
+
+// Returns `true` if there is any overlap between set- or range-valued
+// resources in the provided `Resources` objects.
+bool detectOverlappingSetAndRangeResources(
+    const std::vector<Resources>& resources);
 
 // Validates resources specified by frameworks.
 // NOTE: We cannot take 'Resources' here because invalid resources are
@@ -303,7 +326,6 @@ Option<Error> validate(
     const Offer::Operation::Destroy& destroy,
     const Resources& checkpointedResources,
     const hashmap<FrameworkID, Resources>& usedResources,
-    const hashmap<FrameworkID, hashmap<TaskID, TaskInfo>>& pendingTasks,
     const Option<FrameworkInfo>& frameworkInfo = None());
 
 

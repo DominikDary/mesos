@@ -2466,6 +2466,202 @@ TYPED_TEST(AuthorizationTest, UpdateQuota)
 }
 
 
+// This tests the authorization of requests to update quota configs.
+TYPED_TEST(AuthorizationTest, UpdateQuotaConfig)
+{
+  ACLs acls;
+
+  {
+    // "foo" principal can update quota configs for all roles.
+    mesos::ACL::UpdateQuota* acl = acls.add_update_quotas();
+    acl->mutable_principals()->add_values("foo");
+    acl->mutable_roles()->set_type(mesos::ACL::Entity::ANY);
+  }
+
+  {
+    // "bar" principal can update quota configs for "dev" role.
+    mesos::ACL::UpdateQuota* acl = acls.add_update_quotas();
+    acl->mutable_principals()->add_values("bar");
+    acl->mutable_roles()->add_values("dev");
+  }
+
+  {
+    // Anyone can update quota configs for "test" role.
+    mesos::ACL::UpdateQuota* acl = acls.add_update_quotas();
+    acl->mutable_principals()->set_type(mesos::ACL::Entity::ANY);
+    acl->mutable_roles()->add_values("test");
+  }
+
+  {
+    // Principal "elizabeth-ii" can update quota configs for the "king" role
+    // and its nested ones.
+    mesos::ACL::UpdateQuota* acl = acls.add_update_quotas();
+    acl->mutable_principals()->add_values("elizabeth-ii");
+    acl->mutable_roles()->add_values("king/%");
+    acl->mutable_roles()->add_values("king");
+  }
+
+  {
+    // Principal "charles" can update quota configs for any role below the
+    // "king/" role. Not in "king" itself.
+    mesos::ACL::UpdateQuota* acl = acls.add_update_quotas();
+    acl->mutable_principals()->add_values("charles");
+    acl->mutable_roles()->add_values("king/%");
+  }
+
+  {
+    // Principal "j-welby" can update quota configs only for the "king" role
+    // but not in any nested one.
+    mesos::ACL::UpdateQuota* acl = acls.add_update_quotas();
+    acl->mutable_principals()->add_values("j-welby");
+    acl->mutable_roles()->add_values("king");
+  }
+
+  {
+    // No other principal can update quota configs.
+    mesos::ACL::UpdateQuota* acl = acls.add_update_quotas();
+    acl->mutable_principals()->set_type(mesos::ACL::Entity::ANY);
+    acl->mutable_roles()->set_type(mesos::ACL::Entity::NONE);
+  }
+
+  // Create an `Authorizer` with the ACLs.
+  Try<Authorizer*> create = TypeParam::create(parameterize(acls));
+  ASSERT_SOME(create);
+  Owned<Authorizer> authorizer(create.get());
+
+  // Principal "foo" can update quota configs for all roles, so this will pass.
+  {
+    authorization::Request request;
+    request.set_action(authorization::UPDATE_QUOTA_WITH_CONFIG);
+    request.mutable_subject()->set_value("foo");
+    request.mutable_object()->set_value("prod");
+    AWAIT_EXPECT_TRUE(authorizer->authorized(request));
+  }
+
+  // Principal "bar" can update quota configs for role "dev", so this will pass.
+  {
+    authorization::Request request;
+    request.set_action(authorization::UPDATE_QUOTA_WITH_CONFIG);
+    request.mutable_subject()->set_value("bar");
+    request.mutable_object()->set_value("dev");
+    AWAIT_EXPECT_TRUE(authorizer->authorized(request));
+  }
+
+  // Principal "bar" can only update quota configs for role "dev",
+  // so this will fail.
+  {
+    authorization::Request request;
+    request.set_action(authorization::UPDATE_QUOTA_WITH_CONFIG);
+    request.mutable_subject()->set_value("bar");
+    request.mutable_object()->set_value("prod");
+    AWAIT_EXPECT_FALSE(authorizer->authorized(request));
+  }
+
+  // Anyone can update quota configs for role "test", so this will pass.
+  {
+    authorization::Request request;
+    request.set_action(authorization::UPDATE_QUOTA_WITH_CONFIG);
+    request.mutable_object()->set_value("test");
+    AWAIT_EXPECT_TRUE(authorizer->authorized(request));
+  }
+
+  // Principal "jeff" is not mentioned in the ACLs of the `Authorizer`, so it
+  // will be caught by the final ACL, which provides a default case that denies
+  // access for all other principals. This case will fail.
+  {
+    authorization::Request request;
+    request.set_action(authorization::UPDATE_QUOTA_WITH_CONFIG);
+    request.mutable_subject()->set_value("jeff");
+    request.mutable_object()->set_value("prod");
+    AWAIT_EXPECT_FALSE(authorizer->authorized(request));
+  }
+
+  // `elizabeth-ii` has full permissions for the `king` role as well as all
+  // its nested roles. She should be able to update quota configs in the next
+  // three blocks.
+  {
+    authorization::Request request;
+    request.set_action(authorization::UPDATE_QUOTA_WITH_CONFIG);
+    request.mutable_subject()->set_value("elizabeth-ii");
+    request.mutable_object()->set_value("king");
+    AWAIT_EXPECT_TRUE(authorizer->authorized(request));
+  }
+
+  {
+    authorization::Request request;
+    request.set_action(authorization::UPDATE_QUOTA_WITH_CONFIG);
+    request.mutable_subject()->set_value("elizabeth-ii");
+    request.mutable_object()->set_value("king/prince");
+    AWAIT_EXPECT_TRUE(authorizer->authorized(request));
+  }
+
+  {
+    authorization::Request request;
+    request.set_action(authorization::UPDATE_QUOTA_WITH_CONFIG);
+    request.mutable_subject()->set_value("elizabeth-ii");
+    request.mutable_object()
+        ->set_value("king/prince/duke");
+    AWAIT_EXPECT_TRUE(authorizer->authorized(request));
+  }
+
+  // `charles` doesn't have permissions for the `king` role, so the first
+  // test should fail. However he has permissions for `king`'s nested roles
+  // so the next two tests should succeed.
+  {
+    authorization::Request request;
+    request.set_action(authorization::UPDATE_QUOTA_WITH_CONFIG);
+    request.mutable_subject()->set_value("charles");
+    request.mutable_object()->set_value("king");
+    AWAIT_EXPECT_FALSE(authorizer->authorized(request));
+  }
+
+  {
+    authorization::Request request;
+    request.set_action(authorization::UPDATE_QUOTA_WITH_CONFIG);
+    request.mutable_subject()->set_value("charles");
+    request.mutable_object()->set_value("king/prince");
+    AWAIT_EXPECT_TRUE(authorizer->authorized(request));
+  }
+
+  {
+    authorization::Request request;
+    request.set_action(authorization::UPDATE_QUOTA_WITH_CONFIG);
+    request.mutable_subject()->set_value("charles");
+    request.mutable_object()
+        ->set_value("king/prince/duke");
+    AWAIT_EXPECT_TRUE(authorizer->authorized(request));
+  }
+
+  // `j-welby` only has permissions for the role `king` itself, but not
+  // for its nested roles, therefore only the first of the following three
+  // tests should succeed.
+  {
+    authorization::Request request;
+    request.set_action(authorization::UPDATE_QUOTA_WITH_CONFIG);
+    request.mutable_subject()->set_value("j-welby");
+    request.mutable_object()->set_value("king");
+    AWAIT_EXPECT_TRUE(authorizer->authorized(request));
+  }
+
+  {
+    authorization::Request request;
+    request.set_action(authorization::UPDATE_QUOTA_WITH_CONFIG);
+    request.mutable_subject()->set_value("j-welby");
+    request.mutable_object()->set_value("king/prince");
+    AWAIT_EXPECT_FALSE(authorizer->authorized(request));
+  }
+
+  {
+    authorization::Request request;
+    request.set_action(authorization::UPDATE_QUOTA_WITH_CONFIG);
+    request.mutable_subject()->set_value("j-welby");
+    request.mutable_object()
+        ->set_value("king/prince/duke");
+    AWAIT_EXPECT_FALSE(authorizer->authorized(request));
+  }
+}
+
+
 // This tests the authorization of requests to ViewFramework.
 TYPED_TEST(AuthorizationTest, ViewFramework)
 {
@@ -5723,6 +5919,171 @@ TYPED_TEST(AuthorizationTest, GetMaintenanceStatus)
 }
 
 
+// This tests the authorization of requests to DrainAgent.
+TYPED_TEST(AuthorizationTest, DrainAgent)
+{
+  ACLs acls;
+
+  {
+    // "foo" principal can drain agents.
+    mesos::ACL::DrainAgent* acl = acls.add_drain_agents();
+    acl->mutable_principals()->add_values("foo");
+    acl->mutable_agents()->set_type(mesos::ACL::Entity::ANY);
+  }
+
+  {
+    // Nobody else can drain agents.
+    mesos::ACL::DrainAgent* acl = acls.add_drain_agents();
+    acl->mutable_principals()->set_type(mesos::ACL::Entity::ANY);
+    acl->mutable_agents()->set_type(mesos::ACL::Entity::NONE);
+  }
+
+  Try<Authorizer*> create = TypeParam::create(parameterize(acls));
+  ASSERT_SOME(create);
+  Owned<Authorizer> authorizer(create.get());
+
+  {
+    // "foo" is allowed to drain agents.
+    authorization::Request request;
+    request.set_action(authorization::DRAIN_AGENT);
+    request.mutable_subject()->set_value("foo");
+
+    AWAIT_EXPECT_TRUE(authorizer->authorized(request));
+  }
+
+  {
+    // "bar" is not allowed to drain agents.
+    authorization::Request request;
+    request.set_action(authorization::DRAIN_AGENT);
+    request.mutable_subject()->set_value("bar");
+
+    AWAIT_EXPECT_FALSE(authorizer->authorized(request));
+  }
+
+  {
+    // Test that no authorizer is created with invalid ACLs.
+    ACLs invalid;
+
+    mesos::ACL::DrainAgent* acl = invalid.add_drain_agents();
+    acl->mutable_principals()->add_values("foo");
+    acl->mutable_agents()->add_values("yoda");
+
+    Try<Authorizer*> create = TypeParam::create(parameterize(invalid));
+    EXPECT_ERROR(create);
+  }
+}
+
+
+// This tests the authorization of requests to DeactivateAgent.
+TYPED_TEST(AuthorizationTest, DeactivateAgent)
+{
+  ACLs acls;
+
+  {
+    // "foo" principal can deactivate agents.
+    mesos::ACL::DeactivateAgent* acl = acls.add_deactivate_agents();
+    acl->mutable_principals()->add_values("foo");
+    acl->mutable_agents()->set_type(mesos::ACL::Entity::ANY);
+  }
+
+  {
+    // Nobody else can deactivate agents.
+    mesos::ACL::DeactivateAgent* acl = acls.add_deactivate_agents();
+    acl->mutable_principals()->set_type(mesos::ACL::Entity::ANY);
+    acl->mutable_agents()->set_type(mesos::ACL::Entity::NONE);
+  }
+
+  Try<Authorizer*> create = TypeParam::create(parameterize(acls));
+  ASSERT_SOME(create);
+  Owned<Authorizer> authorizer(create.get());
+
+  {
+    // "foo" is allowed to deactivate agents.
+    authorization::Request request;
+    request.set_action(authorization::DEACTIVATE_AGENT);
+    request.mutable_subject()->set_value("foo");
+
+    AWAIT_EXPECT_TRUE(authorizer->authorized(request));
+  }
+
+  {
+    // "bar" is not allowed to deactivate agents.
+    authorization::Request request;
+    request.set_action(authorization::DEACTIVATE_AGENT);
+    request.mutable_subject()->set_value("bar");
+
+    AWAIT_EXPECT_FALSE(authorizer->authorized(request));
+  }
+
+  {
+    // Test that no authorizer is created with invalid ACLs.
+    ACLs invalid;
+
+    mesos::ACL::DeactivateAgent* acl = invalid.add_deactivate_agents();
+    acl->mutable_principals()->add_values("foo");
+    acl->mutable_agents()->add_values("yoda");
+
+    Try<Authorizer*> create = TypeParam::create(parameterize(invalid));
+    EXPECT_ERROR(create);
+  }
+}
+
+
+// This tests the authorization of requests to ReactivateAgent.
+TYPED_TEST(AuthorizationTest, ReactivateAgent)
+{
+  ACLs acls;
+
+  {
+    // "foo" principal can reactivate agents.
+    mesos::ACL::ReactivateAgent* acl = acls.add_reactivate_agents();
+    acl->mutable_principals()->add_values("foo");
+    acl->mutable_agents()->set_type(mesos::ACL::Entity::ANY);
+  }
+
+  {
+    // Nobody else can reactivate agents.
+    mesos::ACL::ReactivateAgent* acl = acls.add_reactivate_agents();
+    acl->mutable_principals()->set_type(mesos::ACL::Entity::ANY);
+    acl->mutable_agents()->set_type(mesos::ACL::Entity::NONE);
+  }
+
+  Try<Authorizer*> create = TypeParam::create(parameterize(acls));
+  ASSERT_SOME(create);
+  Owned<Authorizer> authorizer(create.get());
+
+  {
+    // "foo" is allowed to reactivate agents.
+    authorization::Request request;
+    request.set_action(authorization::REACTIVATE_AGENT);
+    request.mutable_subject()->set_value("foo");
+
+    AWAIT_EXPECT_TRUE(authorizer->authorized(request));
+  }
+
+  {
+    // "bar" is not allowed to reactivate agents.
+    authorization::Request request;
+    request.set_action(authorization::REACTIVATE_AGENT);
+    request.mutable_subject()->set_value("bar");
+
+    AWAIT_EXPECT_FALSE(authorizer->authorized(request));
+  }
+
+  {
+    // Test that no authorizer is created with invalid ACLs.
+    ACLs invalid;
+
+    mesos::ACL::ReactivateAgent* acl = invalid.add_reactivate_agents();
+    acl->mutable_principals()->add_values("foo");
+    acl->mutable_agents()->add_values("yoda");
+
+    Try<Authorizer*> create = TypeParam::create(parameterize(invalid));
+    EXPECT_ERROR(create);
+  }
+}
+
+
 // This tests the authorization of requests to ViewStandaloneContainer.
 TYPED_TEST(AuthorizationTest, ViewStandaloneContainer)
 {
@@ -6016,13 +6377,6 @@ TYPED_TEST(AuthorizationTest, CreateBlockDisk)
     acl->mutable_roles()->set_type(mesos::ACL::Entity::NONE);
   }
 
-  {
-    // No other principals can create block disks.
-    mesos::ACL::CreateBlockDisk* acl = acls.add_create_block_disks();
-    acl->mutable_principals()->set_type(mesos::ACL::Entity::ANY);
-    acl->mutable_roles()->set_type(mesos::ACL::Entity::NONE);
-  }
-
   // Create an `Authorizer` with the ACLs.
   Try<Authorizer*> create = TypeParam::create(parameterize(acls));
   ASSERT_SOME(create);
@@ -6267,13 +6621,6 @@ TYPED_TEST(AuthorizationTest, DestroyBlockDisk)
     mesos::ACL::DestroyBlockDisk* acl = acls.add_destroy_block_disks();
     acl->mutable_principals()->add_values("j-welby");
     acl->mutable_roles()->add_values("king");
-  }
-
-  {
-    // No other principals can destroy block disks.
-    mesos::ACL::DestroyBlockDisk* acl = acls.add_destroy_block_disks();
-    acl->mutable_principals()->set_type(mesos::ACL::Entity::ANY);
-    acl->mutable_roles()->set_type(mesos::ACL::Entity::NONE);
   }
 
   {
@@ -6536,13 +6883,6 @@ TYPED_TEST(AuthorizationTest, CreateMountDisk)
     acl->mutable_roles()->set_type(mesos::ACL::Entity::NONE);
   }
 
-  {
-    // No other principals can create mount disks.
-    mesos::ACL::CreateMountDisk* acl = acls.add_create_mount_disks();
-    acl->mutable_principals()->set_type(mesos::ACL::Entity::ANY);
-    acl->mutable_roles()->set_type(mesos::ACL::Entity::NONE);
-  }
-
   // Create an `Authorizer` with the ACLs.
   Try<Authorizer*> create = TypeParam::create(parameterize(acls));
   ASSERT_SOME(create);
@@ -6796,13 +7136,6 @@ TYPED_TEST(AuthorizationTest, DestroyMountDisk)
     acl->mutable_roles()->set_type(mesos::ACL::Entity::NONE);
   }
 
-  {
-    // No other principals can destroy mount disks.
-    mesos::ACL::DestroyMountDisk* acl = acls.add_destroy_mount_disks();
-    acl->mutable_principals()->set_type(mesos::ACL::Entity::ANY);
-    acl->mutable_roles()->set_type(mesos::ACL::Entity::NONE);
-  }
-
   // Create an `Authorizer` with the ACLs.
   Try<Authorizer*> create = TypeParam::create(parameterize(acls));
   ASSERT_SOME(create);
@@ -6987,6 +7320,259 @@ TYPED_TEST(AuthorizationTest, DestroyMountDisk)
   {
     authorization::Request request;
     request.set_action(authorization::DESTROY_MOUNT_DISK);
+    request.mutable_subject()->set_value("j-welby");
+    request.mutable_object()
+      ->mutable_resource()
+      ->mutable_reservations()
+      ->Add()
+      ->set_role("king/prince/duke");
+    AWAIT_EXPECT_FALSE(authorizer->authorized(request));
+  }
+}
+
+
+// This tests the authorization to destroy raw disks.
+TYPED_TEST(AuthorizationTest, DestroyRawDisk)
+{
+  ACLs acls;
+
+  {
+    // Principal "foo" can destroy raw disks for any role.
+    mesos::ACL::DestroyRawDisk* acl = acls.add_destroy_raw_disks();
+    acl->mutable_principals()->add_values("foo");
+    acl->mutable_roles()->set_type(mesos::ACL::Entity::ANY);
+  }
+
+  {
+    // Principal "bar" can only destroy raw disks for the "panda" role.
+    mesos::ACL::DestroyRawDisk* acl = acls.add_destroy_raw_disks();
+    acl->mutable_principals()->add_values("bar");
+    acl->mutable_roles()->add_values("panda");
+  }
+
+  {
+    // Principal "baz" cannot destroy raw disks.
+    mesos::ACL::DestroyRawDisk* acl = acls.add_destroy_raw_disks();
+    acl->mutable_principals()->add_values("baz");
+    acl->mutable_roles()->set_type(mesos::ACL::Entity::NONE);
+  }
+
+  {
+    // Principal "elizabeth-ii" can destroy raw disks for the "king" role
+    // and its nested ones.
+    mesos::ACL::DestroyRawDisk* acl = acls.add_destroy_raw_disks();
+    acl->mutable_principals()->add_values("elizabeth-ii");
+    acl->mutable_roles()->add_values("king/%");
+    acl->mutable_roles()->add_values("king");
+  }
+
+  {
+    // Principal "charles" can destroy raw disks for any role below the
+    // "king/" role. Not in "king" itself.
+    mesos::ACL::DestroyRawDisk* acl = acls.add_destroy_raw_disks();
+    acl->mutable_principals()->add_values("charles");
+    acl->mutable_roles()->add_values("king/%");
+  }
+
+  {
+    // Principal "j-welby" can destroy raw disks only for the "king"
+    // role but not in any nested one.
+    mesos::ACL::DestroyRawDisk* acl = acls.add_destroy_raw_disks();
+    acl->mutable_principals()->add_values("j-welby");
+    acl->mutable_roles()->add_values("king");
+  }
+
+  {
+    // No other principals can destroy raw disks.
+    mesos::ACL::DestroyRawDisk* acl = acls.add_destroy_raw_disks();
+    acl->mutable_principals()->set_type(mesos::ACL::Entity::ANY);
+    acl->mutable_roles()->set_type(mesos::ACL::Entity::NONE);
+  }
+
+  // Create an `Authorizer` with the ACLs.
+  Try<Authorizer*> create = TypeParam::create(parameterize(acls));
+  ASSERT_SOME(create);
+  Owned<Authorizer> authorizer(create.get());
+
+  // Principal "foo" can destroy raw disks for any role, so this
+  // request will pass.
+  {
+    authorization::Request request;
+    request.set_action(authorization::DESTROY_RAW_DISK);
+    request.mutable_subject()->set_value("foo");
+    request.mutable_object()
+      ->mutable_resource()
+      ->mutable_reservations()
+      ->Add()
+      ->set_role("awesome_role");
+    AWAIT_EXPECT_TRUE(authorizer->authorized(request));
+  }
+
+  // Principal "bar" can destroy raw disks for the "panda" role,
+  // so this request will pass.
+  {
+    authorization::Request request;
+    request.set_action(authorization::DESTROY_RAW_DISK);
+    request.mutable_subject()->set_value("bar");
+    request.mutable_object()
+      ->mutable_resource()
+      ->mutable_reservations()
+      ->Add()
+      ->set_role("panda");
+    AWAIT_EXPECT_TRUE(authorizer->authorized(request));
+  }
+
+  // Principal "bar" cannot destroy raw disks for the "giraffe" role,
+  // so this request will fail.
+  {
+    authorization::Request request;
+    request.set_action(authorization::DESTROY_RAW_DISK);
+    request.mutable_subject()->set_value("bar");
+    request.mutable_object()
+      ->mutable_resource()
+      ->mutable_reservations()
+      ->Add()
+      ->set_role("giraffe");
+    AWAIT_EXPECT_FALSE(authorizer->authorized(request));
+  }
+
+  // Principal "baz" cannot destroy raw disks for any role,
+  // so this request will fail.
+  {
+    authorization::Request request;
+    request.set_action(authorization::DESTROY_RAW_DISK);
+    request.mutable_subject()->set_value("baz");
+    request.mutable_object()
+      ->mutable_resource()
+      ->mutable_reservations()
+      ->Add()
+      ->set_role("panda");
+    AWAIT_EXPECT_FALSE(authorizer->authorized(request));
+  }
+
+  // Principal "zelda" is not mentioned in the ACLs of the Authorizer, so it
+  // will be caught by the final ACL, which provides a default case that denies
+  // access for all other principals. This request will fail.
+  {
+    authorization::Request request;
+    request.set_action(authorization::DESTROY_RAW_DISK);
+    request.mutable_subject()->set_value("zelda");
+    request.mutable_object()
+      ->mutable_resource()
+      ->mutable_reservations()
+      ->Add()
+      ->set_role("panda");
+    AWAIT_EXPECT_FALSE(authorizer->authorized(request));
+  }
+
+  // `elizabeth-ii` has full permissions for the `king` role as well as all
+  // its nested roles. She should be able to destroy raw disks in the next
+  // three blocks.
+  {
+    authorization::Request request;
+    request.set_action(authorization::DESTROY_RAW_DISK);
+    request.mutable_subject()->set_value("elizabeth-ii");
+    request.mutable_object()
+      ->mutable_resource()
+      ->mutable_reservations()
+      ->Add()
+      ->set_role("king");
+    AWAIT_EXPECT_TRUE(authorizer->authorized(request));
+  }
+
+  {
+    authorization::Request request;
+    request.set_action(authorization::DESTROY_RAW_DISK);
+    request.mutable_subject()->set_value("elizabeth-ii");
+    request.mutable_object()
+      ->mutable_resource()
+      ->mutable_reservations()
+      ->Add()
+      ->set_role("king/prince");
+    AWAIT_EXPECT_TRUE(authorizer->authorized(request));
+  }
+
+  {
+    authorization::Request request;
+    request.set_action(authorization::DESTROY_RAW_DISK);
+    request.mutable_subject()->set_value("elizabeth-ii");
+    request.mutable_object()
+      ->mutable_resource()
+      ->mutable_reservations()
+      ->Add()
+      ->set_role("king/prince/duke");
+    AWAIT_EXPECT_TRUE(authorizer->authorized(request));
+  }
+
+  // `charles` doesn't have permissions for the `king` role, so the first
+  // test should fail. However he has permissions for `king`'s nested roles
+  // so the next two tests should succeed.
+  {
+    authorization::Request request;
+    request.set_action(authorization::DESTROY_RAW_DISK);
+    request.mutable_subject()->set_value("charles");
+    request.mutable_object()
+      ->mutable_resource()
+      ->mutable_reservations()
+      ->Add()
+      ->set_role("king");
+    AWAIT_EXPECT_FALSE(authorizer->authorized(request));
+  }
+
+  {
+    authorization::Request request;
+    request.set_action(authorization::DESTROY_RAW_DISK);
+    request.mutable_subject()->set_value("charles");
+    request.mutable_object()
+      ->mutable_resource()
+      ->mutable_reservations()
+      ->Add()
+      ->set_role("king/prince");
+    AWAIT_EXPECT_TRUE(authorizer->authorized(request));
+  }
+
+  {
+    authorization::Request request;
+    request.set_action(authorization::DESTROY_RAW_DISK);
+    request.mutable_subject()->set_value("charles");
+    request.mutable_object()
+      ->mutable_resource()
+      ->mutable_reservations()
+      ->Add()
+      ->set_role("king/prince/duke");
+    AWAIT_EXPECT_TRUE(authorizer->authorized(request));
+  }
+
+  // `j-welby` only has permissions for the role `king` itself, but not
+  // for its nested roles, therefore only the first of the following three
+  // tests should succeed.
+  {
+    authorization::Request request;
+    request.set_action(authorization::DESTROY_RAW_DISK);
+    request.mutable_subject()->set_value("j-welby");
+    request.mutable_object()
+      ->mutable_resource()
+      ->mutable_reservations()
+      ->Add()
+      ->set_role("king");
+    AWAIT_EXPECT_TRUE(authorizer->authorized(request));
+  }
+
+  {
+    authorization::Request request;
+    request.set_action(authorization::DESTROY_RAW_DISK);
+    request.mutable_subject()->set_value("j-welby");
+    request.mutable_object()
+      ->mutable_resource()
+      ->mutable_reservations()
+      ->Add()
+      ->set_role("king/prince");
+    AWAIT_EXPECT_FALSE(authorizer->authorized(request));
+  }
+
+  {
+    authorization::Request request;
+    request.set_action(authorization::DESTROY_RAW_DISK);
     request.mutable_subject()->set_value("j-welby");
     request.mutable_object()
       ->mutable_resource()

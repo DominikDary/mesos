@@ -76,6 +76,7 @@ namespace paths {
 //   |   |   |-- latest (symlink)
 //   |   |   |-- <slave_id>
 //   |   |       |-- slave.info
+//   |   |       |-- drain.config
 //   |   |       |-- operations
 //   |   |       |   |-- <operation_uuid>
 //   |   |       |       |-- operation.updates
@@ -236,6 +237,13 @@ std::string getExecutorRunPath(
     const FrameworkID& frameworkId,
     const ExecutorID& executorId,
     const ContainerID& containerId);
+
+
+std::string getExecutorGeneratedForCommandTaskPath(
+  const std::string& rootDir,
+  const SlaveID& slaveId,
+  const FrameworkID& frameworkId,
+  const ExecutorID& executorId);
 
 
 std::string getExecutorHttpMarkerPath(
@@ -414,12 +422,21 @@ std::string getResourceStatePath(
     const std::string& rootDir);
 
 
+std::string getResourceStateTargetPath(
+    const std::string& rootDir);
+
+
 std::string getResourcesInfoPath(
     const std::string& rootDir);
 
 
 std::string getResourcesTargetPath(
     const std::string& rootDir);
+
+
+std::string getDrainConfigPath(
+    const std::string& metaDir,
+    const SlaveID& slaveId);
 
 
 Try<std::list<std::string>> getPersistentVolumePaths(

@@ -71,6 +71,12 @@
 #include "authorizer/local/authorizer.hpp"
 
 #include "common/authorization.hpp"
+
+#ifndef __WINDOWS__
+#include "common/domain_sockets.hpp"
+#endif // __WINDOWS__
+
+#include "common/future_tracker.hpp"
 #include "common/http.hpp"
 
 #include "files/files.hpp"
@@ -117,6 +123,10 @@ using mesos::master::detector::StandaloneMasterDetector;
 using mesos::master::detector::ZooKeeperMasterDetector;
 
 using mesos::slave::ContainerTermination;
+
+#ifndef __WINDOWS__
+using process::network::unix::Socket;
+#endif // __WINDOWS__
 
 namespace mesos {
 namespace internal {
@@ -415,6 +425,7 @@ Try<process::Owned<Slave>> Slave::create(
     const Option<mesos::slave::QoSController*>& qosController,
     const Option<mesos::SecretGenerator*>& secretGenerator,
     const Option<Authorizer*>& providedAuthorizer,
+    const Option<PendingFutureTracker*>& futureTracker,
     bool mock)
 {
   process::Owned<Slave> slave(new Slave());
@@ -446,6 +457,17 @@ Try<process::Owned<Slave>> Slave::create(
   }
 #endif // __WINDOWS__
 
+  // If the future tracker is not provided, create a default one.
+  if (futureTracker.isNone()) {
+    Try<PendingFutureTracker*> _futureTracker = PendingFutureTracker::create();
+    if (_futureTracker.isError()) {
+      return Error(
+          "Failed to create pending future tracker: " + _futureTracker.error());
+    }
+
+    slave->futureTracker.reset(_futureTracker.get());
+  }
+
   // If the containerizer is not provided, create a default one.
   if (containerizer.isSome()) {
     slave->containerizer = containerizer.get();
@@ -460,7 +482,8 @@ Try<process::Owned<Slave>> Slave::create(
           slave->fetcher.get(),
           gc.getOrElse(slave->gc.get()),
           nullptr,
-          volumeGidManager);
+          volumeGidManager,
+          futureTracker.getOrElse(slave->futureTracker.get()));
 
     if (_containerizer.isError()) {
       return Error("Failed to create containerizer: " + _containerizer.error());
@@ -593,6 +616,26 @@ Try<process::Owned<Slave>> Slave::create(
     slave->secretGenerator.reset(_secretGenerator);
   }
 
+#ifndef __WINDOWS__
+  Option<Socket> executorSocket = None();
+  if (flags.http_executor_domain_sockets) {
+    // If `http_executor_domain_sockets` is true, then the location should have
+    // been set by the user or automatically during startup.
+    CHECK_SOME(flags.domain_socket_location);
+
+    LOG(INFO) << "Creating domain socket at " << *flags.domain_socket_location;
+    Try<Socket> socket =
+      common::createDomainSocket(*flags.domain_socket_location);
+
+    if (socket.isError()) {
+      EXIT(EXIT_FAILURE)
+        << "Failed to create domain socket: " << socket.error();
+    }
+
+    executorSocket = socket.get();
+  }
+#endif // __WINDOWS__
+
   // If the task status update manager is not provided, create a default one.
   if (taskStatusUpdateManager.isNone()) {
     slave->taskStatusUpdateManager.reset(
@@ -613,6 +656,7 @@ Try<process::Owned<Slave>> Slave::create(
         qosController.getOrElse(slave->qosController.get()),
         secretGenerator.getOrElse(slave->secretGenerator.get()),
         volumeGidManager,
+        futureTracker.getOrElse(slave->futureTracker.get()),
         authorizer));
   } else {
     slave->slave.reset(new slave::Slave(
@@ -627,6 +671,10 @@ Try<process::Owned<Slave>> Slave::create(
         qosController.getOrElse(slave->qosController.get()),
         secretGenerator.getOrElse(slave->secretGenerator.get()),
         volumeGidManager,
+        futureTracker.getOrElse(slave->futureTracker.get()),
+#ifndef __WINDOWS__
+        executorSocket,
+#endif // __WINDOWS__
         authorizer));
   }
 

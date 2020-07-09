@@ -23,10 +23,12 @@
 
 #include <mesos/slave/isolator.hpp>
 
-#include <process/id.hpp>
+#include <process/clock.hpp>
 #include <process/http.hpp>
+#include <process/id.hpp>
 #include <process/sequence.hpp>
 #include <process/shared.hpp>
+#include <process/time.hpp>
 
 #include <process/metrics/counter.hpp>
 
@@ -72,7 +74,8 @@ public:
       GarbageCollector* gc = nullptr,
       SecretResolver* secretResolver = nullptr,
       const Option<NvidiaComponents>& nvidia = None(),
-      VolumeGidManager* volumeGidManager = nullptr);
+      VolumeGidManager* volumeGidManager = nullptr,
+      PendingFutureTracker* futureTracker = nullptr);
 
   static Try<MesosContainerizer*> create(
       const Flags& flags,
@@ -100,7 +103,9 @@ public:
 
   process::Future<Nothing> update(
       const ContainerID& containerId,
-      const Resources& resources) override;
+      const Resources& resourceRequests,
+      const google::protobuf::Map<
+          std::string, Value::Scalar>& resourceLimits = {}) override;
 
   process::Future<ResourceStatistics> usage(
       const ContainerID& containerId) override;
@@ -194,7 +199,9 @@ public:
 
   virtual process::Future<Nothing> update(
       const ContainerID& containerId,
-      const Resources& resources);
+      const Resources& resourceRequests,
+      const google::protobuf::Map<
+          std::string, Value::Scalar>& resourceLimits = {});
 
   virtual process::Future<ResourceStatistics> usage(
       const ContainerID& containerId);
@@ -227,6 +234,7 @@ public:
 private:
   enum State
   {
+    STARTING,
     PROVISIONING,
     PREPARING,
     ISOLATING,
@@ -349,7 +357,10 @@ private:
 
   struct Container
   {
-    Container() : sequence("mesos-container-status-updates") {}
+    Container()
+      : state(STARTING),
+        lastStateTransition(process::Clock::now()),
+        sequence("mesos-container-status-updates") {}
 
     // Promise for futures returned from wait().
     process::Promise<mesos::slave::ContainerTermination> termination;
@@ -379,8 +390,8 @@ private:
     Option<process::Future<Option<int>>> status;
 
     // We keep track of the future for 'provisioner->provision' so
-    // that destroy will only start calling 'provisioner->destroy'
-    // after 'provisioner->provision' has finished.
+    // that we can discard the provisioning for the container which
+    // is destroyed when it is being provisioned.
     process::Future<ProvisionInfo> provisioning;
 
     // We keep track of the future that is waiting for all the
@@ -394,9 +405,10 @@ private:
     // calling cleanup after all isolators have finished isolating.
     process::Future<std::vector<Nothing>> isolation;
 
-    // We keep track of the resources for each container so we can set
-    // the ResourceStatistics limits in usage().
-    Resources resources;
+    // We keep track of the resource requests and limits for each container so
+    // we can set the ResourceStatistics limits in usage().
+    Resources resourceRequests;
+    google::protobuf::Map<std::string, Value::Scalar> resourceLimits;
 
     // The configuration for the container to be launched.
     // This can only be None if the underlying container is launched
@@ -421,6 +433,7 @@ private:
     Option<mesos::slave::ContainerLaunchInfo> launchInfo;
 
     State state;
+    process::Time lastStateTransition;
 
     // Used when `status` needs to be collected from isolators
     // associated with this container. `Sequence` allows us to

@@ -25,6 +25,10 @@
 
 #include <mesos/type_utils.hpp>
 
+#ifndef __WINDOWS__
+#include "common/domain_sockets.hpp"
+#endif // __WINDOWS__
+
 #include "common/http.hpp"
 #include "common/parse.hpp"
 #include "common/protobuf_utils.hpp"
@@ -74,8 +78,8 @@ mesos::internal::slave::Flags::Flags()
       "\n"
       "To use JSON, pass a JSON-formatted string or use\n"
       "`--resources=filepath` to specify the resources via a file containing\n"
-      "a JSON-formatted string. `filepath` can be of the form\n"
-      "`file:///path/to/file` or `/path/to/file`.\n"
+      "a JSON-formatted string. `filepath` can only be of the form\n"
+      "`file:///path/to/file`.\n"
       "\n"
       "Example JSON:\n"
       "[\n"
@@ -223,6 +227,21 @@ mesos::internal::slave::Flags::Flags()
       "The root directory where we checkpoint the information about docker\n"
       "volumes that each container uses.",
       "/var/run/mesos/isolators/docker/volume");
+
+  add(&Flags::docker_volume_chown,
+      "docker_volume_chown",
+      "Whether to chown the docker volume's mount point non-recursively\n"
+      "to the container user. Please notice that this flag is not recommended\n"
+      "to turn on if there is any docker volume shared by multiple non-root\n"
+      "users. By default, this flag is off.\n",
+      false);
+
+  add(&Flags::docker_ignore_runtime,
+      "docker_ignore_runtime",
+      "Ignore any runtime configuration specified in the Docker image. The\n"
+      "Mesos containerizer will not propagate Docker runtime specifications\n"
+      "such as `WORKDIR`, `ENV` and `CMD` to the container.\n",
+      false);
 
   add(&Flags::default_role,
       "default_role",
@@ -756,6 +775,28 @@ mesos::internal::slave::Flags::Flags()
       "This flag has the same syntax as `--effective_capabilities`."
      );
 
+  add(&Flags::default_container_shm_size,
+      "default_container_shm_size",
+      "The default size of the /dev/shm for the container which has its own\n"
+      "/dev/shm but does not specify the `shm_size` field in its `LinuxInfo`.\n"
+      "The format is [number][unit], number must be a positive integer and\n"
+      "unit can be B (bytes), KB (kilobytes), MB (megabytes), GB (gigabytes)\n"
+      "or TB (terabytes). Note that this flag is only relevant for the Mesos\n"
+      "Containerizer and it will be ignored if the `namespaces/ipc` isolator\n"
+      "is not enabled."
+      );
+
+  add(&Flags::disallow_sharing_agent_ipc_namespace,
+      "disallow_sharing_agent_ipc_namespace",
+      "If set to `true`, each top-level container will have its own IPC\n"
+      "namespace and /dev/shm, and if the framework requests to share the\n"
+      "agent IPC namespace and /dev/shm for the top level container, the\n"
+      "container launch will be rejected. If set to `false`, the top-level\n"
+      "containers will share the IPC namespace and /dev/shm with agent if\n"
+      "the framework requests it. This flag will be ignored if the\n"
+      "`namespaces/ipc` isolator is not enabled.\n",
+      false);
+
   add(&Flags::disallow_sharing_agent_pid_namespace,
       "disallow_sharing_agent_pid_namespace",
       "If set to `true`, each top-level container will have its own pid\n"
@@ -770,8 +811,9 @@ mesos::internal::slave::Flags::Flags()
   add(&Flags::agent_features,
       "agent_features",
       "JSON representation of agent features to whitelist. We always require\n"
-      "'MULTI_ROLE', 'HIERARCHICAL_ROLE', 'RESERVATION_REFINEMENT', and\n"
-      "'AGENT_OPERATION_FEEDBACK'.\n"
+      "'MULTI_ROLE', 'HIERARCHICAL_ROLE', 'RESERVATION_REFINEMENT',\n"
+      "'AGENT_OPERATION_FEEDBACK', 'RESOURCE_PROVIDER', 'AGENT_DRAINING', and\n"
+      "'TASK_RESOURCE_LIMITS'.\n"
       "\n"
       "Example:\n"
       "{\n"
@@ -779,7 +821,10 @@ mesos::internal::slave::Flags::Flags()
       "        {\"type\": \"MULTI_ROLE\"},\n"
       "        {\"type\": \"HIERARCHICAL_ROLE\"},\n"
       "        {\"type\": \"RESERVATION_REFINEMENT\"},\n"
-      "        {\"type\": \"AGENT_OPERATION_FEEDBACK\"}\n"
+      "        {\"type\": \"AGENT_OPERATION_FEEDBACK\"},\n"
+      "        {\"type\": \"RESOURCE_PROVIDER\"},\n"
+      "        {\"type\": \"AGENT_DRAINING\"},\n"
+      "        {\"type\": \"TASK_RESOURCE_LIMITS\"}\n"
       "    ]\n"
       "}\n",
       [](const Option<SlaveCapabilities>& agentFeatures) -> Option<Error> {
@@ -791,23 +836,15 @@ mesos::internal::slave::Flags::Flags()
           if (!capabilities.multiRole ||
               !capabilities.hierarchicalRole ||
               !capabilities.reservationRefinement ||
-              !capabilities.agentOperationFeedback) {
+              !capabilities.agentOperationFeedback ||
+              !capabilities.resourceProvider ||
+              !capabilities.agentDraining ||
+              !capabilities.taskResourceLimits) {
             return Error(
                 "At least the following agent features need to be enabled:"
                 " MULTI_ROLE, HIERARCHICAL_ROLE, RESERVATION_REFINEMENT,"
-                " AGENT_OPERATION_FEEDBACK");
-          }
-
-          if (capabilities.resizeVolume && !capabilities.resourceProvider) {
-            return Error(
-                "RESIZE_VOLUME feature requires RESOURCE_PROVIDER feature");
-          }
-
-          if (capabilities.agentOperationFeedback &&
-              !capabilities.resourceProvider) {
-            return Error(
-                "AGENT_OPERATION_FEEDBACK feature"
-                " requires RESOURCE_PROVIDER feature");
+                " AGENT_OPERATION_FEEDBACK, RESOURCE_PROVIDER, AGENT_DRAINING,"
+                " and TASK_RESOURCE_LIMITS");
           }
         }
 
@@ -944,6 +981,27 @@ mesos::internal::slave::Flags::Flags()
       "C:\\mesos\\sandbox"
 #endif // __WINDOWS__
       );
+
+#ifndef __WINDOWS__
+  add(&Flags::domain_socket_location,
+      "domain_socket_location",
+      "Location on the host filesystem of the domain socket used for\n"
+      "communication with executors.\n Alternatively, this can be set to"
+      "'systemd:<identifier>' to use the domain socket with the given\n"
+      "identifier, which is expected to be passed by systemd.\n"
+      "This flag will be ignored unless the '--http_executor_domain_sockets'\n"
+      "flag is also set to true. Total path length must be less than 108\n"
+      "characters.\n Will be set to <runtime_dir>/agent.sock by default.",
+      [](const Option<string>& location) -> Option<Error> {
+        if (location.isSome() &&
+            location->size() >= common::DOMAIN_SOCKET_MAX_PATH_LENGTH) {
+          return Error(
+              "Domain socket location cannot be longer than 108 characters.");
+        }
+
+        return None();
+      });
+#endif // __WINDOWS__
 
   add(&Flags::default_container_dns,
       "default_container_dns",
@@ -1341,6 +1399,15 @@ mesos::internal::slave::Flags::Flags()
       "flag is only available when Mesos is built with SSL support.",
       false);
 #endif // USE_SSL_SOCKET
+
+#ifndef __WINDOWS__
+  add(&Flags::http_executor_domain_sockets,
+      "http_executor_domain_sockets",
+      "If true, the agent will provide a unix domain sockets that the\n"
+      "executor can use to connect to the agent, instead of relying on\n"
+      "a TCP connection.",
+      false);
+#endif // __WINDOWS__
 
   add(&Flags::http_credentials,
       "http_credentials",

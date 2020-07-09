@@ -87,13 +87,15 @@ This package provides files for developing Mesos frameworks/modules.
 %setup -q
 
 %build
+%{!?el6:%define launcher_sealing --enable-launcher-sealing}
+
 %configure \
     --enable-optimize \
     --disable-python-dependency-install \
     --enable-install-module-dependencies \
+    %{launcher_sealing} \
     --enable-libevent \
     --enable-ssl \
-    --enable-grpc \
     --enable-hardening \
     --enable-xfs-disk-isolator=%{_with_xfs}
 
@@ -160,6 +162,7 @@ install -m 0644 src/java/target/mesos-*.jar %{buildroot}%{_datadir}/java/
 ######################
 %files devel
 %doc LICENSE NOTICE
+%{_includedir}/csi/
 %{_includedir}/elfio/
 %{_includedir}/mesos/
 %{_includedir}/stout/

@@ -200,7 +200,7 @@ Result<string> Fetcher::uriToLocalPath(
   string path =
     strings::remove(path::from_uri(uri), "localhost", strings::PREFIX);
 
-  if (!path::absolute(path)) {
+  if (!path::is_absolute(path)) {
     if (fileUri) {
       return Error("File URI only supports absolute paths");
     }
@@ -945,7 +945,7 @@ void FetcherProcess::kill(const ContainerID& containerId)
   if (subprocessPids.contains(containerId)) {
     VLOG(1) << "Killing the fetcher for container '" << containerId << "'";
     // Best effort kill the entire fetcher tree.
-    os::killtree(subprocessPids.get(containerId).get(), SIGKILL);
+    os::killtree(subprocessPids.at(containerId), SIGKILL);
 
     subprocessPids.erase(containerId);
   }
@@ -1057,7 +1057,7 @@ bool FetcherProcess::Cache::contains(
     const string& uri) const
 {
   const string key = cacheKey(user, uri);
-  return table.get(key).isSome();
+  return table.contains(key);
 }
 
 

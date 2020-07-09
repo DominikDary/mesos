@@ -19,6 +19,8 @@
 #include <string>
 
 #include <mesos/mesos.hpp>
+#include <mesos/quota/quota.hpp>
+#include <mesos/resource_quantities.hpp>
 #include <mesos/resources.hpp>
 #include <mesos/roles.hpp>
 #include <mesos/values.hpp>
@@ -27,9 +29,11 @@
 #include <stout/option.hpp>
 #include <stout/set.hpp>
 
-#include "common/resource_quantities.hpp"
+#include "common/protobuf_utils.hpp"
 #include "common/resources_utils.hpp"
 #include "common/validation.hpp"
+
+#include "master/constants.hpp"
 
 using google::protobuf::Map;
 using google::protobuf::RepeatedPtrField;
@@ -45,49 +49,93 @@ namespace internal {
 namespace master {
 namespace quota {
 
-UpdateQuota::UpdateQuota(const QuotaInfo& quotaInfo)
-  : info(quotaInfo) {}
+UpdateQuota::UpdateQuota(
+    const google::protobuf::RepeatedPtrField<QuotaConfig>& quotaConfigs)
+  : configs(quotaConfigs) {}
 
 
 Try<bool> UpdateQuota::perform(
-    Registry* registry,
-    hashset<SlaveID>* /*slaveIDs*/)
+    Registry* registry, hashset<SlaveID>* /*slaveIDs*/)
 {
-  // If there is already quota stored for the role, update the entry.
-  foreach (Registry::Quota& quota, *registry->mutable_quotas()) {
-    if (quota.info().role() == info.role()) {
-      quota.mutable_info()->CopyFrom(info);
-      return true; // Mutation.
+  // Sanity check that we're not writing any invalid configs.
+  foreach (const QuotaConfig& config, configs) {
+    Option<Error> error = validate(config);
+
+    if (error.isSome()) {
+      // We also log it since this error won't currently surface
+      // in logging or to the end client that is attempting the
+      // update.
+      LOG(ERROR) << "Invalid quota config"
+                 << " '" << jsonify(JSON::Protobuf(config)) << "'"
+                 << ": " + error->message;
+
+      return Error("Invalid quota config"
+                   " '" + string(jsonify(JSON::Protobuf(config))) + "'"
+                   ": " + error->message);
     }
   }
 
-  // If there is no quota yet for the role, create a new entry.
-  registry->add_quotas()->mutable_info()->CopyFrom(info);
+  google::protobuf::RepeatedPtrField<QuotaConfig>& registryConfigs =
+    *registry->mutable_quota_configs();
 
-  return true; // Mutation.
-}
+  foreach (const QuotaConfig& config, configs) {
+    // Check if there is already quota stored for the role.
+    int configIndex = std::find_if(
+        registryConfigs.begin(),
+        registryConfigs.end(),
+        [&](const QuotaConfig& registryConfig) {
+          return registryConfig.role() == config.role();
+        }) -
+        registryConfigs.begin();
 
+    if (Quota(config) == DEFAULT_QUOTA) {
+      // Erase if present, otherwise no-op.
+      if (configIndex < registryConfigs.size()) {
+        registryConfigs.DeleteSubrange(configIndex, 1);
+      }
+    } else {
+      // Modify if present, otherwise insert.
+      if (configIndex < registryConfigs.size()) {
+        // TODO(mzhu): Check if we are setting quota to the same value.
+        // If so, no need to mutate.
+        *registryConfigs.Mutable(configIndex) = config;
+      } else {
+        *registryConfigs.Add() = config;
+      }
+    }
 
-RemoveQuota::RemoveQuota(const string& _role) : role(_role) {}
+    // Remove the old `QuotaInfo` entries if any.
 
+    google::protobuf::RepeatedPtrField<Registry::Quota>& quotas =
+      *registry->mutable_quotas();
 
-Try<bool> RemoveQuota::perform(
-    Registry* registry,
-    hashset<SlaveID>* /*slaveIDs*/)
-{
-  // Remove quota for the role if a corresponding entry exists.
-  for (int i = 0; i < registry->quotas().size(); ++i) {
-    const Registry::Quota& quota = registry->quotas(i);
+    int quotaIndex = std::find_if(
+        quotas.begin(),
+        quotas.end(),
+        [&](const Registry::Quota& quota) {
+        return quota.info().role() == config.role();
+        }) -
+        quotas.begin();
 
-    if (quota.info().role() == role) {
-      registry->mutable_quotas()->DeleteSubrange(i, 1);
-
-      // NOTE: Multiple entries per role are not allowed.
-      return true; // Mutation.
+    if (quotaIndex < quotas.size()) {
+      quotas.DeleteSubrange(quotaIndex, 1);
     }
   }
 
-  return false;
+  // Update the minimum capability.
+  if (!registryConfigs.empty()) {
+    protobuf::master::addMinimumCapability(
+        registry->mutable_minimum_capabilities(),
+        MasterInfo::Capability::QUOTA_V2);
+  } else {
+    protobuf::master::removeMinimumCapability(
+        registry->mutable_minimum_capabilities(),
+        MasterInfo::Capability::QUOTA_V2);
+  }
+
+  // We always return true here since there is currently
+  // no optimization for no mutation case.
+  return true;
 }
 
 
@@ -126,12 +174,6 @@ Option<Error> quotaInfo(const QuotaInfo& quotaInfo)
   Option<Error> roleError = roles::validate(quotaInfo.role());
   if (roleError.isSome()) {
     return Error("QuotaInfo with invalid role: " + roleError->message);
-  }
-
-  // Disallow quota for '*' role.
-  // TODO(alexr): Consider allowing setting quota for '*' role, see MESOS-3938.
-  if (quotaInfo.role() == "*") {
-    return Error("QuotaInfo must not specify the default '*' role");
   }
 
   // Check that `QuotaInfo` contains at least one guarantee.
@@ -190,11 +232,61 @@ Option<Error> validate(const QuotaConfig& config)
     return Error("Invalid 'QuotaConfig.role': " + error->message);
   }
 
-  // Disallow quota for '*' role.
-  if (config.role() == "*") {
-    return Error(
-      "Invalid 'QuotaConfig.role': setting quota for the"
-      " default '*' role is not supported");
+  // Before we validate the scalars, we need to check for
+  // our maximum supported quota values. Otherwise, they
+  // will surface as a generic overflow error in the scalar
+  // validation below.
+  //
+  // The underlying fixed precision logic used for
+  // Value::Scalar overflows between:
+  //
+  //   9,223,372,036,854,774 and (ditto) + 1.0
+  //
+  //   double d = 9223372036854774;
+  //   d += 1.0;
+  //   Value::scalar s, zero;
+  //   s.set_value(d);
+  //   s < zero == true; // overflow!
+  //
+  // This works out to ~9 zettabytes (given we use megabytes
+  // as the base unit), we set a limit of 1 exabyte, and we
+  // can increase this later if needed.
+  //
+  // We also impose a limit on cpu, ports and other types of
+  // 1 trillion.
+
+  const int64_t exabyteInMegabytes = 1024ll * 1024ll * 1024ll * 1024ll;
+  const int64_t otherLimit = 1000ll * 1000ll * 1000ll * 1000ll;
+
+  auto validateTooLarge = [&](
+      const Map<string, Value::Scalar>& m) -> Option<Error> {
+    foreach (auto&& pair, m) {
+      if (pair.first == "mem" || pair.first == "disk") {
+        if (pair.second.value() > exabyteInMegabytes) {
+          return Error(
+              "{'" + pair.first + "': " + stringify(pair.second) + "}"
+              " is invalid: values greater than 1 exabyte"
+              " (" + stringify(exabyteInMegabytes) + ") are not supported");
+        }
+      } else if (pair.second.value() > otherLimit) {
+        return Error(
+            "{'" + pair.first + "': " + stringify(pair.second) + "}"
+            " is invalid: values greater than 1 trillion"
+            " (" + stringify(otherLimit) + ") are not supported");
+      }
+    }
+
+    return None();
+  };
+
+  error = validateTooLarge(config.guarantees());
+  if (error.isSome()) {
+    return Error("Invalid 'QuotaConfig.guarantees': " + error->message);
+  }
+
+  error = validateTooLarge(config.limits());
+  if (error.isSome()) {
+    return Error("Invalid 'QuotaConfig.limits': " + error->message);
   }
 
   // Validate scalar values.
@@ -237,4 +329,53 @@ Option<Error> validate(const QuotaConfig& config)
 } // namespace quota {
 } // namespace master {
 } // namespace internal {
+
+Quota::Quota(const QuotaConfig& config)
+{
+  guarantees = ResourceQuantities(config.guarantees());
+  limits = ResourceLimits(config.limits());
+}
+
+
+Quota::Quota(const QuotaInfo& info)
+{
+  guarantees = ResourceQuantities::fromScalarResources(info.guarantee());
+
+  // For legacy `QuotaInfo`, guarantee also acts as limit.
+  limits = [&info]() {
+    google::protobuf::Map<string, Value::Scalar> limits;
+    foreach (const Resource& r, info.guarantee()) {
+      limits[r.name()] = r.scalar();
+    }
+    return ResourceLimits(limits);
+  }();
+}
+
+
+Quota::Quota(const QuotaRequest& request)
+{
+  guarantees = ResourceQuantities::fromScalarResources(request.guarantee());
+
+  // For legacy `QuotaInfo`, guarantee also acts as limit.
+  limits = [&request]() {
+    google::protobuf::Map<string, Value::Scalar> limits;
+    foreach (const Resource& r, request.guarantee()) {
+      limits[r.name()] = r.scalar();
+    }
+    return ResourceLimits(limits);
+  }();
+}
+
+
+bool Quota::operator==(const Quota& that) const
+{
+  return guarantees == that.guarantees && limits == that.limits;
+}
+
+
+bool Quota::operator!=(const Quota& that) const
+{
+  return guarantees != that.guarantees || limits != that.limits;
+}
+
 } // namespace mesos {

@@ -163,12 +163,25 @@ public:
               ContentType::PROTOBUF, executor, fullEnvironment));
     }
 
+    // Checkpoint the forked pid if requested by the agent.
+    if (pidCheckpointPath.isSome()) {
+      Try<Nothing> checkpointed = slave::state::checkpoint(
+          pidCheckpointPath.get(), stringify(::getpid()));
+
+      if (checkpointed.isError()) {
+        LOG(ERROR) << "Failed to checkpoint container's forked pid to '"
+                   << pidCheckpointPath.get() << "': " << checkpointed.error();
+        return Failure("Could not checkpoint container's pid");
+      }
+    }
+
     return slave::Containerizer::LaunchResult::SUCCESS;
   }
 
   Future<Nothing> update(
       const ContainerID& containerId,
-      const Resources& resources)
+      const Resources& resourceRequests,
+      const google::protobuf::Map<string, Value::Scalar>& resourceLimits)
   {
     return Nothing();
   }
@@ -393,7 +406,7 @@ void TestContainerizer::setup()
   EXPECT_CALL(*this, status(_))
     .WillRepeatedly(Invoke(this, &TestContainerizer::_status));
 
-  EXPECT_CALL(*this, update(_, _))
+  EXPECT_CALL(*this, update(_, _, _))
     .WillRepeatedly(Invoke(this, &TestContainerizer::_update));
 
   EXPECT_CALL(*this, launch(_, _, _, _))
@@ -454,13 +467,15 @@ Future<Connection> TestContainerizer::_attach(
 
 Future<Nothing> TestContainerizer::_update(
     const ContainerID& containerId,
-    const Resources& resources)
+    const Resources& resourceRequests,
+    const google::protobuf::Map<string, Value::Scalar>& resourceLimits)
 {
   return process::dispatch(
       process.get(),
       &TestContainerizerProcess::update,
       containerId,
-      resources);
+      resourceRequests,
+      resourceLimits);
 }
 
 

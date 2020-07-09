@@ -26,6 +26,7 @@
 #include <google/protobuf/repeated_field.h>
 
 #include <mesos/roles.hpp>
+#include <mesos/resource_quantities.hpp>
 
 #include <mesos/v1/mesos.hpp>
 #include <mesos/v1/resources.hpp>
@@ -39,7 +40,6 @@
 #include <stout/strings.hpp>
 #include <stout/unreachable.hpp>
 
-#include "common/resource_quantities.hpp"
 #include "common/resources_utils.hpp"
 
 using std::make_shared;
@@ -52,8 +52,6 @@ using std::string;
 using std::vector;
 
 using google::protobuf::RepeatedPtrField;
-
-using mesos::internal::ResourceQuantities;
 
 namespace mesos {
 namespace v1 {
@@ -554,29 +552,6 @@ static bool subtractable(const Resource& left, const Resource& right)
   }
 
   return true;
-}
-
-
-// Tests if "right" is contained in "left".
-static bool contains(const Resource& left, const Resource& right)
-{
-  // NOTE: This is a necessary condition for 'contains'.
-  // 'subtractable' will verify name, role, type, ReservationInfo,
-  // DiskInfo, SharedInfo, RevocableInfo, and ResourceProviderID
-  // compatibility.
-  if (!subtractable(left, right)) {
-    return false;
-  }
-
-  if (left.type() == Value::SCALAR) {
-    return right.scalar() <= left.scalar();
-  } else if (left.type() == Value::RANGES) {
-    return right.ranges() <= left.ranges();
-  } else if (left.type() == Value::SET) {
-    return right.set() <= left.set();
-  } else {
-    return false;
-  }
 }
 
 
@@ -1282,14 +1257,26 @@ bool Resources::isShared(const Resource& resource)
 }
 
 
-bool Resources::isScalarQuantity(const Resources& resources)
+bool Resources::isAllocatedToRoleSubtree(
+    const Resource& resource, const string& role)
 {
-  // Instead of checking the absence of non-scalar-quantity fields,
-  // we do an equality check between the original `Resources` object and
-  // its stripped counterpart.
-  //
-  // We remove the static reservation metadata here via `toUnreserved()`.
-  return resources == resources.createStrippedScalarQuantity().toUnreserved();
+  CHECK(!resource.has_role()) << resource;
+  CHECK(!resource.has_reservation()) << resource;
+
+  return resource.allocation_info().role() == role ||
+         roles::isStrictSubroleOf(resource.allocation_info().role(), role);
+}
+
+
+bool Resources::isReservedToRoleSubtree(
+    const Resource& resource, const string& role)
+{
+  CHECK(!resource.has_role()) << resource;
+  CHECK(!resource.has_reservation()) << resource;
+
+  return Resources::isReserved(resource) &&
+         (Resources::reservationRole(resource) == role ||
+          roles::isStrictSubroleOf(Resources::reservationRole(resource), role));
 }
 
 
@@ -1324,19 +1311,30 @@ bool Resources::shrink(Resource* resource, const Value::Scalar& target)
     return true; // Already within target.
   }
 
-  Resource copy = *resource;
-  copy.mutable_scalar()->CopyFrom(target);
+  // Some `disk` resources (e.g. MOUNT disk) are indivisible.
+  // We use a containement check to verify this. Specifically,
+  // if it contains a smaller version of itself, then it can
+  // safely be chopped into a smaller amount.
+  //
+  // NOTE: If additional types of resources become indivisible,
+  // this code needs updating!
+  if (resource->has_disk()) {
+    Resource original = *resource;
 
-  // Some resources (e.g. MOUNT disk) are indivisible. We use
-  // a containement check to verify this. Specifically, if a
-  // contains a smaller version of itself, then it can safely
-  // be chopped into a smaller amount.
-  if (Resources(*resource).contains(copy)) {
-    resource->CopyFrom(copy);
-    return true;
+    Value::Scalar oldScalar = resource->scalar();
+    *resource->mutable_scalar() = target;
+
+    if (mesos::v1::contains(original, *resource)) {
+      return true;
+    }
+
+    // Restore the old value.
+    *resource->mutable_scalar() = std::move(oldScalar);
+    return false;
   }
 
-  return false;
+  *resource->mutable_scalar() = target;
+  return true;
 }
 
 
@@ -1380,7 +1378,7 @@ bool Resources::Resource_::contains(const Resource_& that) const
   }
 
   // For non-shared resources just compare the protobufs.
-  return internal::contains(resource, that.resource);
+  return mesos::v1::contains(resource, that.resource);
 }
 
 
@@ -1659,6 +1657,18 @@ Resources Resources::reserved(const Option<string>& role) const
 Resources Resources::allocatableTo(const string& role) const
 {
   return filter(lambda::bind(isAllocatableTo, lambda::_1, role));
+}
+
+
+Resources Resources::allocatedToRoleSubtree(const string& role) const
+{
+  return filter(lambda::bind(isAllocatedToRoleSubtree, lambda::_1, role));
+}
+
+
+Resources Resources::reservedToRoleSubtree(const string& role) const
+{
+  return filter(lambda::bind(isReservedToRoleSubtree, lambda::_1, role));
 }
 
 
@@ -2637,6 +2647,28 @@ ostream& operator<<(
     const google::protobuf::RepeatedPtrField<Resource>& resources)
 {
   return stream << JSON::protobuf(resources);
+}
+
+
+bool contains(const Resource& left, const Resource& right)
+{
+  // NOTE: This is a necessary condition for 'contains'.
+  // 'subtractable' will verify name, role, type, ReservationInfo,
+  // DiskInfo, SharedInfo, RevocableInfo, and ResourceProviderID
+  // compatibility.
+  if (!internal::subtractable(left, right)) {
+    return false;
+  }
+
+  if (left.type() == Value::SCALAR) {
+    return right.scalar() <= left.scalar();
+  } else if (left.type() == Value::RANGES) {
+    return right.ranges() <= left.ranges();
+  } else if (left.type() == Value::SET) {
+    return right.set() <= left.set();
+  } else {
+    return false;
+  }
 }
 
 

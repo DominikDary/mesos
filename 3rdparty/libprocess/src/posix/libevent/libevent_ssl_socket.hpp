@@ -41,6 +41,10 @@ public:
 
   // Implement 'SocketImpl' interface.
   Future<Nothing> connect(const Address& address) override;
+  Future<Nothing> connect(
+      const Address& address,
+      const openssl::TLSClientConfig& config) override;
+
   Future<size_t> recv(char* data, size_t size) override;
   // Send does not currently support discard. See implementation.
   Future<size_t> send(const char* data, size_t size) override;
@@ -73,16 +77,16 @@ private:
     AcceptRequest(
         int_fd _socket,
         evconnlistener* _listener,
-        const Option<net::IP>& _ip)
+        const Address& _address)
       : peek_event(nullptr),
         listener(_listener),
         socket(_socket),
-        ip(_ip) {}
+        address(_address) {}
     event* peek_event;
     Promise<std::shared_ptr<SocketImpl>> promise;
     evconnlistener* listener;
     int_fd socket;
-    Option<net::IP> ip;
+    Address address;
   };
 
   struct RecvRequest
@@ -111,8 +115,7 @@ private:
   // functions.
   LibeventSSLSocketImpl(
       int_fd _s,
-      bufferevent* bev,
-      Option<std::string>&& peer_hostname);
+      bufferevent* bev);
 
   // This is called when the equivalent of 'accept' returns. The role
   // of this function is to set up the SSL object and bev. If we
@@ -187,8 +190,8 @@ private:
   // discards through.
   Queue<Future<std::shared_ptr<SocketImpl>>> accept_queue;
 
-  Option<std::string> peer_hostname;
   Option<net::IP> peer_ip;
+  Option<openssl::TLSClientConfig> client_config;
 };
 
 } // namespace internal {

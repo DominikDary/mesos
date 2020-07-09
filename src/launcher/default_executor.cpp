@@ -88,6 +88,7 @@ namespace mesos {
 namespace internal {
 
 constexpr char MESOS_CONTAINER_IP[] = "MESOS_CONTAINER_IP";
+constexpr char MESOS_ALLOCATION_ROLE[] = "MESOS_ALLOCATION_ROLE";
 
 
 class DefaultExecutor : public ProtobufProcess<DefaultExecutor>
@@ -278,6 +279,12 @@ public:
           containers.at(taskId)->acknowledged = true;
         }
 
+        // Terminate the executor if all status updates have been acknowledged
+        // by the agent and no running containers left.
+        if (containers.empty() && unacknowledgedUpdates.empty()) {
+          terminate(self());
+        }
+
         break;
       }
 
@@ -431,6 +438,9 @@ protected:
 
     LOG(INFO) << "Setting 'MESOS_CONTAINER_IP' to: " << containerIP.value();
 
+    Environment::Variable allocationRole;
+    allocationRole.set_name(MESOS_ALLOCATION_ROLE);
+
     vector<ContainerID> containerIds;
     vector<Future<Response>> responses;
 
@@ -460,11 +470,9 @@ protected:
       forward(status);
 
       agent::Call call;
-      call.set_type(agent::Call::LAUNCH_NESTED_CONTAINER);
+      call.set_type(agent::Call::LAUNCH_CONTAINER);
 
-      agent::Call::LaunchNestedContainer* launch =
-        call.mutable_launch_nested_container();
-
+      agent::Call::LaunchContainer* launch = call.mutable_launch_container();
       launch->mutable_container_id()->CopyFrom(containerId);
 
       if (task.has_command()) {
@@ -475,12 +483,19 @@ protected:
         launch->mutable_container()->CopyFrom(task.container());
       }
 
-      // Currently, it is not possible to specify resources for nested
-      // containers (i.e., all resources are merged in the top level
-      // executor container). This means that any disk resources used by
-      // the task are mounted on the top level container. As a workaround,
-      // we set up the volume mapping allowing child containers to share
-      // the volumes from their parent containers sandbox.
+      launch->mutable_resources()->CopyFrom(task.resources());
+
+      if (!task.limits().empty()) {
+        *launch->mutable_limits() = task.limits();
+      }
+
+      // Currently any disk resources used by the task are mounted
+      // on the top level container. As a workaround, we set up the
+      // volume mapping allowing child containers to share the volumes
+      // from their parent containers sandbox.
+      //
+      // TODO(qianzhang): Mount the disk resources on the task containers
+      // directly and then remove this workaround.
       foreach (const Resource& resource, task.resources()) {
         // Ignore if there are no disk resources or if the
         // disk resources did not specify a volume mapping.
@@ -510,12 +525,20 @@ protected:
         sandboxPath->set_path(executorVolume.container_path());
       }
 
-      // Set the `MESOS_CONTAINER_IP` for the task.
+      // Set the `MESOS_CONTAINER_IP` environment variable for the task.
       //
       // TODO(asridharan): Document this API for consumption by tasks
       // in the Mesos CNI and default-executor documentation.
       CommandInfo *command = launch->mutable_command();
       command->mutable_environment()->add_variables()->CopyFrom(containerIP);
+
+      // Set the `MESOS_ALLOCATION_ROLE` environment variable for the task.
+      // Please note that tasks are not allowed to mix resources allocated
+      // to different roles, see MESOS-6636.
+      allocationRole.set_value(
+          task.resources().begin()->allocation_info().role());
+
+      command->mutable_environment()->add_variables()->CopyFrom(allocationRole);
 
       responses.push_back(post(connection.get(), call));
     }
@@ -546,7 +569,7 @@ protected:
     // happens.
     if (!responses.isReady()) {
       LOG(ERROR) << "Unable to receive a response from the agent for "
-                 << "the LAUNCH_NESTED_CONTAINER call: "
+                 << "the LAUNCH_CONTAINER call: "
                  << (responses.isFailed() ? responses.failure() : "discarded");
       _shutdown();
       return;
@@ -566,7 +589,7 @@ protected:
       Container* container = containers.at(taskId).get();
 
       // Check if we received a 200 OK response for the
-      // `LAUNCH_NESTED_CONTAINER` call. Skip the rest of the container
+      // `LAUNCH_CONTAINER` call. Skip the rest of the container
       // initialization if this is not the case.
       if (response.code != process::http::Status::OK) {
         LOG(ERROR) << "Received '" << response.status << "' (" << response.body
@@ -865,7 +888,7 @@ protected:
         // `killTask()` or `shutdown()`.
         taskState = TASK_KILLED;
       } else if (container->launchError.isSome()) {
-        // Send TASK_FAILED if we know that `LAUNCH_NESTED_CONTAINER` returned
+        // Send TASK_FAILED if we know that `LAUNCH_CONTAINER` returned
         // an error.
         taskState = TASK_FAILED;
         message = container->launchError;
@@ -1076,14 +1099,21 @@ protected:
 
   void _shutdown()
   {
-    const Duration duration = Seconds(1);
+    if (unacknowledgedUpdates.empty()) {
+      terminate(self());
+    } else {
+      // This is a fail safe in case the agent doesn't send an ACK for
+      // a status update for some reason.
+      const Duration duration = Seconds(60);
 
-    LOG(INFO) << "Terminating after " << duration;
+      LOG(INFO) << "Terminating after " << duration;
 
-    // TODO(qianzhang): Remove this hack since the executor now receives
-    // acknowledgements for status updates. The executor can terminate
-    // after it receives an ACK for a terminal status update.
-    os::sleep(duration);
+      delay(duration, self(), &Self::__shutdown);
+    }
+  }
+
+  void __shutdown()
+  {
     terminate(self());
   }
 
@@ -1715,16 +1745,57 @@ int main(int argc, char** argv)
       << "Expecting 'MESOS_SLAVE_PID' to be set in the environment";
   }
 
-  process::initialize();
-
   UPID upid(value.get());
   CHECK(upid) << "Failed to parse MESOS_SLAVE_PID '" << value.get() << "'";
 
-  agent = ::URL(
-      scheme,
-      upid.address.ip,
-      upid.address.port,
-      upid.id + "/api/v1");
+#ifndef __WINDOWS__
+  value = os::getenv("MESOS_DOMAIN_SOCKET");
+  if (value.isSome()) {
+    // The previous value of `scheme` can be ignored here, since we do not
+    // use https over unix domain sockets anyways.
+    scheme = "http+unix";
+    std::string path = value.get();
+
+    if (path.size() >= 108) {
+      std::string cwd = os::getcwd();
+      VLOG(1) << "Path " << path << " too long, shortening it by using"
+              << " the relative path to " << cwd;
+
+      Try<std::string> relative = path::relative(path, cwd);
+      if (relative.isError()) {
+        EXIT(EXIT_FAILURE)
+          << "Couldnt compute relative path of socket location: "
+          << relative.error();
+      }
+      path = "./" + *relative;
+    }
+
+    // This should not happen, because the socket is supposed to
+    // be in `$MESOS_SANDBOX/agent.sock`, so the relative path should
+    // always be `./agent.sock`.
+    if (path.size() >= 108) {
+      EXIT(EXIT_FAILURE)
+        << "Cannot use domain sockets for communication as requested: "
+        << "Path " << path << " is longer than 108 characters";
+    }
+
+    agent = ::URL(
+        scheme,
+        path,
+        upid.id + "/api/v1");
+  } else
+#endif // __WINDOWS__
+  {
+    agent = ::URL(
+        scheme,
+        upid.address.ip,
+        upid.address.port,
+        upid.id + "/api/v1");
+  }
+
+  LOG(INFO) << "Using URL " << agent << " for the streaming endpoint";
+
+  process::initialize();
 
   value = os::getenv("MESOS_SANDBOX");
   if (value.isNone()) {

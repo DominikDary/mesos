@@ -80,6 +80,8 @@ Metrics::Metrics(const Master& master)
     outstanding_offers(
         "master/outstanding_offers",
         defer(master, &Master::_outstanding_offers)),
+    operation_states(
+        "master/operations/"),
     operator_event_stream_subscribers(
         "master/operator_event_stream_subscribers"),
     tasks_staging(
@@ -157,6 +159,8 @@ Metrics::Metrics(const Master& master)
         "master/messages_unregister_slave"),
     messages_status_update(
         "master/messages_status_update"),
+    messages_operation_status_update(
+        "master/messages_operation_status_update"),
     messages_exited_executor(
         "master/messages_exited_executor"),
     messages_update_slave(
@@ -179,6 +183,10 @@ Metrics::Metrics(const Master& master)
         "master/valid_status_update_acknowledgements"),
     invalid_status_update_acknowledgements(
         "master/invalid_status_update_acknowledgements"),
+    valid_operation_status_updates(
+        "master/valid_operation_status_updates"),
+    invalid_operation_status_updates(
+        "master/invalid_operation_status_updates"),
     valid_operation_status_update_acknowledgements(
         "master/valid_operation_status_update_acknowledgements"),
     invalid_operation_status_update_acknowledgements(
@@ -278,6 +286,7 @@ Metrics::Metrics(const Master& master)
   process::metrics::add(messages_reregister_slave);
   process::metrics::add(messages_unregister_slave);
   process::metrics::add(messages_status_update);
+  process::metrics::add(messages_operation_status_update);
   process::metrics::add(messages_exited_executor);
   process::metrics::add(messages_update_slave);
 
@@ -295,6 +304,9 @@ Metrics::Metrics(const Master& master)
 
   process::metrics::add(valid_status_update_acknowledgements);
   process::metrics::add(invalid_status_update_acknowledgements);
+
+  process::metrics::add(valid_operation_status_updates);
+  process::metrics::add(invalid_operation_status_updates);
 
   process::metrics::add(valid_operation_status_update_acknowledgements);
   process::metrics::add(invalid_operation_status_update_acknowledgements);
@@ -368,6 +380,30 @@ Metrics::Metrics(const Master& master)
     process::metrics::add(used);
     process::metrics::add(percent);
   }
+
+  for (int index = 0;
+       index < Offer::Operation::Type_descriptor()->value_count();
+       index++) {
+    const google::protobuf::EnumValueDescriptor* descriptor =
+      Offer::Operation::Type_descriptor()->value(index);
+
+    const Offer::Operation::Type type =
+      static_cast<Offer::Operation::Type>(descriptor->number());
+
+    // Skip `LAUNCH` and `LAUNCH_GROUP` because they are special-cased
+    // in the master and don't go through the usual offer operation feedback
+    // cycle.
+    if (type == Offer::Operation::UNKNOWN ||
+        type == Offer::Operation::LAUNCH ||
+        type == Offer::Operation::LAUNCH_GROUP) {
+      continue;
+    }
+
+    std::string prefix =
+      "master/operations/" + strings::lower(descriptor->name()) + "/";
+
+    operation_type_states.emplace(type, prefix);
+  }
 }
 
 
@@ -432,6 +468,7 @@ Metrics::~Metrics()
   process::metrics::remove(messages_reregister_slave);
   process::metrics::remove(messages_unregister_slave);
   process::metrics::remove(messages_status_update);
+  process::metrics::remove(messages_operation_status_update);
   process::metrics::remove(messages_exited_executor);
   process::metrics::remove(messages_update_slave);
 
@@ -449,6 +486,9 @@ Metrics::~Metrics()
 
   process::metrics::remove(valid_status_update_acknowledgements);
   process::metrics::remove(invalid_status_update_acknowledgements);
+
+  process::metrics::remove(valid_operation_status_updates);
+  process::metrics::remove(invalid_operation_status_updates);
 
   process::metrics::remove(valid_operation_status_update_acknowledgements);
   process::metrics::remove(invalid_operation_status_update_acknowledgements);
@@ -562,27 +602,131 @@ void Metrics::incrementTasksStates(
 }
 
 
+Metrics::OperationStates::OperationStates(const std::string& prefix)
+  : total(prefix + "total"),
+    pending(prefix + "pending"),
+    recovering(prefix + "recovering"),
+    unreachable(prefix + "unreachable"),
+    finished(prefix + "finished"),
+    failed(prefix + "failed"),
+    error(prefix + "error"),
+    dropped(prefix + "dropped"),
+    gone_by_operator(prefix + "gone_by_operator")
+{
+  process::metrics::add(total);
+  process::metrics::add(pending);
+  process::metrics::add(recovering);
+  process::metrics::add(finished);
+  process::metrics::add(failed);
+  process::metrics::add(error);
+  process::metrics::add(dropped);
+  process::metrics::add(unreachable);
+  process::metrics::add(gone_by_operator);
+}
+
+
+Metrics::OperationStates::~OperationStates()
+{
+  process::metrics::remove(total);
+  process::metrics::remove(pending);
+  process::metrics::remove(recovering);
+  process::metrics::remove(finished);
+  process::metrics::remove(failed);
+  process::metrics::remove(error);
+  process::metrics::remove(dropped);
+  process::metrics::remove(unreachable);
+  process::metrics::remove(gone_by_operator);
+}
+
+
+void Metrics::OperationStates::update(
+    const OperationState& operationState,
+    int delta)
+{
+  total += delta;
+
+  switch(operationState) {
+    case OPERATION_FINISHED:
+      finished += delta;
+      break;
+    case OPERATION_DROPPED:
+      dropped += delta;
+      break;
+    case OPERATION_ERROR:
+      error += delta;
+      break;
+    case OPERATION_FAILED:
+      failed += delta;
+      break;
+    case OPERATION_GONE_BY_OPERATOR:
+      gone_by_operator += delta;
+      break;
+    case OPERATION_PENDING:
+      pending += delta;
+      break;
+    case OPERATION_UNREACHABLE:
+      unreachable += delta;
+      break;
+    case OPERATION_RECOVERING:
+      recovering += delta;
+      break;
+    case OPERATION_UNSUPPORTED:
+    case OPERATION_UNKNOWN:
+      LOG(ERROR) << "Unexpected operation state: " << operationState;
+      break;
+  }
+}
+
+
+void Metrics::incrementOperationState(
+    Offer::Operation::Type type,
+    const OperationState& state)
+{
+  operation_states.update(state, 1);
+  if (operation_type_states.count(type)) {
+    operation_type_states.at(type).update(state, 1);
+  }
+}
+
+
+void Metrics::decrementOperationState(
+    Offer::Operation::Type type,
+    const OperationState& state)
+{
+  operation_states.update(state, -1);
+  if (operation_type_states.count(type)) {
+    operation_type_states.at(type).update(state, -1);
+  }
+}
+
+
+void Metrics::transitionOperationState(
+    Offer::Operation::Type type,
+    const OperationState& oldState,
+    const OperationState& newState)
+{
+  if (oldState == newState) {
+    return;  // Nothing to do.
+  }
+
+  decrementOperationState(type, oldState);
+  incrementOperationState(type, newState);
+}
+
+
 FrameworkMetrics::FrameworkMetrics(
     const FrameworkInfo& _frameworkInfo,
     bool _publishPerFrameworkMetrics)
-  : frameworkInfo(_frameworkInfo),
+  : metricPrefix(getFrameworkMetricPrefix(_frameworkInfo)),
     publishPerFrameworkMetrics(_publishPerFrameworkMetrics),
-    subscribed(
-        getFrameworkMetricPrefix(frameworkInfo) + "subscribed"),
-    calls(
-        getFrameworkMetricPrefix(frameworkInfo) + "calls"),
-    events(
-        getFrameworkMetricPrefix(frameworkInfo) + "events"),
-    offers_sent(
-        getFrameworkMetricPrefix(frameworkInfo) + "offers/sent"),
-    offers_accepted(
-        getFrameworkMetricPrefix(frameworkInfo) + "offers/accepted"),
-    offers_declined(
-        getFrameworkMetricPrefix(frameworkInfo) + "offers/declined"),
-    offers_rescinded(
-        getFrameworkMetricPrefix(frameworkInfo) + "offers/rescinded"),
-    operations(
-        getFrameworkMetricPrefix(frameworkInfo) + "operations")
+    subscribed(metricPrefix + "subscribed"),
+    calls(metricPrefix + "calls"),
+    events(metricPrefix + "events"),
+    offers_sent(metricPrefix + "offers/sent"),
+    offers_accepted(metricPrefix + "offers/accepted"),
+    offers_declined(metricPrefix + "offers/declined"),
+    offers_rescinded(metricPrefix + "offers/rescinded"),
+    operations(metricPrefix + "operations")
 {
   addMetric(subscribed);
   addMetric(offers_sent);
@@ -606,8 +750,7 @@ FrameworkMetrics::FrameworkMetrics(
     }
 
     Counter counter = Counter(
-        getFrameworkMetricPrefix(frameworkInfo) + "calls/" +
-        strings::lower(descriptor->name()));
+        metricPrefix + "calls/" + strings::lower(descriptor->name()));
 
     call_types.put(type, counter);
     addMetric(counter);
@@ -629,8 +772,7 @@ FrameworkMetrics::FrameworkMetrics(
     }
 
     Counter counter = Counter(
-        getFrameworkMetricPrefix(frameworkInfo) + "events/" +
-        strings::lower(descriptor->name()));
+        metricPrefix + "events/" + strings::lower(descriptor->name()));
 
     event_types.put(type, counter);
     addMetric(counter);
@@ -645,14 +787,14 @@ FrameworkMetrics::FrameworkMetrics(
 
     if (protobuf::isTerminalState(state)) {
       Counter counter = Counter(
-          getFrameworkMetricPrefix(frameworkInfo) + "tasks/terminal/" +
+          metricPrefix + "tasks/terminal/" +
           strings::lower(descriptor->name()));
 
       terminal_task_states.put(state, counter);
       addMetric(counter);
     } else {
       PushGauge gauge = PushGauge(
-          getFrameworkMetricPrefix(frameworkInfo) + "tasks/active/" +
+          metricPrefix + "tasks/active/" +
           strings::lower(TaskState_Name(state)));
 
       active_task_states.put(state, gauge);
@@ -675,9 +817,8 @@ FrameworkMetrics::FrameworkMetrics(
       continue;
     }
 
-    Counter counter =
-      Counter(getFrameworkMetricPrefix(frameworkInfo) +
-      "operations/" + strings::lower(descriptor->name()));
+    Counter counter = Counter(
+        metricPrefix + "operations/" + strings::lower(descriptor->name()));
 
     operation_types.put(type, counter);
     addMetric(counter);
@@ -723,8 +864,8 @@ void FrameworkMetrics::incrementCall(const scheduler::Call::Type& callType)
 {
   CHECK(call_types.contains(callType));
 
-  call_types.get(callType).get()++;
-  calls++;
+  ++call_types.at(callType);
+  ++calls;
 }
 
 
@@ -732,10 +873,10 @@ void FrameworkMetrics::incrementTaskState(const TaskState& state)
 {
   if (protobuf::isTerminalState(state)) {
     CHECK(terminal_task_states.contains(state));
-    terminal_task_states.get(state).get()++;
+    ++terminal_task_states.at(state);
   } else {
     CHECK(active_task_states.contains(state));
-    active_task_states.get(state).get() += 1;
+    ++active_task_states.at(state);
   }
 }
 
@@ -744,7 +885,7 @@ void FrameworkMetrics::decrementActiveTaskState(const TaskState& state)
 {
   CHECK(active_task_states.contains(state));
 
-  active_task_states.get(state).get() -= 1;
+  active_task_states.at(state) -= 1;
 }
 
 
@@ -752,8 +893,8 @@ void FrameworkMetrics::incrementOperation(const Offer::Operation& operation)
 {
   CHECK(operation_types.contains(operation.type()));
 
-  operation_types.get(operation.type()).get()++;
-  operations++;
+  ++operation_types.at(operation.type());
+  ++operations;
 }
 
 

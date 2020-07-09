@@ -1497,7 +1497,7 @@ TYPED_TEST(SlaveRecoveryTest, RecoverTerminatedHTTPExecutor)
   ASSERT_TRUE(state->slave->frameworks.contains(frameworkId.get()));
 
   slave::state::FrameworkState frameworkState =
-    state->slave->frameworks.get(frameworkId.get()).get();
+    state->slave->frameworks.at(frameworkId.get());
 
   ASSERT_EQ(1u, frameworkState.executors.size());
 
@@ -4012,7 +4012,7 @@ TYPED_TEST(SlaveRecoveryTest, ReconcileTasksMissingFromSlave)
   ASSERT_TRUE(state->slave->frameworks.contains(frameworkId.get()));
 
   slave::state::FrameworkState frameworkState =
-    state->slave->frameworks.get(frameworkId.get()).get();
+    state->slave->frameworks.at(frameworkId.get());
 
   ASSERT_EQ(1u, frameworkState.executors.size());
 
@@ -4037,7 +4037,7 @@ TYPED_TEST(SlaveRecoveryTest, ReconcileTasksMissingFromSlave)
     FUTURE_PROTOBUF(SlaveReregisteredMessage(), _, _);
 
   EXPECT_CALL(allocator, activateSlave(_));
-  EXPECT_CALL(allocator, recoverResources(_, _, _, _));
+  EXPECT_CALL(allocator, recoverResources(_, _, _, _, _));
 
   Future<TaskStatus> status;
   EXPECT_CALL(sched, statusUpdate(_, _))
@@ -4088,7 +4088,7 @@ TYPED_TEST(SlaveRecoveryTest, ReconcileTasksMissingFromSlave)
 
   // If there was an outstanding offer, we can get a call to
   // recoverResources when we stop the scheduler.
-  EXPECT_CALL(allocator, recoverResources(_, _, _, _))
+  EXPECT_CALL(allocator, recoverResources(_, _, _, _, _))
     .WillRepeatedly(Return());
 
   driver.stop();
@@ -5332,7 +5332,8 @@ TEST_F(MesosContainerizerSlaveRecoveryTest, ResourceStatistics)
   AWAIT_READY(usage);
 
   // Check the resource limits are set.
-  EXPECT_TRUE(usage->has_cpus_limit());
+  EXPECT_TRUE(usage->has_cpus_soft_limit());
+  EXPECT_TRUE(usage->has_mem_soft_limit_bytes());
   EXPECT_TRUE(usage->has_mem_limit_bytes());
 
   // Destroy the container.

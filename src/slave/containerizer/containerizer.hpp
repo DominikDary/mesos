@@ -36,6 +36,8 @@
 #include <stout/option.hpp>
 #include <stout/try.hpp>
 
+#include "common/future_tracker.hpp"
+
 #include "slave/gc.hpp"
 
 #include "slave/volume_gid_manager/volume_gid_manager.hpp"
@@ -75,7 +77,8 @@ public:
       Fetcher* fetcher,
       GarbageCollector* gc,
       SecretResolver* secretResolver = nullptr,
-      VolumeGidManager* volumeGidManager = nullptr);
+      VolumeGidManager* volumeGidManager = nullptr,
+      PendingFutureTracker* futureTracker = nullptr);
 
   // Determine slave resources from flags, probing the system or
   // querying a delegate.
@@ -116,7 +119,9 @@ public:
   // Update the resources for a container.
   virtual process::Future<Nothing> update(
       const ContainerID& containerId,
-      const Resources& resources) = 0;
+      const Resources& resourceRequests,
+      const google::protobuf::Map<
+          std::string, Value::Scalar>& resourceLimits = {}) = 0;
 
   // Get resource usage statistics on the container.
   virtual process::Future<ResourceStatistics> usage(

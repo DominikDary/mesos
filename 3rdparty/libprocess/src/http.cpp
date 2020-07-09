@@ -46,6 +46,8 @@
 #include <process/socket.hpp>
 #include <process/state_machine.hpp>
 
+#include <process/ssl/tls_config.hpp>
+
 #include <stout/error.hpp>
 #include <stout/foreach.hpp>
 #include <stout/ip.hpp>
@@ -635,28 +637,99 @@ Future<Nothing> Pipe::Writer::readerClosed() const
 
 namespace header {
 
-Try<WWWAuthenticate> WWWAuthenticate::create(const string& value)
+Try<WWWAuthenticate> WWWAuthenticate::create(const string& input)
 {
   // Set `maxTokens` as 2 since auth-param quoted string may
   // contain space (e.g., "Basic realm="Registry Realm").
-  vector<string> tokens = strings::tokenize(value, " ", 2);
+  vector<string> tokens = strings::tokenize(input, " ", 2);
   if (tokens.size() != 2) {
-    return Error("Unexpected WWW-Authenticate header format: '" + value + "'");
+    return Error("Unexpected WWW-Authenticate header format: '" + input + "'");
   }
 
+  // Since the authentication parameters can contain quote values, we
+  // do not use `strings::split` here since the delimiter may occur in
+  // a quoted value which should not be split.
   hashmap<string, string> authParam;
-  foreach (const string& token, strings::split(tokens[1], ",")) {
-    vector<string> split = strings::split(token, "=");
-    if (split.size() != 2) {
-      return Error(
-          "Unexpected auth-param format: '" +
-          token + "' in '" + tokens[1] + "'");
-    }
+  Option<string> key, value;
+  bool inQuotes = false;
 
+  foreach (char c, tokens[1]) {
     // Auth-param values can be a quoted-string or directive values.
     // Please see section "3.2.2.4 Directive values and quoted-string":
     // https://tools.ietf.org/html/rfc2617.
-    authParam[split[0]] = strings::trim(split[1], strings::ANY, "\"");
+    //
+    // If we see a quote we know we must already be parsing `value`
+    // since `key` cannot be a quoted-string.
+    if (c != '"' && inQuotes) {
+      if (value.isNone()) {
+        return Error("Unexpected auth-param format: '" + tokens[1] + "'");
+      }
+
+      value->append({c});
+      continue;
+    }
+
+    // If we have not yet parsed `key` this character must belong to
+    // it if it is not a space, and cannot be a `,` delimiter.
+    if (key.isNone()) {
+      if (c == ',') {
+        return Error("Unexpected auth-param format: '" + tokens[1] + "'");
+      }
+
+      if (c == ' ') {
+        continue;
+      }
+
+      key = string({c});
+      continue;
+    }
+
+    // If the current character is `=` we must start parsing a new
+    // `value`. Since we have already handled `=` in quotes above we
+    // cannot already have started parsing `value`.
+    if (c == '=') {
+      if (value.isSome()) {
+        return Error("Unexpected auth-param format: '" + tokens[1] + "'");
+      }
+      value = "";
+      continue;
+    }
+
+    // If the current character is a quote, drop the
+    // character and toogle the quote state.
+    if (c == '"') {
+      inQuotes = !inQuotes;
+      continue;
+    }
+
+    // If the current character is a record delimiter and we are not
+    // in quotes, we should have parsed both a key and a value. Store
+    // them, drop the delimiter, and restart parsing.
+    if (c == ',' && !inQuotes) {
+      if (key.isNone() || value.isNone()) {
+        return Error("Unexpected auth-param format: '" + tokens[1] + "'");
+      }
+      authParam[*key] = *value;
+      key = None();
+      value = None();
+
+      continue;
+    }
+
+    // If we have not started parsing `value` we are still parsing `key`.
+    if (value.isNone()) {
+      key->append({c});
+    } else {
+      value->append({c});
+    }
+  }
+
+  // Record the last parsed `(key, value)` pair.
+  if (key.isSome()) {
+    if (value.isNone() || inQuotes) {
+      return Error("Unexpected auth-param format: '" + tokens[1] + "'");
+    }
+    authParam[*key] = *value;
   }
 
   // The realm directive (case-insensitive) is required for all
@@ -942,12 +1015,25 @@ string encode(const hashmap<string, string>& query)
 
 ostream& operator<<(ostream& stream, const URL& url)
 {
+  // TODO(bevers): The '//' sequence only follows the ':' if
+  // the next part begins with an "authority". This is required
+  // for the 'http' scheme, but not guaranteed in general.
   if (url.scheme.isSome()) {
     stream << url.scheme.get() << "://";
   }
 
   if (url.domain.isSome()) {
-    stream << url.domain.get();
+    // Optimize the most common case by not encoding for `http`
+    // and `https` schemes, since their domain part is already
+    // guaranteed to only contain unreserved characters.
+    bool encodeDomain = url.scheme.isNone() ||
+      (*url.scheme != "http" && *url.scheme != "https");
+
+    const std::string& host = encodeDomain
+      ? http::encode(url.domain.get())
+      : url.domain.get();
+
+    stream << host;
   } else if (url.ip.isSome()) {
     stream << url.ip.get();
   }
@@ -1006,7 +1092,9 @@ Pipe::Reader encode(const Request& request)
   // Need to specify the 'Host' header.
   CHECK(request.url.domain.isSome() || request.url.ip.isSome());
 
-  if (request.url.domain.isSome()) {
+  if (request.url.scheme == Some("http+unix")) {
+    headers["Host"] = "localhost";
+  } else if (request.url.domain.isSome()) {
     headers["Host"] = request.url.domain.get();
   } else if (request.url.ip.isSome()) {
     headers["Host"] = stringify(request.url.ip.get());
@@ -1423,12 +1511,16 @@ Future<Nothing> Connection::disconnected()
 }
 
 
-Future<Connection> connect(const network::Address& address, Scheme scheme)
+Future<Connection> connect(
+    const network::Address& address,
+    Scheme scheme,
+    const Option<string>& peer_hostname)
 {
   SocketImpl::Kind kind;
 
   switch (scheme) {
     case Scheme::HTTP:
+    case Scheme::HTTP_UNIX:
       kind = SocketImpl::Kind::POLL;
       break;
 #ifdef USE_SSL_SOCKET
@@ -1446,7 +1538,22 @@ Future<Connection> connect(const network::Address& address, Scheme scheme)
     return Failure("Failed to create socket: " + socket.error());
   }
 
-  return socket->connect(address)
+  Future<Nothing> connected = [&]() {
+    switch (scheme) {
+      case Scheme::HTTP:
+      case Scheme::HTTP_UNIX:
+        return socket->connect(address);
+#ifdef USE_SSL_SOCKET
+      case Scheme::HTTPS:
+        return socket->connect(
+            address,
+            network::openssl::create_tls_client_config(peer_hostname));
+#endif
+    }
+    UNREACHABLE();
+  }();
+
+  return connected
     .then([socket, address]() -> Future<Connection> {
       Try<network::Address> localAddress = socket->address();
       if (localAddress.isError()) {
@@ -1459,8 +1566,20 @@ Future<Connection> connect(const network::Address& address, Scheme scheme)
 }
 
 
+Future<Connection> connect(
+    const network::Address& address,
+    Scheme scheme)
+{
+  return connect(address, scheme, None());
+}
+
+
 Future<Connection> connect(const URL& url)
 {
+  // Default to 'http' if no scheme was specified.
+  string scheme = url.scheme.getOrElse("http");
+  bool inetAddressRequired = scheme == "http" || scheme == "https";
+
   // TODO(bmahler): Move address resolution into the URL class?
   Address address = inet4::Address::ANY_ANY();
 
@@ -1470,7 +1589,7 @@ Future<Connection> connect(const URL& url)
 
   if (url.ip.isSome()) {
     address.ip = url.ip.get();
-  } else {
+  } else if (inetAddressRequired) {
     Try<net::IP> ip = net::getIP(url.domain.get(), AF_INET);
 
     if (ip.isError()) {
@@ -1481,24 +1600,45 @@ Future<Connection> connect(const URL& url)
     address.ip = ip.get();
   }
 
-  if (url.port.isNone()) {
+  if (url.port.isNone() && inetAddressRequired) {
     return Failure("Expecting url.port to be set");
   }
 
-  address.port = url.port.get();
-
-  // Default to 'http' if no scheme was specified.
-  if (url.scheme.isNone() || url.scheme == string("http")) {
-    return connect(address, Scheme::HTTP);
+  if (url.port.isSome()) {
+    address.port = url.port.get();
   }
 
-  if (url.scheme == string("https")) {
+  if (scheme == "http") {
+    return connect(address, Scheme::HTTP, url.domain);
+  }
+
+  if (scheme == "https") {
 #ifdef USE_SSL_SOCKET
-    return connect(address, Scheme::HTTPS);
+    return connect(address, Scheme::HTTPS, url.domain);
 #else
     return Failure("'https' scheme requires SSL enabled");
 #endif
   }
+
+#ifndef __WINDOWS__
+  if (scheme == "http+unix") {
+    if (!url.domain.isSome()) {
+      return Failure("'http+unix' scheme requires domain (filesystem path)");
+    }
+
+    Try<network::unix::Address> address =
+      network::unix::Address::create(url.domain.get());
+
+    if (address.isError()) {
+      return Failure(strings::format(
+          "Could not create address from %s: %s",
+          url.domain.get(),
+          address.error()).get());
+    }
+
+    return connect(*address, Scheme::HTTP, url.domain);
+  }
+#endif // __WINDOWS__
 
   return Failure("Unsupported URL scheme");
 }
@@ -2208,9 +2348,12 @@ Try<Server> Server::create(
 {
   SocketImpl::Kind kind = [&]() {
     switch (options.scheme) {
-      case Scheme::HTTP: return SocketImpl::Kind::POLL;
+      case Scheme::HTTP:
+      case Scheme::HTTP_UNIX:
+        return SocketImpl::Kind::POLL;
 #ifdef USE_SSL_SOCKET
-      case Scheme::HTTPS: return SocketImpl::Kind::SSL;
+      case Scheme::HTTPS:
+        return SocketImpl::Kind::SSL;
 #endif
     }
     UNREACHABLE();

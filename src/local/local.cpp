@@ -75,7 +75,7 @@
 #include "master/registrar.hpp"
 
 #include "master/allocator/mesos/hierarchical.hpp"
-#include "master/allocator/sorter/drf/sorter.hpp"
+#include "master/allocator/mesos/sorter/drf/sorter.hpp"
 
 #include "master/contender/standalone.hpp"
 
@@ -534,6 +534,10 @@ PID<Master> launch(const Flags& flags, Allocator* _allocator)
         qosControllers->back(),
         secretGenerators->back(),
         nullptr,
+        nullptr,
+#ifndef __WINDOWS__
+        None(),
+#endif // __WINDOWS__
         authorizer_); // Same authorizer as master.
 
     slaves[containerizer.get()] = slave;

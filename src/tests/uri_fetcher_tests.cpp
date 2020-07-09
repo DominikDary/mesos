@@ -35,7 +35,9 @@
 
 #include <stout/tests/utils.hpp>
 
+#ifndef __WINDOWS__
 #include <mesos/docker/spec.hpp>
+#endif // __WINDOWS__
 
 #include "uri/fetcher.hpp"
 
@@ -49,7 +51,9 @@ namespace http = process::http;
 using std::list;
 using std::string;
 
+#ifndef __WINDOWS__
 using mesos::uri::DockerFetcherPlugin;
+#endif // __WINDOWS__
 
 using process::Future;
 using process::Owned;
@@ -115,6 +119,25 @@ TEST_F(CurlFetcherPluginTest, CURL_ValidUri)
 }
 
 
+TEST_F(CurlFetcherPluginTest, CURL_ValidUriWithOutputFileName)
+{
+  URI uri = uri::http(
+      stringify(server.self().address.ip),
+      "/TestHttpServer/test",
+      server.self().address.port);
+
+  EXPECT_CALL(server, test(_))
+    .WillOnce(Return(http::OK("test")));
+
+  Try<Owned<uri::Fetcher>> fetcher = uri::fetcher::create();
+  ASSERT_SOME(fetcher);
+
+  AWAIT_READY(fetcher.get()->fetch(uri, os::getcwd(), None(), "file"));
+
+  EXPECT_TRUE(os::exists(path::join(os::getcwd(), "file")));
+}
+
+
 TEST_F(CurlFetcherPluginTest, CURL_InvalidUri)
 {
   URI uri = uri::http(
@@ -146,7 +169,7 @@ TEST_F(CurlFetcherPluginTest, CURL_InvokeFetchByName)
   Try<Owned<uri::Fetcher>> fetcher = uri::fetcher::create();
   ASSERT_SOME(fetcher);
 
-  AWAIT_READY(fetcher.get()->fetch(uri, os::getcwd(), "curl", None()));
+  AWAIT_READY(fetcher.get()->fetch(uri, os::getcwd(), "curl", None(), None()));
 
   EXPECT_TRUE(os::exists(path::join(os::getcwd(), "test")));
 }
@@ -266,7 +289,7 @@ TEST_F(HadoopFetcherPluginTest, InvokeFetchByName)
 
   string dir = path::join(os::getcwd(), "dir");
 
-  AWAIT_READY(fetcher.get()->fetch(uri, dir, "hadoop", None()));
+  AWAIT_READY(fetcher.get()->fetch(uri, dir, "hadoop", None(), None()));
 
   EXPECT_SOME_EQ("abc", os::read(path::join(dir, "file")));
 }
@@ -287,10 +310,13 @@ static constexpr char TEST_DIGEST[] = "sha256:a3ed95caeb02ffe68cdd9fd844066"
 #endif // __WINDOWS__
 
 
+// NOTE: Windows images exist and can be fetched, but there is no Windows
+// provisioner in the Mesos containerizer that can use these images.
+#ifndef __WINDOWS__
 class DockerFetcherPluginTest : public TemporaryDirectoryTest {};
 
 
-TEST_F(DockerFetcherPluginTest, INTERNET_CURL_FetchManifest)
+TEST_F(DockerFetcherPluginTest, DISABLED_INTERNET_CURL_FetchManifest)
 {
   URI uri = uri::docker::manifest(
       TEST_REPOSITORY, "latest", DOCKER_REGISTRY_HOST);
@@ -302,29 +328,17 @@ TEST_F(DockerFetcherPluginTest, INTERNET_CURL_FetchManifest)
 
   AWAIT_READY_FOR(fetcher.get()->fetch(uri, dir), Seconds(60));
 
-  // Version 2 schema 1 image manifest test
-  Try<string> _s1Manifest = os::read(path::join(dir, "manifest"));
-  ASSERT_SOME(_s1Manifest);
-
-  Try<docker::spec::v2::ImageManifest> s1Manifest =
-    docker::spec::v2::parse(_s1Manifest.get());
-
-  ASSERT_SOME(s1Manifest);
-  EXPECT_EQ(1u, s1Manifest->schemaversion());
-  EXPECT_EQ(TEST_REPOSITORY, s1Manifest->name());
-  EXPECT_EQ("latest", s1Manifest->tag());
-
-#ifdef __WINDOWS__
   // Version 2 schema 2 image manifest test
-  Try<string> _s2Manifest = os::read(path::join(dir, "manifest_v2s2"));
-  ASSERT_SOME(_s2Manifest);
+  Try<string> _manifest = os::read(path::join(dir, "manifest"));
+  ASSERT_SOME(_manifest);
 
-  Try<docker::spec::v2_2::ImageManifest> s2Manifest =
-    docker::spec::v2_2::parse(_s2Manifest.get());
+  Try<docker::spec::v2_2::ImageManifest> manifest =
+    docker::spec::v2_2::parse(_manifest.get());
 
-  ASSERT_SOME(s2Manifest);
-  EXPECT_EQ(2u, s2Manifest->schemaversion());
-#endif // __WINDOWS__
+  ASSERT_SOME(manifest);
+  EXPECT_EQ(2u, manifest->schemaversion());
+  EXPECT_EQ("application/vnd.docker.distribution.manifest.v2+json",
+            manifest->mediatype());
 }
 
 
@@ -345,7 +359,7 @@ TEST_F(DockerFetcherPluginTest, INTERNET_CURL_FetchBlob)
 
 
 // Fetches the image manifest and all blobs in that image.
-TEST_F(DockerFetcherPluginTest, INTERNET_CURL_FetchImage)
+TEST_F(DockerFetcherPluginTest, DISABLED_INTERNET_CURL_FetchImage)
 {
   URI uri = uri::docker::image(
       TEST_REPOSITORY, "latest", DOCKER_REGISTRY_HOST);
@@ -360,25 +374,83 @@ TEST_F(DockerFetcherPluginTest, INTERNET_CURL_FetchImage)
   Try<string> _manifest = os::read(path::join(dir, "manifest"));
   ASSERT_SOME(_manifest);
 
-  Try<docker::spec::v2::ImageManifest> manifest =
-      docker::spec::v2::parse(_manifest.get());
+  Try<docker::spec::v2_2::ImageManifest> manifest =
+      docker::spec::v2_2::parse(_manifest.get());
 
   ASSERT_SOME(manifest);
-  EXPECT_EQ(1u, manifest->schemaversion());
-  EXPECT_EQ(TEST_REPOSITORY, manifest->name());
-  EXPECT_EQ("latest", manifest->tag());
+  EXPECT_EQ(2u, manifest->schemaversion());
+  EXPECT_EQ("application/vnd.docker.distribution.manifest.v2+json",
+            manifest->mediatype());
 
-  for (int i = 0; i < manifest->fslayers_size(); i++) {
+  EXPECT_TRUE(os::exists(DockerFetcherPlugin::getBlobPath(
+      dir, manifest->config().digest())));
+
+  for (int i = 0; i < manifest->layers_size(); i++) {
     EXPECT_TRUE(os::exists(
         DockerFetcherPlugin::getBlobPath(
             dir,
-            manifest->fslayers(i).blobsum())));
+            manifest->layers(i).digest())));
+  }
+}
+
+
+// Fetches an image from a registry for which fetcher falls back to generating
+// repository scope (see MESOS-10092). This test uses 'nvcr.io' as a registry
+// that does not provide scope on its own.
+//
+// TODO(asekretenko): Set up a mock registry and use it in this test.
+TEST_F(DockerFetcherPluginTest, INTERNET_CURL_GeneratedRepositoryScope)
+{
+  // Using `nvidia/k8s/cuda-sample:nbody` as it seems to be the smallest one
+  // on nvcr.io
+  const URI uri =
+    uri::docker::image("nvidia/k8s/cuda-sample", "nbody", "nvcr.io");
+
+  const string dir = path::join(os::getcwd(), "dir");
+
+  // First, we create a docker fetcher plugin with fallback disabled
+  // to make sure that nvcr.io is still suitable for the purpose of this test.
+  Try<process::Owned<uri::Fetcher::Plugin>> fetcherWithDisabledFallback =
+    DockerFetcherPlugin::create(DockerFetcherPlugin::Flags(), false);
+
+  ASSERT_SOME(fetcherWithDisabledFallback);
+  Future<Nothing> NoFallbackFetch =
+    fetcherWithDisabledFallback.get()->fetch(uri, dir);
+
+  AWAIT_FAILED_FOR(NoFallbackFetch, Seconds(120));
+
+  ASSERT_TRUE(strings::contains(
+      NoFallbackFetch.failure(),
+      "Missing 'realm', 'service' or 'scope' in header WWW-Authenticate"));
+
+  // Now, we can proceed with testing the fallback.
+  Try<Owned<uri::Fetcher>> fetcher = uri::fetcher::create();
+  ASSERT_SOME(fetcher);
+
+  AWAIT_READY_FOR(fetcher.get()->fetch(uri, dir), Seconds(120));
+
+  Try<string> _manifest = os::read(path::join(dir, "manifest"));
+  ASSERT_SOME(_manifest);
+
+  Try<docker::spec::v2_2::ImageManifest> manifest =
+    docker::spec::v2_2::parse(_manifest.get());
+
+  ASSERT_SOME(manifest);
+  EXPECT_EQ(2u, manifest->schemaversion());
+  EXPECT_EQ("application/vnd.docker.distribution.manifest.v2+json",
+            manifest->mediatype());
+
+  EXPECT_TRUE(os::exists(path::join(dir, manifest->config().digest())));
+
+  for (int i = 0; i < manifest->layers_size(); i++) {
+    EXPECT_TRUE(os::exists(
+        DockerFetcherPlugin::getBlobPath(dir, manifest->layers(i).digest())));
   }
 }
 
 
 // This test verifies invoking 'fetch' by plugin name.
-TEST_F(DockerFetcherPluginTest, INTERNET_CURL_InvokeFetchByName)
+TEST_F(DockerFetcherPluginTest, DISABLED_INTERNET_CURL_InvokeFetchByName)
 {
   URI uri = uri::docker::image(
       TEST_REPOSITORY, "latest", DOCKER_REGISTRY_HOST);
@@ -389,27 +461,31 @@ TEST_F(DockerFetcherPluginTest, INTERNET_CURL_InvokeFetchByName)
   string dir = path::join(os::getcwd(), "dir");
 
   AWAIT_READY_FOR(
-      fetcher.get()->fetch(uri, dir, "docker", None()),
+      fetcher.get()->fetch(uri, dir, "docker", None(), None()),
       Seconds(60));
 
   Try<string> _manifest = os::read(path::join(dir, "manifest"));
   ASSERT_SOME(_manifest);
 
-  Try<docker::spec::v2::ImageManifest> manifest =
-      docker::spec::v2::parse(_manifest.get());
+  Try<docker::spec::v2_2::ImageManifest> manifest =
+      docker::spec::v2_2::parse(_manifest.get());
 
   ASSERT_SOME(manifest);
-  EXPECT_EQ(1u, manifest->schemaversion());
-  EXPECT_EQ(TEST_REPOSITORY, manifest->name());
-  EXPECT_EQ("latest", manifest->tag());
+  EXPECT_EQ(2u, manifest->schemaversion());
+  EXPECT_EQ("application/vnd.docker.distribution.manifest.v2+json",
+            manifest->mediatype());
 
-  for (int i = 0; i < manifest->fslayers_size(); i++) {
+  EXPECT_TRUE(os::exists(DockerFetcherPlugin::getBlobPath(
+      dir, manifest->config().digest())));
+
+  for (int i = 0; i < manifest->layers_size(); i++) {
     EXPECT_TRUE(os::exists(
         DockerFetcherPlugin::getBlobPath(
             dir,
-            manifest->fslayers(i).blobsum())));
+            manifest->layers(i).digest())));
   }
 }
+#endif // __WINDOWS__
 
 
 class CopyFetcherPluginTest : public TemporaryDirectoryTest {};
@@ -470,7 +546,7 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(CopyFetcherPluginTest, InvokeFetchByName)
 
   const string dir = path::join(os::getcwd(), "dir");
 
-  AWAIT_READY(fetcher.get()->fetch(uri, dir, "copy", None()));
+  AWAIT_READY(fetcher.get()->fetch(uri, dir, "copy", None(), None()));
 
   // Validate the fetched file's content.
   EXPECT_SOME_EQ("abc", os::read(path::join(dir, "file")));

@@ -27,6 +27,7 @@
 
 #include <mesos/quota/quota.hpp>
 
+#include <mesos/resource_quantities.hpp>
 #include <mesos/resources.hpp>
 
 #include <process/future.hpp>
@@ -38,7 +39,6 @@
 #include <stout/option.hpp>
 #include <stout/try.hpp>
 
-#include "common/resource_quantities.hpp"
 
 namespace mesos {
 namespace allocator {
@@ -60,8 +60,7 @@ struct Options
   Option<DomainInfo> domain = None();
 
   // The minimum allocatable resource quantities, if any.
-  Option<std::vector<mesos::internal::ResourceQuantities>>
-    minAllocatableResources = None();
+  Option<std::vector<ResourceQuantities>> minAllocatableResources = None();
 
   size_t maxCompletedFrameworks = 0;
 
@@ -216,6 +215,11 @@ public:
    * @param used Resources that are allocated on the current agent. The
    *     allocator should avoid double accounting when yet unknown frameworks
    *     are added later in `addFramework()`.
+   *
+   * TODO(asekretenko): Ideally, to get rig of an intermediate allocator state
+   * when some resources are used by nonexistent frameworks, we should change
+   * the interface so that per-agent per-framework used resources and the
+   * not yet known frameworks that are using them are added atomically.
    */
   virtual void addSlave(
       const SlaveID& slaveId,
@@ -374,13 +378,22 @@ public:
     getInverseOfferStatuses() = 0;
 
   /**
+   * This method should be invoked when the offered resources has become
+   * actually allocated.
+   */
+  virtual void transitionOfferedToAllocated(
+      const SlaveID& slaveId, const Resources& resources) = 0;
+
+  /**
    * Recovers resources.
    *
    * Used to update the set of available resources for a specific agent. This
-   * method is invoked to inform the allocator about allocated resources that
-   * have been refused or are no longer in use. Allocated resources will have
-   * an `allocation_info.role` assigned and callers are expected to only call
-   * this with resources allocated to a single role.
+   * method is invoked to inform the allocator about offered resources that
+   * have been refused or allocated (i.e. used for launching tasks) resources
+   * that are no longer in use. The resources will have an
+   * `allocation_info.role` assigned and callers are expected to only call this
+   * with resources allocated to a single role.
+   *
    *
    * TODO(bmahler): We could allow resources allocated to multiple roles
    * within a single call here, but filtering them in the same way does
@@ -390,7 +403,8 @@ public:
       const FrameworkID& frameworkId,
       const SlaveID& slaveId,
       const Resources& resources,
-      const Option<Filters>& filters) = 0;
+      const Option<Filters>& filters,
+      bool isAllocated) = 0;
 
   /**
    * Suppresses offers.
@@ -415,43 +429,17 @@ public:
       const std::set<std::string>& roles) = 0;
 
   /**
-   * Informs the allocator to set quota for the given role.
+   * Informs the allocator to update quota for the given role.
    *
    * It is up to the allocator implementation how to satisfy quota. An
    * implementation may employ different strategies for roles with or
-   * without quota. Hence an empty (or zero) quota is not necessarily the
-   * same as an absence of quota. Logically, this method implies that the
-   * given role should be transitioned to the group of roles with quota
-   * set. An allocator implementation may assert quota for the given role
-   * is not set prior to the call and react accordingly if this assumption
-   * is violated (i.e. fail).
-   *
-   * TODO(alexr): Consider returning a future which an allocator can fail
-   * in order to report failure.
-   *
-   * TODO(alexr): Consider adding an `updateQuota()` method which allows
-   * updating existing quota.
+   * without quota. All roles have a default quota defined as `DEFAULT_QUOTA`.
+   * Currently, it is no guarantees and no limits. Thus to "remove" a quota,
+   * one should simply update the quota to be `DEFAULT_QUOTA`.
    */
-  virtual void setQuota(
+  virtual void updateQuota(
       const std::string& role,
       const Quota& quota) = 0;
-
-  /**
-   * Informs the allocator to remove quota for the given role.
-   *
-   * An allocator implementation may employ different strategies for roles
-   * with or without quota. Hence an empty (or zero) quota is not necessarily
-   * the same as an absence of quota. Logically, this method implies that the
-   * given role should be transitioned to the group of roles without quota
-   * set (absence of quota). An allocator implementation may assert quota
-   * for the given role is set prior to the call and react accordingly if
-   * this assumption is violated (i.e. fail).
-   *
-   * TODO(alexr): Consider returning a future which an allocator can fail in
-   * order to report failure.
-   */
-  virtual void removeQuota(
-      const std::string& role) = 0;
 
   /**
    * Updates the weight associated with one or more roles. If a role

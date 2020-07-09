@@ -144,11 +144,15 @@ public:
               hashmap<FrameworkID, mesos::allocator::InverseOfferStatus>>>
     getInverseOfferStatuses() override;
 
+  void transitionOfferedToAllocated(
+     const SlaveID& slaveId, const Resources& resources) override;
+
   void recoverResources(
       const FrameworkID& frameworkId,
       const SlaveID& slaveId,
       const Resources& resources,
-      const Option<Filters>& filters) override;
+      const Option<Filters>& filters,
+      bool isAllocated) override;
 
   void suppressOffers(
       const FrameworkID& frameworkId,
@@ -158,12 +162,9 @@ public:
       const FrameworkID& frameworkId,
       const std::set<std::string>& roles) override;
 
-  void setQuota(
+  void updateQuota(
       const std::string& role,
       const Quota& quota) override;
-
-  void removeQuota(
-      const std::string& role) override;
 
   void updateWeights(
       const std::vector<WeightInfo>& weightInfos) override;
@@ -291,11 +292,15 @@ public:
               hashmap<FrameworkID, mesos::allocator::InverseOfferStatus>>>
     getInverseOfferStatuses() = 0;
 
+  virtual void transitionOfferedToAllocated(
+      const SlaveID& slaveId, const Resources& resources) = 0;
+
   virtual void recoverResources(
       const FrameworkID& frameworkId,
       const SlaveID& slaveId,
       const Resources& resources,
-      const Option<Filters>& filters) = 0;
+      const Option<Filters>& filters,
+      bool isAllocated) = 0;
 
   virtual void suppressOffers(
       const FrameworkID& frameworkId,
@@ -305,12 +310,9 @@ public:
       const FrameworkID& frameworkId,
       const std::set<std::string>& roles) = 0;
 
-  virtual void setQuota(
+  virtual void updateQuota(
       const std::string& role,
       const Quota& quota) = 0;
-
-  virtual void removeQuota(
-      const std::string& role) = 0;
 
   virtual void updateWeights(
       const std::vector<WeightInfo>& weightInfos) = 0;
@@ -632,13 +634,26 @@ inline process::Future<
       &MesosAllocatorProcess::getInverseOfferStatuses);
 }
 
+template <typename AllocatorProcess>
+inline void MesosAllocator<AllocatorProcess>::transitionOfferedToAllocated(
+    const SlaveID& slaveId,
+    const Resources& resources)
+{
+  process::dispatch(
+      process,
+      &MesosAllocatorProcess::transitionOfferedToAllocated,
+      slaveId,
+      resources);
+}
+
 
 template <typename AllocatorProcess>
 inline void MesosAllocator<AllocatorProcess>::recoverResources(
     const FrameworkID& frameworkId,
     const SlaveID& slaveId,
     const Resources& resources,
-    const Option<Filters>& filters)
+    const Option<Filters>& filters,
+    bool isAllocated)
 {
   process::dispatch(
       process,
@@ -646,7 +661,8 @@ inline void MesosAllocator<AllocatorProcess>::recoverResources(
       frameworkId,
       slaveId,
       resources,
-      filters);
+      filters,
+      isAllocated);
 }
 
 
@@ -677,26 +693,15 @@ inline void MesosAllocator<AllocatorProcess>::reviveOffers(
 
 
 template <typename AllocatorProcess>
-inline void MesosAllocator<AllocatorProcess>::setQuota(
+inline void MesosAllocator<AllocatorProcess>::updateQuota(
     const std::string& role,
     const Quota& quota)
 {
   process::dispatch(
       process,
-      &MesosAllocatorProcess::setQuota,
+      &MesosAllocatorProcess::updateQuota,
       role,
       quota);
-}
-
-
-template <typename AllocatorProcess>
-inline void MesosAllocator<AllocatorProcess>::removeQuota(
-    const std::string& role)
-{
-  process::dispatch(
-      process,
-      &MesosAllocatorProcess::removeQuota,
-      role);
 }
 
 

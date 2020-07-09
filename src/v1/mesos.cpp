@@ -146,6 +146,12 @@ bool operator==(
 }
 
 
+bool operator==(const DrainInfo& left, const DrainInfo& right)
+{
+  return google::protobuf::util::MessageDifferencer::Equals(left, right);
+}
+
+
 bool operator==(
     const Environment::Variable& left,
     const Environment::Variable& right)
@@ -661,6 +667,36 @@ ostream& operator<<(ostream& stream, const TaskStatus& status)
   if (status.has_healthy()) {
     stream << " in health state "
            << (status.healthy() ? "healthy" : "unhealthy");
+  }
+
+  return stream;
+}
+
+
+ostream& operator<<(ostream& stream, const OperationStatus& status)
+{
+  stream << status.state();
+
+  if (status.has_uuid()) {
+    stream << " (Status UUID: "
+           << stringify(id::UUID::fromBytes(status.uuid().value()).get())
+           << ")";
+  }
+
+  if (status.has_message()) {
+    stream << " Message: '" << status.message() << "'";
+  }
+
+  if (status.has_operation_id()) {
+    stream << " for operation '" << status.operation_id() << "'";
+  }
+
+  if (status.has_agent_id()) {
+    stream << " on agent: " << status.agent_id() << "";
+  }
+
+  if (status.has_resource_provider_id()) {
+    stream << " on resource provider: " << status.resource_provider_id() << "";
   }
 
   return stream;

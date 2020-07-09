@@ -22,6 +22,7 @@
 #include <list>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <mesos/attributes.hpp>
@@ -128,6 +129,10 @@ public:
         mesos::slave::QoSController* qosController,
         mesos::SecretGenerator* secretGenerator,
         VolumeGidManager* volumeGidManager,
+        PendingFutureTracker* futureTracker,
+#ifndef __WINDOWS__
+        const Option<process::network::unix::Socket>& executorSocket,
+#endif // __WINDOWS__
         const Option<Authorizer*>& authorizer);
 
   ~Slave() override;
@@ -153,6 +158,9 @@ public:
       const process::UPID& from,
       RunTaskMessage&& runTaskMessage);
 
+  Option<Error> validateResourceLimitsAndIsolators(
+      const std::vector<TaskInfo>& tasks);
+
   // Made 'virtual' for Slave mocking.
   virtual void runTask(
       const process::UPID& from,
@@ -170,7 +178,8 @@ public:
       Option<TaskGroupInfo> taskGroup,
       const std::vector<ResourceVersionUUID>& resourceVersionUuids,
       const process::UPID& pid,
-      const Option<bool>& launchExecutor);
+      const Option<bool>& launchExecutor,
+      bool executorGeneratedForCommandTask);
 
   // Made 'virtual' for Slave mocking.
   //
@@ -194,7 +203,8 @@ public:
       const Option<TaskInfo>& task,
       const Option<TaskGroupInfo>& taskGroup,
       const std::vector<ResourceVersionUUID>& resourceVersionUuids,
-      const Option<bool>& launchExecutor);
+      const Option<bool>& launchExecutor,
+      bool executorGeneratedForCommandTask);
 
   // This is called when the resource limits of the container have
   // been updated for the given tasks and task groups. If the update is
@@ -225,10 +235,27 @@ public:
       const std::vector<ResourceVersionUUID>& resourceVersionUuids,
       const Option<bool>& launchExecutor);
 
-  // Made 'virtual' for Slave mocking.
+  // Handler for the `KillTaskMessage`. Made 'virtual' for Slave mocking.
   virtual void killTask(
       const process::UPID& from,
       const KillTaskMessage& killTaskMessage);
+
+  // Helper to kill a pending task, which may or may not be associated with a
+  // valid `Executor` struct.
+  void killPendingTask(
+      const FrameworkID& frameworkId,
+      Framework* framework,
+      const TaskID& taskId);
+
+  // Helper to kill a task belonging to a valid framework and executor. This
+  // function should be used to kill tasks which are queued or launched, but
+  // not tasks which are pending.
+  void kill(
+      const FrameworkID& frameworkId,
+      Framework* framework,
+      Executor* executor,
+      const TaskID& taskId,
+      const Option<KillPolicy>& killPolicy);
 
   // Made 'virtual' for Slave mocking.
   virtual void shutdownExecutor(
@@ -267,7 +294,8 @@ public:
   void checkpointResourcesMessage(
       const std::vector<Resource>& resources);
 
-  void applyOperation(const ApplyOperationMessage& message);
+  // Made 'virtual' for Slave mocking.
+  virtual void applyOperation(const ApplyOperationMessage& message);
 
   // Reconciles pending operations with the master. This is necessary to handle
   // cases in which operations were dropped in transit, or in which an agent's
@@ -374,6 +402,10 @@ public:
       const process::UPID& from,
       const AcknowledgeOperationStatusMessage& acknowledgement);
 
+  void drain(
+      const process::UPID& from,
+      DrainSlaveMessage&& drainSlaveMessage);
+
   void executorLaunched(
       const FrameworkID& frameworkId,
       const ExecutorID& executorId,
@@ -433,16 +465,21 @@ public:
   void finalize() override;
   void exited(const process::UPID& pid) override;
 
-  process::Future<Secret> generateSecret(
+  // Generates a secret for executor authentication. Returns None if there is
+  // no secret generator.
+  process::Future<Option<Secret>> generateSecret(
       const FrameworkID& frameworkId,
       const ExecutorID& executorId,
       const ContainerID& containerId);
 
-  // If an executor is launched for a task group, `taskInfo` would not be set.
+  // `executorInfo` is a mutated executor info with some default fields and
+  // resources. If an executor is launched for a task group, `taskInfo` would
+  // not be set.
   void launchExecutor(
-      const Option<process::Future<Secret>>& future,
+      const process::Future<Option<Secret>>& authorizationToken,
       const FrameworkID& frameworkId,
-      const ExecutorID& executorId,
+      const ExecutorInfo& executorInfo,
+      const google::protobuf::Map<std::string, Value::Scalar>& executorLimits,
       const Option<TaskInfo>& taskInfo);
 
   void fileAttached(const process::Future<Nothing>& result,
@@ -745,6 +782,14 @@ private:
       const Flags& flags,
       const SlaveID& slaveId);
 
+  // This function is used to compute limits for executors before they
+  // are launched as well as when updating running executors, so we must
+  // accept both `TaskInfo` and `Task` types to handle both cases.
+  google::protobuf::Map<std::string, Value::Scalar> computeExecutorLimits(
+      const Resources& executorResources,
+      const std::vector<TaskInfo>& taskInfos,
+      const std::vector<Task*>& tasks = {}) const;
+
   protobuf::master::Capabilities requiredMasterCapabilities;
 
   const Flags flags;
@@ -841,6 +886,14 @@ private:
 
   VolumeGidManager* volumeGidManager;
 
+  PendingFutureTracker* futureTracker;
+
+#ifndef __WINDOWS__
+  Option<process::network::unix::Socket> executorSocket;
+#endif // __WINDOWS__
+
+  Option<process::http::Server> executorSocketServer;
+
   const Option<Authorizer*> authorizer;
 
   // The most recent estimate of the total amount of oversubscribed
@@ -872,8 +925,25 @@ private:
   // provider.
   hashmap<UUID, Operation*> operations;
 
+  // Maps framework-supplied operation IDs to the operation's internal UUID.
+  // This is used to satisfy some reconciliation requests which are forwarded
+  // from the master to the agent.
+  hashmap<std::pair<FrameworkID, OperationID>, UUID> operationIds;
+
   // Operations that are checkpointed by the agent.
   hashmap<UUID, Operation> checkpointedOperations;
+
+  // If the agent is currently draining, contains the configuration used to
+  // drain the agent. If NONE, the agent is not currently draining.
+  Option<DrainConfig> drainConfig;
+
+  // Time when this agent was last asked to drain. This field
+  // is empty if the agent is not currently draining.
+  Option<process::Time> estimatedDrainStartTime;
+
+  // Check whether draining is finished and possibly remove
+  // both in-memory and persisted drain configuration.
+  void updateDrainStatus();
 };
 
 
@@ -891,7 +961,8 @@ public:
       const ContainerID& containerId,
       const std::string& directory,
       const Option<std::string>& user,
-      bool checkpoint);
+      bool checkpoint,
+      bool isGeneratedForCommandTask);
 
   ~Executor();
 
@@ -907,6 +978,9 @@ public:
   void checkpointTask(const Task& task);
 
   void recoverTask(const state::TaskState& state, bool recheckpointTask);
+
+  void addPendingTaskStatus(const TaskStatus& status);
+  void removePendingTaskStatus(const TaskStatus& status);
 
   Try<Nothing> updateTaskState(const TaskStatus& status);
 
@@ -1052,6 +1126,9 @@ public:
   // non-terminal tasks.
   Option<mesos::slave::ContainerTermination> pendingTermination;
 
+  // Task status updates that are being processed by the agent.
+  hashmap<TaskID, LinkedHashMap<id::UUID, TaskStatus>> pendingStatusUpdates;
+
 private:
   Executor(const Executor&) = delete;
   Executor& operator=(const Executor&) = delete;
@@ -1085,7 +1162,10 @@ public:
 
   const FrameworkID id() const { return info.id(); }
 
-  Try<Executor*> addExecutor(const ExecutorInfo& executorInfo);
+  Try<Executor*> addExecutor(
+    const ExecutorInfo& executorInfo,
+    bool isGeneratedForCommandTask);
+
   Executor* getExecutor(const ExecutorID& executorId) const;
   Executor* getExecutor(const TaskID& taskId) const;
 

@@ -118,23 +118,15 @@ TEST(MasterCallValidationTest, UpdateQuota)
   EXPECT_TRUE(strings::contains(error->message, "Invalid 'QuotaConfig.role'"))
     << error->message;
 
-  config.set_role("*");
-
-  error = mesos::internal::master::quota::validate(config);
-  ASSERT_SOME(error);
-  EXPECT_TRUE(strings::contains(
-      error->message,
-      "Invalid 'QuotaConfig.role':"
-      " setting quota for the default '*' role is not supported"))
-    << error->message;
-
   // Once a role is set, it is valid to have no guarantee and no limit.
   config.set_role("role");
-
   error = mesos::internal::master::quota::validate(config);
   ASSERT_NONE(error);
 
-  // Now test the guarantees <= limits validation.
+  // Setting quota on "*" role is allowed.
+  config.set_role("*");
+  error = mesos::internal::master::quota::validate(config);
+  ASSERT_NONE(error);
 
   auto resourceMap = [](const vector<pair<string, double>>& vector)
     -> Map<string, Value::Scalar> {
@@ -148,6 +140,85 @@ TEST(MasterCallValidationTest, UpdateQuota)
 
     return result;
   };
+
+  // The quota endpoint only allows memory / disk up to
+  // 1 exabyte (in megabytes) or 1 trillion cores/ports/other.
+  double largestMegabytes = 1024.0 * 1024.0 * 1024.0 * 1024.0;
+  double largestCpuPortsOrOther = 1000.0 * 1000.0 * 1000.0 * 1000.0;
+
+  *config.mutable_guarantees() = resourceMap({
+    {"disk", largestMegabytes},
+    {"mem", largestMegabytes},
+    {"cpus", largestCpuPortsOrOther},
+    {"ports", largestCpuPortsOrOther},
+    {"foobars", largestCpuPortsOrOther}
+  });
+  *config.mutable_limits() = resourceMap({
+    {"disk", largestMegabytes},
+    {"mem", largestMegabytes},
+    {"cpus", largestCpuPortsOrOther},
+    {"ports", largestCpuPortsOrOther},
+    {"foobars", largestCpuPortsOrOther},
+  });
+
+  error = mesos::internal::master::quota::validate(config);
+  EXPECT_NONE(error)
+    << error->message;
+
+  config.clear_guarantees();
+  *config.mutable_limits() = resourceMap({{"disk", largestMegabytes + 1.0}});
+
+  error = mesos::internal::master::quota::validate(config);
+  ASSERT_SOME(error);
+  EXPECT_TRUE(strings::contains(
+      error->message,
+      "values greater than 1 exabyte (1099511627776) are not supported"))
+    << error->message;
+
+  config.clear_guarantees();
+  *config.mutable_limits() = resourceMap({{"mem", largestMegabytes + 1.0}});
+
+  error = mesos::internal::master::quota::validate(config);
+  ASSERT_SOME(error);
+  EXPECT_TRUE(strings::contains(
+      error->message,
+      "values greater than 1 exabyte (1099511627776) are not supported"))
+    << error->message;
+
+  config.clear_limits();
+  *config.mutable_guarantees() = resourceMap({
+    {"cpus", largestCpuPortsOrOther + 1.0}});
+
+  error = mesos::internal::master::quota::validate(config);
+  ASSERT_SOME(error);
+  EXPECT_TRUE(strings::contains(
+      error->message,
+      "values greater than 1 trillion (1000000000000) are not supported"))
+    << error->message;
+
+  config.clear_limits();
+  *config.mutable_guarantees() = resourceMap({
+    {"ports", largestCpuPortsOrOther + 1.0}});
+
+  error = mesos::internal::master::quota::validate(config);
+  ASSERT_SOME(error);
+  EXPECT_TRUE(strings::contains(
+      error->message,
+      "values greater than 1 trillion (1000000000000) are not supported"))
+    << error->message;
+
+  config.clear_limits();
+  *config.mutable_guarantees() = resourceMap({
+    {"foobars", largestCpuPortsOrOther + 1.0}});
+
+  error = mesos::internal::master::quota::validate(config);
+  ASSERT_SOME(error);
+  EXPECT_TRUE(strings::contains(
+      error->message,
+      "values greater than 1 trillion (1000000000000) are not supported"))
+    << error->message;
+
+  // Now test the guarantees <= limits validation.
 
   // Guarantees > limits.
   Map<string, Value::Scalar> superset =
@@ -441,6 +512,88 @@ TEST_F(ResourceValidationTest, SingleResourceProvider)
         error->message,
         "Some resources have a resource provider and some do not"));
   }
+}
+
+
+// Unit test for the `resource::detectOverlappingSetAndRangeResources()` helper
+// function. This function should return `true` when it receives two or more
+// `Resources` objects which contain overlapping sets or ranges.
+TEST_F(ResourceValidationTest, OverlappingSetsAndRanges)
+{
+  // An empty vector, which cannot overlap.
+  EXPECT_FALSE(resource::detectOverlappingSetAndRangeResources({}));
+
+  // One group of resources containing a set, which cannot overlap.
+  EXPECT_FALSE(
+      resource::detectOverlappingSetAndRangeResources(
+          {CHECK_NOTERROR(Resources::parse("zones:{a,b,c}"))}));
+
+  // Two groups of resources with non-overlapping ranges.
+  EXPECT_FALSE(
+      resource::detectOverlappingSetAndRangeResources({
+          CHECK_NOTERROR(Resources::parse("ports:[5555-5556]")),
+          CHECK_NOTERROR(Resources::parse("ports:[5557-5558]"))
+      }));
+
+  // Two groups of resources with identical ranges.
+  EXPECT_TRUE(
+      resource::detectOverlappingSetAndRangeResources({
+          CHECK_NOTERROR(Resources::parse("ports:[5555-5556]")),
+          CHECK_NOTERROR(Resources::parse("ports:[5555-5556]"))
+      }));
+
+  // Two groups of resources with overlapping ranges.
+  EXPECT_TRUE(
+      resource::detectOverlappingSetAndRangeResources({
+          CHECK_NOTERROR(Resources::parse("ports:[5555-5557]")),
+          CHECK_NOTERROR(Resources::parse("ports:[5556-5558]"))
+      }));
+
+  // Three groups of resources, two of which have overlapping ranges.
+  EXPECT_TRUE(
+      resource::detectOverlappingSetAndRangeResources({
+          CHECK_NOTERROR(Resources::parse("ports:[5555-5557]")),
+          CHECK_NOTERROR(Resources::parse("ports:[5558-5559]")),
+          CHECK_NOTERROR(Resources::parse("ports:[5559-5560]"))
+      }));
+
+  // Two groups of resources with overlapping ranges
+  // and other scalar resources.
+  EXPECT_TRUE(
+      resource::detectOverlappingSetAndRangeResources({
+          CHECK_NOTERROR(Resources::parse("cpus:0.1;mem:32;ports:[5555-5557]")),
+          CHECK_NOTERROR(
+              Resources::parse("cpus:1.0;mem:2048;disk:4096;ports:[5556-5558]"))
+      }));
+
+  // Two groups of resources with non-overlapping sets.
+  EXPECT_FALSE(
+      resource::detectOverlappingSetAndRangeResources({
+          CHECK_NOTERROR(Resources::parse("zones:{a,b}")),
+          CHECK_NOTERROR(Resources::parse("zones:{c,d}"))
+      }));
+
+  // Two groups of resources with identical sets.
+  EXPECT_TRUE(
+      resource::detectOverlappingSetAndRangeResources({
+          CHECK_NOTERROR(Resources::parse("zones:{a,b}")),
+          CHECK_NOTERROR(Resources::parse("zones:{a,b}"))
+      }));
+
+  // Two groups of resources with overlapping sets.
+  EXPECT_TRUE(
+      resource::detectOverlappingSetAndRangeResources({
+          CHECK_NOTERROR(Resources::parse("zones:{a,b,c}")),
+          CHECK_NOTERROR(Resources::parse("zones:{c,d,e}"))
+      }));
+
+  // Three groups of resources, two of which have overlapping sets.
+  EXPECT_TRUE(
+      resource::detectOverlappingSetAndRangeResources({
+          CHECK_NOTERROR(Resources::parse("zones:{a,b,c}")),
+          CHECK_NOTERROR(Resources::parse("zones:{d,e,f}")),
+          CHECK_NOTERROR(Resources::parse("zones:{g,h,a}"))
+      }));
 }
 
 
@@ -1474,39 +1627,6 @@ TEST_F(DestroyOperationValidationTest, SharedPersistentVolumeInUse)
 }
 
 
-// This test verifies that DESTROY for shared persistent volumes is valid
-// when the volumes are not assigned to any pending task.
-TEST_F(DestroyOperationValidationTest, SharedPersistentVolumeInPendingTasks)
-{
-  Resource cpus = Resources::parse("cpus", "1", "*").get();
-  Resource mem = Resources::parse("mem", "5", "*").get();
-  Resource sharedDisk = createDiskResource(
-      "50", "role1", "1", "path1", None(), true); // Shared.
-
-  SlaveID slaveId;
-  slaveId.set_value("S1");
-
-  // Add a task using shared volume as pending tasks.
-  TaskInfo task = createTask(slaveId, sharedDisk, "sleep 1000");
-
-  hashmap<FrameworkID, hashmap<TaskID, TaskInfo>> pendingTasks;
-  FrameworkID frameworkId1;
-  frameworkId1.set_value("id1");
-  pendingTasks[frameworkId1] = {{task.task_id(), task}};
-
-  // Destroy `sharedDisk` which is assigned to `task`.
-  Offer::Operation::Destroy destroy;
-  destroy.add_volumes()->CopyFrom(sharedDisk);
-
-  EXPECT_SOME(operation::validate(destroy, sharedDisk, {}, pendingTasks));
-
-  // Remove all pending tasks.
-  pendingTasks.clear();
-
-  EXPECT_NONE(operation::validate(destroy, sharedDisk, {}, pendingTasks));
-}
-
-
 TEST_F(DestroyOperationValidationTest, UnknownPersistentVolume)
 {
   Resource volume = Resources::parse("disk", "128", "role1").get();
@@ -1974,24 +2094,37 @@ TEST(OperationValidationTest, CreateDisk)
 TEST(OperationValidationTest, DestroyDisk)
 {
   Resource disk1 = createDiskResource(
-      "10", "*", None(), None(), createDiskSourceMount());
+      "10", "*", None(), None(), createDiskSourceMount(None(), "volume1"));
 
   Resource disk2 = createDiskResource(
-      "20", "*", None(), None(), createDiskSourceBlock());
+      "20", "*", None(), None(), createDiskSourceBlock("volume2"));
 
   Resource disk3 = createDiskResource(
-      "30", "*", None(), None(), createDiskSourcePath());
+      "40", "*", None(), None(), createDiskSourceRaw("volume3"));
 
   Resource disk4 = createDiskResource(
-      "40", "*", None(), None(), createDiskSourceMount());
+      "40", "*", None(), None(), createDiskSourcePath("volume4"));
 
-  Resource disk5 = createPersistentVolume(
-      Megabytes(50), "role", "id", "path", None(), createDiskSourceMount());
+  Resource disk5 = createDiskResource(
+      "50", "*", None(), None(), createDiskSourceMount(None(), "volume5"));
+
+  Resource disk6 = createDiskResource(
+      "60", "*", None(), None(), createDiskSourceRaw(None(), "profile"));
+
+  Resource disk7 = createPersistentVolume(
+      Megabytes(70),
+      "role",
+      "id",
+      "path",
+      None(),
+      createDiskSourceMount(None(), "volume7"));
 
   disk1.mutable_provider_id()->set_value("provider1");
   disk2.mutable_provider_id()->set_value("provider2");
   disk3.mutable_provider_id()->set_value("provider3");
-  disk5.mutable_provider_id()->set_value("provider5");
+  disk4.mutable_provider_id()->set_value("provider4");
+  disk6.mutable_provider_id()->set_value("provider6");
+  disk7.mutable_provider_id()->set_value("provider7");
 
   Offer::Operation::DestroyDisk destroyDisk;
   destroyDisk.mutable_source()->CopyFrom(disk1);
@@ -2007,10 +2140,7 @@ TEST(OperationValidationTest, DestroyDisk)
   destroyDisk.mutable_source()->CopyFrom(disk3);
 
   error = operation::validate(destroyDisk);
-  ASSERT_SOME(error);
-  EXPECT_TRUE(strings::contains(
-      error->message,
-      "'source' is neither a MOUNT or BLOCK disk resource"));
+  EXPECT_NONE(error);
 
   destroyDisk.mutable_source()->CopyFrom(disk4);
 
@@ -2018,9 +2148,25 @@ TEST(OperationValidationTest, DestroyDisk)
   ASSERT_SOME(error);
   EXPECT_TRUE(strings::contains(
       error->message,
-      "'source' is not managed by a resource provider"));
+      "'source' is neither a MOUNT, BLOCK or RAW disk resource"));
 
   destroyDisk.mutable_source()->CopyFrom(disk5);
+
+  error = operation::validate(destroyDisk);
+  ASSERT_SOME(error);
+  EXPECT_TRUE(strings::contains(
+      error->message,
+      "'source' is not managed by a resource provider"));
+
+  destroyDisk.mutable_source()->CopyFrom(disk6);
+
+  error = operation::validate(destroyDisk);
+  ASSERT_SOME(error);
+  EXPECT_TRUE(strings::contains(
+      error->message,
+      "'source' is not backed by a CSI volume"));
+
+  destroyDisk.mutable_source()->CopyFrom(disk7);
 
   error = operation::validate(destroyDisk);
   ASSERT_SOME(error);
@@ -3233,7 +3379,9 @@ TEST_F(TaskValidationTest, TaskMissingDockerInfo)
 
 // This test verifies that a task that has `ContainerInfo` set as MESOS
 // but has a `DockerInfo` is rejected during `TaskInfo` validation.
-TEST_F(TaskValidationTest, TaskMesosTypeWithDockerInfo)
+// TODO(josephw): Enable this regression test when we officially deprecate
+// this invalid protobuf. See MESOS-6874 and MESOS-9740.
+TEST_F(TaskValidationTest, DISABLED_TaskMesosTypeWithDockerInfo)
 {
   Try<Owned<cluster::Master>> master = StartMaster();
   ASSERT_SOME(master);
@@ -3333,6 +3481,214 @@ TEST_F(TaskValidationTest, TaskSettingDockerParameterName)
       "Task's `ContainerInfo` is invalid: "
       "Parameter in DockerInfo must not be 'name'",
       status->message());
+
+  driver.stop();
+  driver.join();
+}
+
+
+TEST_F(TaskValidationTest, ResourceLimitLessThanRequest)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get());
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(&driver, _, _));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->empty());
+
+  Future<TaskStatus> status;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&status));
+
+  Map<string, Value::Scalar> limits;
+  limits["cpus"].set_value(0.01);
+
+  TaskInfo task = createTask(
+      offers->at(0),
+      "exit 0",
+      None(),
+      "test-task",
+      id::UUID::random().toString(),
+      limits);
+
+  driver.launchTasks(offers->at(0).id(), {task});
+
+  AWAIT_READY(status);
+  EXPECT_EQ(TASK_ERROR, status->state());
+  EXPECT_TRUE(strings::contains(
+      status->message(),
+      "The cpu limit must be greater than or equal to the cpu request"));
+
+  driver.stop();
+  driver.join();
+}
+
+
+TEST_F(TaskValidationTest, LimitOtherThanCpuOrMem)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get());
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(&driver, _, _));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->empty());
+
+  Future<TaskStatus> status;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&status));
+
+  Map<string, Value::Scalar> limits;
+  limits["disk"].set_value(128);
+
+  TaskInfo task = createTask(
+      offers->at(0),
+      "exit 0",
+      None(),
+      "test-task",
+      id::UUID::random().toString(),
+      limits);
+
+  driver.launchTasks(offers->at(0).id(), {task});
+
+  AWAIT_READY(status);
+  EXPECT_EQ(TASK_ERROR, status->state());
+  EXPECT_TRUE(strings::contains(
+      status->message(),
+      "Only cpus and mem may be included in a task's resource limits"));
+
+  driver.stop();
+  driver.join();
+}
+
+
+TEST_F(TaskValidationTest, NestedCgroupInLaunchOperation)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get());
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(&driver, _, _));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->empty());
+
+  Future<TaskStatus> status;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&status));
+
+  TaskInfo task = createTask(offers->at(0), "exit 0");
+
+  task.mutable_container()->set_type(ContainerInfo::MESOS);
+  task.mutable_container()->mutable_linux_info()->set_share_cgroups(false);
+
+  driver.launchTasks(offers->at(0).id(), {task});
+
+  AWAIT_READY(status);
+  EXPECT_EQ(TASK_ERROR, status->state());
+  EXPECT_TRUE(strings::contains(
+      status->message(),
+      "Only tasks in a task group may have 'share_cgroups' set to 'false'"));
+
+  driver.stop();
+  driver.join();
+}
+
+
+TEST_F(TaskValidationTest, SharedCgroupOnExecutor)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get());
+  ASSERT_SOME(slave);
+
+  FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, frameworkInfo, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(&driver, _, _));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->empty());
+
+  const Offer& offer = offers->at(0);
+
+  Future<TaskStatus> status;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&status));
+
+  ExecutorID executorId;
+  executorId.set_value("test-executor");
+
+  TaskInfo task = createTask(offer, "exit 0", executorId);
+  task.mutable_executor()->mutable_container()->set_type(ContainerInfo::MESOS);
+  task.mutable_executor()->mutable_container()
+    ->mutable_linux_info()->set_share_cgroups(true);
+
+  driver.launchTasks(offer.id(), {task});
+
+  AWAIT_READY(status);
+  EXPECT_EQ(TASK_ERROR, status->state());
+  EXPECT_TRUE(strings::contains(
+      status->message(),
+      "The 'share_cgroups' field cannot be set to 'true' on "
+      "executor containers"));
 
   driver.stop();
   driver.join();
@@ -3439,21 +3795,6 @@ TEST_F(ExecutorValidationTest, ExecutorType)
         error->message,
         "'ExecutorInfo.container.mesos.image' must not be set for "
         "'DEFAULT' executor"));
-  }
-  {
-    // Invalid protobuf union in ContainerInfo.
-    executorInfo.set_type(ExecutorInfo::CUSTOM);
-    executorInfo.mutable_command();
-    executorInfo.mutable_container()->set_type(ContainerInfo::DOCKER);
-    executorInfo.mutable_container()->mutable_mesos();
-
-    Option<Error> error = ::executor::internal::validateType(executorInfo);
-
-    EXPECT_SOME(error);
-    EXPECT_TRUE(strings::contains(
-      error->message,
-      "Protobuf union `mesos.ContainerInfo` with `Type == DOCKER` "
-      "should not have the field `mesos` set."));
   }
 }
 
@@ -4506,6 +4847,583 @@ TEST_F(TaskGroupValidationTest, TaskEnvironmentInvalid)
 }
 
 
+TEST_F(TaskGroupValidationTest, ResourceLimits)
+{
+  Clock::pause();
+
+  master::Flags masterFlags = CreateMasterFlags();
+  Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
+  ASSERT_SOME(master);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get());
+  ASSERT_SOME(slave);
+
+  FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, frameworkInfo, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(&driver, _, _));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers));
+
+  driver.start();
+
+  Clock::advance(masterFlags.allocation_interval);
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->empty());
+
+  const Offer& offer = offers->at(0);
+
+  const SlaveID slaveId = offer.slave_id();
+  frameworkInfo.mutable_id()->CopyFrom(offer.framework_id());
+
+  TaskInfo task1 = createTask(
+      slaveId,
+      Resources::parse("cpus:0.5;mem:32").get(),
+      "exit 0",
+      None(),
+      "test-task-1",
+      id::UUID::random().toString());
+
+  TaskInfo task2 = createTask(
+      slaveId,
+      Resources::parse("cpus:0.5;mem:32").get(),
+      "exit 0",
+      None(),
+      "test-task-2",
+      id::UUID::random().toString());
+
+  Value::Scalar cpuLimit;
+  cpuLimit.set_value(1);
+  (*task1.mutable_limits())["cpus"] = cpuLimit;
+  (*task2.mutable_limits())["cpus"] = cpuLimit;
+
+  Value::Scalar validMemLimit;
+  validMemLimit.set_value(64);
+  (*task1.mutable_limits())["mem"] = validMemLimit;
+
+  Value::Scalar invalidMemLimit;
+  invalidMemLimit.set_value(16);
+  (*task2.mutable_limits())["mem"] = invalidMemLimit;
+
+  ContainerInfo containerInfo;
+  containerInfo.set_type(ContainerInfo::MESOS);
+  containerInfo.mutable_linux_info()->set_share_cgroups(false);
+
+  task1.mutable_container()->CopyFrom(containerInfo);
+  task2.mutable_container()->CopyFrom(containerInfo);
+
+  ExecutorInfo executor = createExecutorInfo(
+      "test-executor",
+      None(),
+      Resources::parse("cpus:0.5;mem:32;disk:128").get(),
+      ExecutorInfo::DEFAULT,
+      frameworkInfo.id());
+
+  // Use short filters so that resources are re-offered.
+  Filters filters;
+  filters.set_refuse_seconds(0);
+
+  // Error: A memory limit less than the memory request.
+  {
+    TaskGroupInfo taskGroup;
+    taskGroup.add_tasks()->CopyFrom(task1);
+    taskGroup.add_tasks()->CopyFrom(task2);
+
+    Offer::Operation operation;
+    operation.set_type(Offer::Operation::LAUNCH_GROUP);
+
+    Offer::Operation::LaunchGroup* launchGroup =
+      operation.mutable_launch_group();
+
+    launchGroup->mutable_executor()->CopyFrom(executor);
+    launchGroup->mutable_task_group()->CopyFrom(taskGroup);
+
+    Future<TaskStatus> task1Status;
+    Future<TaskStatus> task2Status;
+    EXPECT_CALL(sched, statusUpdate(&driver, _))
+      .WillOnce(FutureArg<1>(&task1Status))
+      .WillOnce(FutureArg<1>(&task2Status));
+
+    driver.acceptOffers({offers->at(0).id()}, {operation}, filters);
+
+    AWAIT_READY(task1Status);
+    EXPECT_EQ(TASK_ERROR, task1Status->state());
+    EXPECT_EQ(TaskStatus::REASON_TASK_GROUP_INVALID, task1Status->reason());
+    EXPECT_TRUE(strings::contains(
+          task1Status->message(),
+          "memory limit must be greater"));
+
+    AWAIT_READY(task2Status);
+    EXPECT_EQ(TASK_ERROR, task2Status->state());
+    EXPECT_EQ(TaskStatus::REASON_TASK_GROUP_INVALID, task2Status->reason());
+    EXPECT_TRUE(strings::contains(
+          task2Status->message(),
+          "memory limit must be greater"));
+  }
+
+  (*task2.mutable_limits())["mem"] = validMemLimit;
+
+  containerInfo.mutable_linux_info()->set_share_cgroups(true);
+
+  task2.mutable_container()->CopyFrom(containerInfo);
+
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers));
+
+  Clock::advance(masterFlags.allocation_interval);
+  Clock::settle();
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->empty());
+
+  // Error: limits set when 'share_cgroups' is 'true'.
+  {
+    TaskGroupInfo taskGroup;
+    taskGroup.add_tasks()->CopyFrom(task1);
+    taskGroup.add_tasks()->CopyFrom(task2);
+
+    Offer::Operation operation;
+    operation.set_type(Offer::Operation::LAUNCH_GROUP);
+
+    Offer::Operation::LaunchGroup* launchGroup =
+      operation.mutable_launch_group();
+
+    launchGroup->mutable_executor()->CopyFrom(executor);
+    launchGroup->mutable_task_group()->CopyFrom(taskGroup);
+
+    Future<TaskStatus> task1Status;
+    Future<TaskStatus> task2Status;
+    EXPECT_CALL(sched, statusUpdate(&driver, _))
+      .WillOnce(FutureArg<1>(&task1Status))
+      .WillOnce(FutureArg<1>(&task2Status));
+
+    driver.acceptOffers({offers->at(0).id()}, {operation}, filters);
+
+    AWAIT_READY(task1Status);
+    EXPECT_EQ(TASK_ERROR, task1Status->state());
+    EXPECT_EQ(TaskStatus::REASON_TASK_GROUP_INVALID, task1Status->reason());
+    EXPECT_TRUE(strings::contains(
+          task1Status->message(),
+          "Resource limits may only be set for tasks within a task group when "
+          "the 'share_cgroups' field is set to 'false'."));
+
+    AWAIT_READY(task2Status);
+    EXPECT_EQ(TASK_ERROR, task2Status->state());
+    EXPECT_EQ(TaskStatus::REASON_TASK_GROUP_INVALID, task2Status->reason());
+    EXPECT_TRUE(strings::contains(
+          task2Status->message(),
+          "Resource limits may only be set for tasks within a task group when "
+          "the 'share_cgroups' field is set to 'false'."));
+  }
+
+  containerInfo.mutable_linux_info()->set_share_cgroups(false);
+
+  task2.mutable_container()->CopyFrom(containerInfo);
+
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers));
+
+  Clock::advance(masterFlags.allocation_interval);
+  Clock::settle();
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->empty());
+
+  // Erase the memory limit so we can be sure what error message to look for
+  // in the next test case.
+  task1.mutable_limits()->erase("mem");
+  task2.mutable_limits()->erase("mem");
+
+  // Error: the agent does not have any isolators loaded, so it can't enforce
+  // resource limits and does not launch the task group.
+  {
+    TaskGroupInfo taskGroup;
+    taskGroup.add_tasks()->CopyFrom(task1);
+    taskGroup.add_tasks()->CopyFrom(task2);
+
+    Offer::Operation operation;
+    operation.set_type(Offer::Operation::LAUNCH_GROUP);
+
+    Offer::Operation::LaunchGroup* launchGroup =
+      operation.mutable_launch_group();
+
+    launchGroup->mutable_executor()->CopyFrom(executor);
+    launchGroup->mutable_task_group()->CopyFrom(taskGroup);
+
+    Future<TaskStatus> task1Status;
+    Future<TaskStatus> task2Status;
+    EXPECT_CALL(sched, statusUpdate(&driver, _))
+      .WillOnce(FutureArg<1>(&task1Status))
+      .WillOnce(FutureArg<1>(&task2Status))
+      .WillRepeatedly(Return()); // Ignore subsequent updates.
+
+    driver.acceptOffers({offers->at(0).id()}, {operation}, filters);
+
+    AWAIT_READY(task1Status);
+    EXPECT_EQ(TASK_LOST, task1Status->state());
+    EXPECT_EQ(
+        "CPU limits can only be set on tasks launched in Mesos containers"
+        " when the agent has loaded the 'cgroups/cpu' isolator",
+        task1Status->message());
+
+    AWAIT_READY(task2Status);
+    EXPECT_EQ(TASK_LOST, task2Status->state());
+    EXPECT_EQ(
+        "CPU limits can only be set on tasks launched in Mesos containers"
+        " when the agent has loaded the 'cgroups/cpu' isolator",
+        task2Status->message());
+  }
+}
+
+
+TEST_F(TaskGroupValidationTest, ShareCgroup)
+{
+  Clock::pause();
+
+  master::Flags masterFlags = CreateMasterFlags();
+  Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
+  ASSERT_SOME(master);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get());
+  ASSERT_SOME(slave);
+
+  FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, frameworkInfo, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(&driver, _, _));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers));
+
+  driver.start();
+
+  Clock::advance(masterFlags.allocation_interval);
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->empty());
+
+  const SlaveID slaveId = offers->at(0).slave_id();
+  frameworkInfo.mutable_id()->CopyFrom(offers->at(0).framework_id());
+
+  TaskInfo task1 = createTask(
+      slaveId,
+      Resources::parse("cpus:0.1;mem:32").get(),
+      "exit 0",
+      None(),
+      "test-task-1",
+      id::UUID::random().toString());
+
+  TaskInfo task2 = createTask(
+      slaveId,
+      Resources::parse("cpus:0.1;mem:32").get(),
+      "exit 0",
+      None(),
+      "test-task-2",
+      id::UUID::random().toString());
+
+  ContainerInfo containerInfoNestedCgroups;
+  containerInfoNestedCgroups.set_type(ContainerInfo::MESOS);
+  containerInfoNestedCgroups.mutable_linux_info()->set_share_cgroups(false);
+
+  task2.mutable_container()->CopyFrom(containerInfoNestedCgroups);
+
+  ExecutorInfo executor = createExecutorInfo(
+      "test-executor",
+      None(),
+      Resources::parse("cpus:0.5;mem:32;disk:128").get(),
+      ExecutorInfo::DEFAULT,
+      frameworkInfo.id());
+
+  // Use short filters so that resources are re-offered.
+  Filters filters;
+  filters.set_refuse_seconds(0);
+
+  // Error: One task with 'share_cgroups==false', another task with no
+  // 'LinuxInfo' set.
+  {
+    TaskGroupInfo taskGroup;
+    taskGroup.add_tasks()->CopyFrom(task1);
+    taskGroup.add_tasks()->CopyFrom(task2);
+
+    Offer::Operation operation;
+    operation.set_type(Offer::Operation::LAUNCH_GROUP);
+
+    Offer::Operation::LaunchGroup* launchGroup =
+      operation.mutable_launch_group();
+
+    launchGroup->mutable_executor()->CopyFrom(executor);
+    launchGroup->mutable_task_group()->CopyFrom(taskGroup);
+
+    Future<TaskStatus> task1Status;
+    Future<TaskStatus> task2Status;
+    EXPECT_CALL(sched, statusUpdate(&driver, _))
+      .WillOnce(FutureArg<1>(&task1Status))
+      .WillOnce(FutureArg<1>(&task2Status));
+
+    driver.acceptOffers({offers->at(0).id()}, {operation}, filters);
+
+    AWAIT_READY(task1Status);
+    EXPECT_EQ(TASK_ERROR, task1Status->state());
+    EXPECT_EQ(TaskStatus::REASON_TASK_GROUP_INVALID, task1Status->reason());
+    EXPECT_TRUE(strings::contains(
+          task1Status->message(),
+          "If set, the value of 'share_cgroups' must be the same for all tasks "
+          "in each task group and under a single executor"));
+
+    AWAIT_READY(task2Status);
+    EXPECT_EQ(TASK_ERROR, task2Status->state());
+    EXPECT_EQ(TaskStatus::REASON_TASK_GROUP_INVALID, task2Status->reason());
+    EXPECT_TRUE(strings::contains(
+          task2Status->message(),
+          "If set, the value of 'share_cgroups' must be the same for all tasks "
+          "in each task group and under a single executor"));
+  }
+
+  ContainerInfo containerInfoSharedCgroups;
+  containerInfoSharedCgroups.set_type(ContainerInfo::MESOS);
+  containerInfoSharedCgroups.mutable_linux_info()->set_share_cgroups(true);
+
+  task1.mutable_container()->CopyFrom(containerInfoSharedCgroups);
+
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers));
+
+  Clock::advance(masterFlags.allocation_interval);
+  Clock::settle();
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->empty());
+
+  // Error: Tasks with different values of 'share_cgroups'.
+  {
+    TaskGroupInfo taskGroup;
+    taskGroup.add_tasks()->CopyFrom(task1);
+    taskGroup.add_tasks()->CopyFrom(task2);
+
+    Offer::Operation operation;
+    operation.set_type(Offer::Operation::LAUNCH_GROUP);
+
+    Offer::Operation::LaunchGroup* launchGroup =
+      operation.mutable_launch_group();
+
+    launchGroup->mutable_executor()->CopyFrom(executor);
+    launchGroup->mutable_task_group()->CopyFrom(taskGroup);
+
+    Future<TaskStatus> task1Status;
+    Future<TaskStatus> task2Status;
+    EXPECT_CALL(sched, statusUpdate(&driver, _))
+      .WillOnce(FutureArg<1>(&task1Status))
+      .WillOnce(FutureArg<1>(&task2Status));
+
+    driver.acceptOffers({offers->at(0).id()}, {operation}, filters);
+
+    AWAIT_READY(task1Status);
+    EXPECT_EQ(TASK_ERROR, task1Status->state());
+    EXPECT_EQ(TaskStatus::REASON_TASK_GROUP_INVALID, task1Status->reason());
+    EXPECT_TRUE(strings::contains(
+          task1Status->message(),
+          "If set, the value of 'share_cgroups' must be the same for all tasks "
+          "in each task group and under a single executor"));
+
+    AWAIT_READY(task2Status);
+    EXPECT_EQ(TASK_ERROR, task2Status->state());
+    EXPECT_EQ(TaskStatus::REASON_TASK_GROUP_INVALID, task2Status->reason());
+    EXPECT_TRUE(strings::contains(
+          task2Status->message(),
+          "If set, the value of 'share_cgroups' must be the same for all tasks "
+          "in each task group and under a single executor"));
+  }
+
+  task1.mutable_container()->CopyFrom(containerInfoNestedCgroups);
+
+  executor.set_type(ExecutorInfo::CUSTOM);
+  executor.mutable_container()->CopyFrom(containerInfoSharedCgroups);
+  executor.mutable_command()->set_value("exit 0");
+
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers));
+
+  Clock::advance(masterFlags.allocation_interval);
+  Clock::settle();
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->empty());
+
+  // Error: Executor with 'share_cgroups' set to 'true'.
+  {
+    TaskGroupInfo taskGroup;
+    taskGroup.add_tasks()->CopyFrom(task1);
+    taskGroup.add_tasks()->CopyFrom(task2);
+
+    Offer::Operation operation;
+    operation.set_type(Offer::Operation::LAUNCH_GROUP);
+
+    Offer::Operation::LaunchGroup* launchGroup =
+      operation.mutable_launch_group();
+
+    launchGroup->mutable_executor()->CopyFrom(executor);
+    launchGroup->mutable_task_group()->CopyFrom(taskGroup);
+
+    Future<TaskStatus> task1Status;
+    Future<TaskStatus> task2Status;
+    EXPECT_CALL(sched, statusUpdate(&driver, _))
+      .WillOnce(FutureArg<1>(&task1Status))
+      .WillOnce(FutureArg<1>(&task2Status));
+
+    driver.acceptOffers({offers->at(0).id()}, {operation}, filters);
+
+    AWAIT_READY(task1Status);
+    EXPECT_EQ(TASK_ERROR, task1Status->state());
+    EXPECT_EQ(TaskStatus::REASON_TASK_GROUP_INVALID, task1Status->reason());
+    EXPECT_TRUE(strings::contains(
+          task1Status->message(),
+          "The 'share_cgroups' field cannot be set to 'true' on "
+          "executor containers"));
+
+    AWAIT_READY(task2Status);
+    EXPECT_EQ(TASK_ERROR, task2Status->state());
+    EXPECT_EQ(TaskStatus::REASON_TASK_GROUP_INVALID, task2Status->reason());
+    EXPECT_TRUE(strings::contains(
+          task2Status->message(),
+          "The 'share_cgroups' field cannot be set to 'true' on "
+          "executor containers"));
+  }
+
+  executor.mutable_container()->CopyFrom(containerInfoNestedCgroups);
+  executor.set_type(ExecutorInfo::DEFAULT);
+  executor.clear_command();
+
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers));
+
+  Clock::advance(masterFlags.allocation_interval);
+  Clock::settle();
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->empty());
+
+  // Valid, no error.
+  {
+    TaskGroupInfo taskGroup;
+    taskGroup.add_tasks()->CopyFrom(task1);
+    taskGroup.add_tasks()->CopyFrom(task2);
+
+    Offer::Operation operation;
+    operation.set_type(Offer::Operation::LAUNCH_GROUP);
+
+    Offer::Operation::LaunchGroup* launchGroup =
+      operation.mutable_launch_group();
+
+    launchGroup->mutable_executor()->CopyFrom(executor);
+    launchGroup->mutable_task_group()->CopyFrom(taskGroup);
+
+    Future<TaskStatus> task1Starting;
+    Future<TaskStatus> task2Starting;
+    Future<TaskStatus> task1Running;
+    Future<TaskStatus> task2Running;
+    EXPECT_CALL(sched, statusUpdate(&driver, _))
+      .WillOnce(FutureArg<1>(&task1Starting))
+      .WillOnce(FutureArg<1>(&task2Starting))
+      .WillOnce(FutureArg<1>(&task1Running))
+      .WillOnce(FutureArg<1>(&task2Running));
+
+    driver.acceptOffers({offers->at(0).id()}, {operation}, filters);
+
+    AWAIT_READY(task1Starting);
+    EXPECT_EQ(TASK_STARTING, task1Starting->state());
+    AWAIT_READY(task2Starting);
+    EXPECT_EQ(TASK_STARTING, task2Starting->state());
+
+    AWAIT_READY(task1Running);
+    EXPECT_EQ(TASK_RUNNING, task1Running->state());
+    AWAIT_READY(task2Running);
+    EXPECT_EQ(TASK_RUNNING, task2Running->state());
+  }
+
+  task1 = createTask(
+      slaveId,
+      Resources::parse("cpus:0.1;mem:32").get(),
+      "exit 0",
+      None(),
+      "test-task-1",
+      id::UUID::random().toString());
+
+  task2 = createTask(
+      slaveId,
+      Resources::parse("cpus:0.1;mem:32").get(),
+      "exit 0",
+      None(),
+      "test-task-2",
+      id::UUID::random().toString());
+
+  task1.mutable_container()->CopyFrom(containerInfoSharedCgroups);
+  task2.mutable_container()->CopyFrom(containerInfoSharedCgroups);
+
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers));
+
+  Clock::advance(masterFlags.allocation_interval);
+  Clock::settle();
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->empty());
+
+  // Error: The 'share_cgroups' field must have the same value for all tasks
+  // under a single executor.
+  {
+    TaskGroupInfo taskGroup;
+    taskGroup.add_tasks()->CopyFrom(task1);
+    taskGroup.add_tasks()->CopyFrom(task2);
+
+    Offer::Operation operation;
+    operation.set_type(Offer::Operation::LAUNCH_GROUP);
+
+    Offer::Operation::LaunchGroup* launchGroup =
+      operation.mutable_launch_group();
+
+    launchGroup->mutable_executor()->CopyFrom(executor);
+    launchGroup->mutable_task_group()->CopyFrom(taskGroup);
+
+    Future<TaskStatus> task1Status;
+    Future<TaskStatus> task2Status;
+    EXPECT_CALL(sched, statusUpdate(&driver, _))
+      .WillOnce(FutureArg<1>(&task1Status))
+      .WillOnce(FutureArg<1>(&task2Status))
+      .WillRepeatedly(Return()); // Ignore subsequent updates.
+
+    driver.acceptOffers({offers->at(0).id()}, {operation}, filters);
+
+    AWAIT_READY(task1Status);
+    EXPECT_EQ(TASK_ERROR, task1Status->state());
+    EXPECT_EQ(TaskStatus::REASON_TASK_GROUP_INVALID, task1Status->reason());
+    EXPECT_TRUE(strings::contains(
+          task1Status->message(),
+          "If set, the value of 'share_cgroups' must be the same for all "
+          "tasks in each task group and under a single executor"));
+
+    AWAIT_READY(task2Status);
+    EXPECT_EQ(TASK_ERROR, task2Status->state());
+    EXPECT_EQ(TaskStatus::REASON_TASK_GROUP_INVALID, task2Status->reason());
+    EXPECT_TRUE(strings::contains(
+          task2Status->message(),
+          "If set, the value of 'share_cgroups' must be the same for all "
+          "tasks in each task group and under a single executor"));
+  }
+}
+
+
 class FrameworkInfoValidationTest : public MesosTest {};
 
 
@@ -4665,6 +5583,43 @@ TEST_F(FrameworkInfoValidationTest, ValidateOfferFilters)
       Error("Invalid resource quantity for 'cpus': "
         "Negative values not supported"),
       framework::validate(frameworkInfo));
+}
+
+
+// This tests validation of FrameworkInfo updates.
+TEST_F(FrameworkInfoValidationTest, ValidateUpdate)
+{
+  {
+    FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
+    frameworkInfo.add_roles("bar");
+
+    EXPECT_NONE(framework::validateUpdate(
+        DEFAULT_FRAMEWORK_INFO, frameworkInfo));
+  }
+
+  {
+    FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
+    *frameworkInfo.mutable_principal() += "_foo";
+
+    EXPECT_SOME(framework::validateUpdate(
+        DEFAULT_FRAMEWORK_INFO, frameworkInfo));
+  }
+
+  {
+    FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
+    *frameworkInfo.mutable_user() += "_foo";
+
+    EXPECT_SOME(framework::validateUpdate(
+        DEFAULT_FRAMEWORK_INFO, frameworkInfo));
+  }
+
+  {
+    FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
+    frameworkInfo.set_checkpoint(!frameworkInfo.checkpoint());
+
+    EXPECT_SOME(framework::validateUpdate(
+        DEFAULT_FRAMEWORK_INFO, frameworkInfo));
+  }
 }
 
 

@@ -23,6 +23,7 @@
 #include <mesos/quota/quota.hpp>
 
 #include <process/metrics/counter.hpp>
+#include <process/metrics/metrics.hpp>
 #include <process/metrics/pull_gauge.hpp>
 #include <process/metrics/push_gauge.hpp>
 #include <process/metrics/timer.hpp>
@@ -40,6 +41,24 @@ namespace internal {
 // Forward declarations.
 class HierarchicalAllocatorProcess;
 
+
+class QuotaMetrics
+{
+public:
+  explicit QuotaMetrics(const std::string& suffix_) : suffix(suffix_){};
+  ~QuotaMetrics();
+
+  template <class Quantities>
+  void update(const std::string& role, const Quantities& quantities);
+
+private:
+  const std::string suffix;
+
+  hashmap<std::string, hashmap<std::string, process::metrics::PushGauge>>
+    metrics;
+};
+
+
 // Collection of metrics for the allocator; these begin
 // with the following prefix: `allocator/mesos/`.
 struct Metrics
@@ -48,8 +67,9 @@ struct Metrics
 
   ~Metrics();
 
-  void setQuota(const std::string& role, const Quota& quota);
-  void removeQuota(const std::string& role);
+  void updateQuota(const std::string& role, const Quota& quota);
+  void updateConsumed(
+    const std::string& role, const ResourceQuantities& consumed);
 
   void addRole(const std::string& role);
   void removeRole(const std::string& role);
@@ -83,12 +103,23 @@ struct Metrics
   hashmap<std::string, hashmap<std::string, process::metrics::PullGauge>>
     quota_allocated;
 
-  // PullGauges for the per-role quota guarantee for each resource.
-  hashmap<std::string, hashmap<std::string, process::metrics::PullGauge>>
+  // PushGauges for the per-role quota guarantee for each resource.
+  hashmap<std::string, hashmap<std::string, process::metrics::PushGauge>>
     quota_guarantee;
+
+  // PushGauges for the per-role quota limit for each resource.
+  hashmap<std::string, hashmap<std::string, process::metrics::PushGauge>>
+    quota_limit;
 
   // PullGauges for the per-role count of active offer filters.
   hashmap<std::string, process::metrics::PullGauge> offer_filters_active;
+
+private:
+  // NOTE: Quota metrics should have a suffix in singilar.
+  // (Example of a name: allocator/mesos/quota/roles/roleA/resources/cpu/limit.)
+  QuotaMetrics quotaGuarantees {"/guarantee"};
+  QuotaMetrics quotaLimits {"/limit"};
+  QuotaMetrics quotaConsumed {"/consumed"};
 };
 
 

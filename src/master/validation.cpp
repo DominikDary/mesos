@@ -17,6 +17,7 @@
 #include "master/validation.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <iterator>
 #include <set>
 #include <string>
@@ -24,10 +25,12 @@
 
 #include <glog/logging.h>
 
+#include <mesos/resource_quantities.hpp>
 #include <mesos/roles.hpp>
 #include <mesos/type_utils.hpp>
 
 #include <process/authenticator.hpp>
+#include <process/owned.hpp>
 
 #include <stout/foreach.hpp>
 #include <stout/hashmap.hpp>
@@ -43,6 +46,8 @@
 #include "common/validation.hpp"
 
 #include "master/master.hpp"
+
+using process::Owned;
 
 using process::http::authentication::Principal;
 
@@ -235,6 +240,24 @@ Option<Error> validate(const mesos::master::Call& call)
     case mesos::master::Call::STOP_MAINTENANCE:
       if (!call.has_stop_maintenance()) {
         return Error("Expecting 'stop_maintenance' to be present");
+      }
+      return None();
+
+    case mesos::master::Call::DRAIN_AGENT:
+      if (!call.has_drain_agent()) {
+        return Error("Expecting 'drain_agent' to be present");
+      }
+      return None();
+
+    case mesos::master::Call::DEACTIVATE_AGENT:
+      if (!call.has_deactivate_agent()) {
+        return Error("Expecting 'deactivate_agent' to be present");
+      }
+      return None();
+
+    case mesos::master::Call::REACTIVATE_AGENT:
+      if (!call.has_reactivate_agent()) {
+        return Error("Expecting 'reactivate_agent' to be present");
       }
       return None();
 
@@ -565,6 +588,77 @@ Option<Error> validate(const mesos::FrameworkInfo& frameworkInfo)
   return None();
 }
 
+
+Option<Error> validateUpdate(
+    const FrameworkInfo& oldInfo,
+    const FrameworkInfo& newInfo)
+{
+  Option<string> oldPrincipal = None();
+  if (oldInfo.has_principal()) {
+    oldPrincipal = oldInfo.principal();
+  }
+
+  Option<string> newPrincipal = None();
+  if (newInfo.has_principal()) {
+    newPrincipal = newInfo.principal();
+  }
+
+  if (oldPrincipal != newPrincipal) {
+    // We should not expose the old principal to the 'scheduler' which tries
+    // to subscribe with a known framework ID but another principal.
+    // However, it still should be possible for the people having access to
+    // the master to understand what is going on, hence the log message.
+    LOG(WARNING)
+      << "Framework " << oldInfo.id() << " which had a principal "
+      << " '" << oldPrincipal.getOrElse("<NONE>") << "'"
+      << " tried to (re)subscribe with a new principal "
+      << " '" << newPrincipal.getOrElse("<NONE>") << "'";
+
+    return Error("Changing framework's principal is not allowed.");
+  }
+
+  if (newInfo.user() != oldInfo.user()) {
+    return Error(
+        "Updating 'FrameworkInfo.user' is unsupported"
+        "; attempted to update from '" + oldInfo.user() + "'"
+        " to '" + newInfo.user() + "'");
+  }
+
+  if (newInfo.checkpoint() != oldInfo.checkpoint()) {
+    return Error(
+        "Updating 'FrameworkInfo.checkpoint' is unsupported"
+        "; attempted to update"
+        " from '" + stringify(oldInfo.checkpoint()) + "'"
+        " to '" + stringify(newInfo.checkpoint()) + "'");
+  }
+
+  return None();
+}
+
+
+void preserveImmutableFields(
+    const FrameworkInfo& oldInfo,
+    FrameworkInfo* newInfo)
+{
+  if (newInfo->user() != oldInfo.user()) {
+    LOG(WARNING)
+      << "Cannot update 'FrameworkInfo.user' to '" << newInfo->user() << "'"
+      << " for framework " << oldInfo.id() << "; see MESOS-703";
+
+    newInfo->set_user(oldInfo.user());
+  }
+
+  if (newInfo->checkpoint() != oldInfo.checkpoint()) {
+    LOG(WARNING)
+      << "Cannot update FrameworkInfo.checkpoint to"
+      << " '" << stringify(newInfo->checkpoint()) << "'"
+      << " for framework " << oldInfo.id() << "; see MESOS-703";
+
+    newInfo->set_checkpoint(oldInfo.checkpoint());
+  }
+}
+
+
 } // namespace framework {
 
 
@@ -721,6 +815,18 @@ Option<Error> validate(
     case mesos::scheduler::Call::REQUEST:
       if (!call.has_request()) {
         return Error("Expecting 'request' to be present");
+      }
+      return None();
+
+    case mesos::scheduler::Call::UPDATE_FRAMEWORK:
+      if (!call.has_update_framework()) {
+        return Error("Expecting 'update_framework' to be present");
+      }
+
+      if (call.framework_id() !=
+          call.update_framework().framework_info().id()) {
+        return Error(
+            "'framework_id' differs from 'update_framework.framework_info.id'");
       }
       return None();
 
@@ -897,6 +1003,23 @@ Option<Error> validateAllocatedToSingleRole(const Resources& resources)
   return None();
 }
 
+
+bool detectOverlappingSetAndRangeResources(
+    const vector<Resources>& resources)
+{
+  // If the sum of quantities of each `Resources` is not equal to the quantities
+  // of the sum of `Resources`, then there is some overlap in ranges or sets.
+  ResourceQuantities totalQuantities;
+  Resources totalResources;
+
+  foreach (const Resources& resources_, resources) {
+    totalQuantities += ResourceQuantities::fromResources(resources_);
+    totalResources += resources_;
+  }
+
+  return totalQuantities != ResourceQuantities::fromResources(totalResources);
+}
+
 namespace internal {
 
 // Validates that all the given resources are from the same resource
@@ -983,7 +1106,13 @@ Option<Error> validateType(const ExecutorInfo& executor)
     Option<Error> unionError =
       protobuf::validateProtobufUnion(executor.container());
     if (unionError.isSome()) {
-      return unionError;
+      LOG(WARNING)
+        << "Executor " << executor.executor_id()
+        // NOTE: Validation of FrameworkID is done after this validation.
+        << " of framework '"
+        << (executor.has_framework_id() ? executor.framework_id().value() : "")
+        << "' has an invalid protobuf union: "
+        << unionError.get();
     }
   }
   switch (executor.type()) {
@@ -1357,6 +1486,18 @@ Option<Error> validateTaskAndExecutorResources(const TaskInfo& task)
         "Task and its executor use invalid resources: " + error->message);
   }
 
+  // We perform the check for `has_executor()` again here because we needed to
+  // validate the total resources before checking for overlapping ranges/sets.
+  if (task.has_executor()) {
+    if (resource::detectOverlappingSetAndRangeResources({
+            task.resources(),
+            task.executor().resources()})) {
+      return Error("There are overlapping resources in the task resources " +
+                   stringify(task.resources()) + " and executor resources " +
+                   stringify(task.executor().resources()));
+    }
+  }
+
   error = resource::validateUniquePersistenceID(total);
   if (error.isSome()) {
     return Error("Task and its executor use duplicate persistence ID: " +
@@ -1403,6 +1544,77 @@ Option<Error> validateContainerInfo(const TaskInfo& task)
 }
 
 
+Option<Error> validateResourceLimits(
+    const TaskInfo& task,
+    Slave* slave)
+{
+  auto limits = task.limits();
+
+  if (!limits.empty()) {
+    if (!slave->capabilities.taskResourceLimits) {
+      return Error("Agent is not capable of handling task resource limits");
+    }
+
+    // Ensure that only "cpus" and "mem" are included.
+    const size_t cpuCount = limits.count("cpus");
+    const size_t memCount = limits.count("mem");
+
+    if (limits.size() > cpuCount + memCount) {
+      return Error(
+          "Only cpus and mem may be included in a task's resource limits");
+    }
+
+    if (cpuCount) {
+      Option<double> taskCpus = Resources(task.resources()).cpus();
+      if (taskCpus.isNone()) {
+        return Error(
+            "When a CPU limit is specified, a CPU request must also be "
+            "specified");
+      }
+
+      if (limits.at("cpus").value() < taskCpus.get()) {
+        return Error(
+            "The cpu limit must be greater than or equal to the cpu request");
+      }
+    }
+
+    if (memCount) {
+      Option<Bytes> taskMem = Resources(task.resources()).mem();
+      if (taskMem.isNone()) {
+        return Error(
+            "When a memory limit is specified, a memory request must also be "
+            "specified");
+      }
+
+      if (!std::isinf(limits.at("mem").value()) &&
+          Bytes(limits.at("mem").value(), Bytes::MEGABYTES) < taskMem.get()) {
+        return Error(
+            "The memory limit must be greater"
+            " than or equal to the memory request");
+      }
+    }
+  }
+
+  return None();
+}
+
+
+// This validation function should only be executed for tasks which are launched
+// via the LAUNCH operation, not the LAUNCH_GROUP operation.
+Option<Error> validateShareCgroups(const TaskInfo& task)
+{
+  if (task.has_container() &&
+      task.container().has_linux_info() &&
+      task.container().linux_info().has_share_cgroups() &&
+      !task.container().linux_info().share_cgroups()) {
+    return Error(
+        "Only tasks in a task group may have 'share_cgroups' set to 'false'");
+  }
+
+  return None();
+}
+
+
 // Validates task specific fields except its executor (if it exists).
 Option<Error> validateTask(
     const TaskInfo& task,
@@ -1424,7 +1636,8 @@ Option<Error> validateTask(
     lambda::bind(internal::validateHealthCheck, task),
     lambda::bind(internal::validateResources, task),
     lambda::bind(internal::validateCommandInfo, task),
-    lambda::bind(internal::validateContainerInfo, task)
+    lambda::bind(internal::validateContainerInfo, task),
+    lambda::bind(internal::validateResourceLimits, task, slave)
   };
 
   foreach (const lambda::function<Option<Error>()>& validator, validators) {
@@ -1522,6 +1735,15 @@ Option<Error> validateExecutor(
         << "in future releases.";
     }
 
+    if (executor.has_container() &&
+        executor.container().has_linux_info() &&
+        executor.container().linux_info().has_share_cgroups() &&
+        executor.container().linux_info().share_cgroups()) {
+      return Error(
+          "The 'share_cgroups' field cannot be set to 'true'"
+          " on executor containers");
+    }
+
     if (!slave->hasExecutor(framework->id(), task.executor().executor_id())) {
       total += executorResources;
     }
@@ -1561,7 +1783,8 @@ Option<Error> validate(
 
   vector<lambda::function<Option<Error>()>> validators = {
     lambda::bind(internal::validateTask, task, framework, slave),
-    lambda::bind(internal::validateExecutor, task, framework, slave, offered)
+    lambda::bind(internal::validateExecutor, task, framework, slave, offered),
+    lambda::bind(internal::validateShareCgroups, task)
   };
 
   foreach (const lambda::function<Option<Error>()>& validator, validators) {
@@ -1614,6 +1837,15 @@ Option<Error> validateTask(
     }
   }
 
+  if (!task.limits().empty() &&
+      !(task.has_container() &&
+        task.container().has_linux_info() &&
+        !task.container().linux_info().share_cgroups())) {
+    return Error(
+        "Resource limits may only be set for tasks within a task group when "
+        "the 'share_cgroups' field is set to 'false'.");
+  }
+
   return None();
 }
 
@@ -1623,7 +1855,10 @@ Option<Error> validateTaskGroupAndExecutorResources(
     const ExecutorInfo& executor)
 {
   Resources total = executor.resources();
+
+  vector<Resources> taskResources;
   foreach (const TaskInfo& task, taskGroup.tasks()) {
+    taskResources.push_back(task.resources());
     total += task.resources();
   }
 
@@ -1637,6 +1872,16 @@ Option<Error> validateTaskGroupAndExecutorResources(
   if (error.isSome()) {
     return Error("Task group and executor mix revocable and non-revocable"
                  " resources: " + error->message);
+  }
+
+  vector<Resources> allResources(taskResources);
+  allResources.push_back(executor.resources());
+
+  if (resource::detectOverlappingSetAndRangeResources(allResources)) {
+    return Error("There are overlapping resources in the task group's task"
+                 " resources " + stringify(taskResources) +
+                 " and/or executor resources " +
+                 stringify(executor.resources()));
   }
 
   return None();
@@ -1751,6 +1996,117 @@ Option<Error> validateExecutor(
   return None();
 }
 
+
+Option<Error> validateShareCgroups(
+    const TaskGroupInfo& taskGroup,
+    const ExecutorInfo& executorInfo,
+    Framework* framework,
+    Slave* slave)
+{
+  if (executorInfo.has_container() &&
+      executorInfo.container().has_linux_info() &&
+      executorInfo.container().linux_info().has_share_cgroups() &&
+      executorInfo.container().linux_info().share_cgroups()) {
+    return Error(
+        "The 'share_cgroups' field cannot be set to 'true' on "
+        "executor containers");
+  }
+
+  // If any task in a task group has 'share_cgroups' set to 'false', then all
+  // tasks in the task group must have it set to 'false'. We use this local
+  // variable to track the value.
+  Option<bool> shareCgroups;
+
+  // Helper function to determine whether or not we've seen a task in this task
+  // group or under this executor with a different value of 'share_cgroups'.
+  auto validateShareCgroupsForTask = [](
+      Option<bool>& shareCgroups,
+      const Option<ContainerInfo>& container) -> Option<Error> {
+    // If the task does not have 'LinuxInfo' set, then we treat it as
+    // having 'share_cgroups==true' for validation purposes, since that is
+    // the default behavior.
+    bool taskShareCgroups =
+      (container.isSome() &&
+       container->has_linux_info() &&
+       container->linux_info().has_share_cgroups()) ?
+         container->linux_info().share_cgroups() :
+         true;
+
+    if (shareCgroups.isNone()) {
+      shareCgroups = taskShareCgroups;
+    } else if (taskShareCgroups != shareCgroups.get()) {
+      return Error(
+          "If set, the value of 'share_cgroups' must be the same for all "
+          "tasks in each task group and under a single executor");
+    }
+
+    return None();
+  };
+
+  foreach (const TaskInfo& task, taskGroup.tasks()) {
+    Option<Error> error = validateShareCgroupsForTask(
+        shareCgroups,
+        task.has_container() ?
+          task.container() :
+          Option<ContainerInfo>::none());
+
+    if (error.isSome()) {
+      return error;
+    }
+  }
+
+  CHECK_NOTNULL(framework);
+
+  // If this executor already exists, ensure that all tasks under it
+  // have the same value of 'share_cgroups'.
+  if (shareCgroups.isSome() &&
+      framework->executors.contains(slave->id) &&
+      framework->executors.at(slave->id)
+        .contains(executorInfo.executor_id())) {
+    foreachvalue (const Task* task, framework->tasks) {
+      CHECK_NOTNULL(task);
+
+      if (task->slave_id() == slave->id &&
+          task->has_executor_id() &&
+          task->executor_id() == executorInfo.executor_id()) {
+        Option<Error> error = validateShareCgroupsForTask(
+            shareCgroups,
+            task->has_container() ?
+              task->container() :
+              Option<ContainerInfo>::none());
+
+        if (error.isSome()) {
+          return error;
+        }
+      }
+    }
+
+    // Unreachable tasks are held in the `Framework` struct and in the `Slaves`
+    // struct. Rather than passing `Slaves` to this function to find unreachable
+    // tasks for only one agent, we look through all unreachable tasks via the
+    // `Framework` struct, which is already available.
+    foreachvalue (const Owned<Task>& task, framework->unreachableTasks) {
+      CHECK_NOTNULL(task);
+
+      if (task->slave_id() == slave->id &&
+          task->has_executor_id() &&
+          task->executor_id() == executorInfo.executor_id()) {
+        Option<Error> error = validateShareCgroupsForTask(
+            shareCgroups,
+            task->has_container() ?
+              task->container() :
+              Option<ContainerInfo>::none());
+
+        if (error.isSome()) {
+          return error;
+        }
+      }
+    }
+  }
+
+  return None();
+}
+
 } // namespace internal {
 
 
@@ -1772,11 +2128,23 @@ Option<Error> validate(
     }
   }
 
-  Option<Error> error =
-    internal::validateExecutor(taskGroup, executor, framework, slave, offered);
+  vector<lambda::function<Option<Error>()>> validators = {
+    lambda::bind(
+        internal::validateExecutor,
+        taskGroup,
+        executor,
+        framework,
+        slave,
+        offered),
+    lambda::bind(
+        internal::validateShareCgroups, taskGroup, executor, framework, slave)
+  };
 
-  if (error.isSome()) {
-    return error;
+  foreach (const lambda::function<Option<Error>()>& validator, validators) {
+    Option<Error> error = validator();
+    if (error.isSome()) {
+      return error;
+    }
   }
 
   return None();
@@ -2064,6 +2432,63 @@ Option<Error> validate(
     return Error("Invalid resources: " + error->message);
   }
 
+  error = resource::validate(reserve.source());
+  if (error.isSome()) {
+    return Error("Invalid source: " + error->message);
+  }
+
+  if (reserve.source_size() > 0) {
+    Resources source = reserve.source();
+    Resources target = reserve.resources();
+
+    auto validateReservationResources =
+      [](const RepeatedPtrField<Resource>& resources) -> Option<Error> {
+      // Resources should not be empty.
+      if (resources.empty()) {
+        return Error("Resource cannot be empty");
+      }
+
+      // All passed resources should have identical reservations.
+      const RepeatedPtrField<Resource::ReservationInfo>& reservations =
+        resources.begin()->reservations();
+
+      if (!std::all_of(
+              resources.begin(),
+              resources.end(),
+              [&](const Resource& resource) {
+                return resource.reservations_size() == reservations.size() &&
+                       std::equal(
+                           resource.reservations().begin(),
+                           resource.reservations().end(),
+                           reservations.begin());
+              })) {
+        return Error(
+            "Mixed reservations are not supported" + stringify(resources));
+      }
+
+      return None();
+    };
+
+    error = validateReservationResources(source);
+    if (error.isSome()) {
+      return Error("Invalid source: " + error->message);
+    }
+
+    error = validateReservationResources(target);
+    if (error.isSome()) {
+      return Error("Invalid resources: " + error->message);
+    }
+
+    // Both operands should refer to identical resource quantities.
+    if (source.toUnreserved() != target.toUnreserved()) {
+      return Error(
+          "Source and target resources should refer to identical resource "
+          "quantities: " +
+          stringify(source.toUnreserved()) + " vs. " +
+          stringify(target.toUnreserved()));
+    }
+  }
+
   error =
     resource::internal::validateSingleResourceProvider(reserve.resources());
   if (error.isSome()) {
@@ -2173,15 +2598,6 @@ Option<Error> validate(
             " but the operator API only allows reservations to be made to"
             " unallocated resources");
       }
-    }
-
-    // NOTE: This check would be covered by 'contains' since there
-    // shouldn't be any unreserved resources with 'disk' set.
-    // However, we keep this check since it will be a more useful
-    // error message than what contains would produce.
-    if (Resources::isPersistentVolume(resource)) {
-      return Error("A persistent volume " + stringify(resource) +
-                   " must already be reserved");
     }
   }
 
@@ -2345,7 +2761,6 @@ Option<Error> validate(
     const Offer::Operation::Destroy& destroy,
     const Resources& checkpointedResources,
     const hashmap<FrameworkID, Resources>& usedResources,
-    const hashmap<FrameworkID, hashmap<TaskID, TaskInfo>>& pendingTasks,
     const Option<FrameworkInfo>& frameworkInfo)
 {
   // The operation can either contain allocated resources
@@ -2381,7 +2796,7 @@ Option<Error> validate(
     return Error("Not a persistent volume: " + error->message);
   }
 
-  foreach (const Resource volume, volumes) {
+  foreach (const Resource& volume, volumes) {
     if (Resources::hasResourceProvider(volume)) {
       continue;
     }
@@ -2399,27 +2814,6 @@ Option<Error> validate(
     foreach (const Resource& volume, volumes) {
       if (unallocated(resources).contains(volume)) {
         return Error("Persistent volumes in use");
-      }
-    }
-  }
-
-  // Ensure that the volumes being destroyed are not requested by any pending
-  // task. This check is mainly to validate destruction of shared volumes.
-  // Note that resource requirements in pending tasks are not validated yet
-  // so it is possible that the DESTROY validation fails due to invalid
-  // pending tasks.
-  typedef hashmap<TaskID, TaskInfo> TaskMap;
-  foreachvalue(const TaskMap& tasks, pendingTasks) {
-    foreachvalue (const TaskInfo& task, tasks) {
-      Resources resources = task.resources();
-      if (task.has_executor()) {
-        resources += task.executor().resources();
-      }
-
-      foreach (const Resource& volume, destroy.volumes()) {
-        if (unallocated(resources).contains(volume)) {
-          return Error("Persistent volume in pending tasks");
-        }
       }
     }
   }
@@ -2603,8 +2997,13 @@ Option<Error> validate(const Offer::Operation::DestroyDisk& destroyDisk)
   }
 
   if (!Resources::isDisk(source, Resource::DiskInfo::Source::MOUNT) &&
-      !Resources::isDisk(source, Resource::DiskInfo::Source::BLOCK)) {
-    return Error("'source' is neither a MOUNT or BLOCK disk resource");
+      !Resources::isDisk(source, Resource::DiskInfo::Source::BLOCK) &&
+      !Resources::isDisk(source, Resource::DiskInfo::Source::RAW)) {
+    return Error("'source' is neither a MOUNT, BLOCK or RAW disk resource");
+  }
+
+  if (!source.disk().source().has_id()) {
+    return Error("'source' is not backed by a CSI volume");
   }
 
   if (Resources::isPersistentVolume(source)) {

@@ -333,6 +333,7 @@ struct ExecutorState
   Option<ContainerID> latest;
   hashmap<ContainerID, RunState> runs;
   unsigned int errors;
+  bool generatedForCommandTask = false;
 };
 
 
@@ -390,6 +391,9 @@ struct SlaveState
   // `operations` will be `None()` if the agent that checkpointed the
   // state didn't support checkpointing operations.
   Option<std::vector<Operation>> operations;
+
+  // The drain state of the agent, if any.
+  Option<DrainConfig> drainConfig;
 
   unsigned int errors;
 };

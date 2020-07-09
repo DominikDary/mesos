@@ -14,12 +14,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <memory>
 #include <string>
 #include <tuple>
 #include <utility>
 
 #include <mesos/http.hpp>
 
+#include <mesos/v1/mesos.hpp>
 #include <mesos/v1/resources.hpp>
 #include <mesos/v1/resource_provider.hpp>
 
@@ -66,9 +68,11 @@
 #include "tests/resources_utils.hpp"
 
 #include "tests/containerizer/mock_containerizer.hpp"
+#include "tests/master/mock_master_api_subscriber.hpp"
 
 namespace http = process::http;
 
+using std::shared_ptr;
 
 using google::protobuf::RepeatedPtrField;
 
@@ -110,6 +114,7 @@ using std::tuple;
 using std::vector;
 
 using testing::_;
+using testing::AllOf;
 using testing::AtMost;
 using testing::DoAll;
 using testing::Eq;
@@ -229,7 +234,7 @@ TEST_P(MasterAPITest, GetAgents)
   v1::Resource resource = v1::createDiskResource(
       "200", "*", None(), None(), v1::createDiskSourceRaw());
 
-  v1::MockResourceProvider resourceProvider(info, resource);
+  v1::TestResourceProvider resourceProvider(info, resource);
 
   // Start and register a resource provider.
   Owned<EndpointDetector> endpointDetector(
@@ -271,6 +276,106 @@ TEST_P(MasterAPITest, GetAgents)
       .total_resources();
 
   EXPECT_EQ(v1::Resources(resource), responseResources);
+}
+
+
+// This test verifies that if a resource provider becomes disconnected, it will
+// not be reported by `GET_AGENT` calls.
+TEST_P(MasterAPITest, GetAgentsDisconnectedResourceProvider)
+{
+  Clock::pause();
+
+  const ContentType contentType = GetParam();
+
+  master::Flags masterFlags = CreateMasterFlags();
+  Try<Owned<cluster::Master>> master = this->StartMaster(masterFlags);
+  ASSERT_SOME(master);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  // Start one agent.
+  Future<UpdateSlaveMessage> updateSlaveMessage =
+    FUTURE_PROTOBUF(UpdateSlaveMessage(), _, _);
+
+  slave::Flags slaveFlags = CreateSlaveFlags();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), slaveFlags);
+  ASSERT_SOME(slave);
+
+  Clock::settle();
+  Clock::advance(slaveFlags.registration_backoff_factor);
+
+  AWAIT_READY(updateSlaveMessage);
+  ASSERT_TRUE(updateSlaveMessage->resource_providers().providers().empty());
+
+  // Start a resource provider.
+  mesos::v1::ResourceProviderInfo info;
+  info.set_type("org.apache.mesos.rp.test");
+  info.set_name("test");
+
+  Owned<v1::TestResourceProvider> resourceProvider(
+    new v1::TestResourceProvider(info, v1::Resources()));
+
+  // Start and register a resource provider.
+  Owned<EndpointDetector> endpointDetector(
+      resource_provider::createEndpointDetector(slave.get()->pid));
+
+  updateSlaveMessage = FUTURE_PROTOBUF(UpdateSlaveMessage(), _, _);
+
+  resourceProvider->start(std::move(endpointDetector), contentType);
+
+  // Wait until the agent's resources have been updated to include the
+  // resource provider.
+  AWAIT_READY(updateSlaveMessage);
+  ASSERT_FALSE(updateSlaveMessage->resource_providers().providers().empty());
+
+  {
+    v1::master::Call v1Call;
+    v1Call.set_type(v1::master::Call::GET_AGENTS);
+
+    Future<v1::master::Response> v1Response =
+      post(master.get()->pid, v1Call, contentType);
+
+    AWAIT_READY(v1Response);
+    ASSERT_TRUE(v1Response->IsInitialized());
+    ASSERT_EQ(v1::master::Response::GET_AGENTS, v1Response->type());
+    ASSERT_EQ(1, v1Response->get_agents().agents_size());
+    ASSERT_EQ(1, v1Response->get_agents().agents(0).resource_providers_size());
+
+    const mesos::v1::ResourceProviderInfo& responseInfo =
+      v1Response->get_agents()
+        .agents(0)
+        .resource_providers(0)
+        .resource_provider_info();
+
+    EXPECT_EQ(info.type(), responseInfo.type());
+    EXPECT_EQ(info.name(), responseInfo.name());
+    EXPECT_TRUE(responseInfo.has_id());
+  }
+
+  updateSlaveMessage = FUTURE_PROTOBUF(UpdateSlaveMessage(), _, _);
+
+  // Disconnect the resource provider.
+  resourceProvider.reset();
+
+  // Wait until the agent's resources have been updated to exclude the
+  // resource provider.
+  AWAIT_READY(updateSlaveMessage);
+  ASSERT_TRUE(updateSlaveMessage->resource_providers().providers().empty());
+
+  {
+    v1::master::Call v1Call;
+    v1Call.set_type(v1::master::Call::GET_AGENTS);
+
+    Future<v1::master::Response> v1Response =
+      post(master.get()->pid, v1Call, contentType);
+
+    AWAIT_READY(v1Response);
+    ASSERT_TRUE(v1Response->IsInitialized());
+    ASSERT_EQ(v1::master::Response::GET_AGENTS, v1Response->type());
+    ASSERT_EQ(1, v1Response->get_agents().agents_size());
+    EXPECT_TRUE(
+        v1Response->get_agents().agents(0).resource_providers().empty());
+  }
 }
 
 
@@ -1047,11 +1152,11 @@ TEST_P(MasterAPITest, GetRoles)
   ASSERT_EQ(2, v1Response->get_roles().roles().size());
   EXPECT_EQ("role1", v1Response->get_roles().roles(1).name());
   EXPECT_EQ(2.5, v1Response->get_roles().roles(1).weight());
-  ASSERT_EQ(
-      allocatedResources(
-          devolve(v1::Resources::parse(slaveFlags.resources.get()).get()),
-          "role1"),
-      devolve(v1Response->get_roles().roles(1).resources()));
+
+  EXPECT_EQ(
+      CHECK_NOTERROR(v1::Resources::parse(
+          "cpus:0.5; disk:1024; mem:512")),
+      v1Response->get_roles().roles(1).resources());
 
   driver.stop();
   driver.join();
@@ -1092,7 +1197,7 @@ TEST_P(MasterAPITest, GetOperations)
   info.set_type("org.apache.mesos.rp.test");
   info.set_name("test");
 
-  v1::MockResourceProvider resourceProvider(
+  v1::TestResourceProvider resourceProvider(
       info,
       v1::createDiskResource(
           "200",
@@ -1167,7 +1272,7 @@ TEST_P(MasterAPITest, GetOperations)
 
   // The operation is still pending when we receive this event.
   Future<mesos::v1::resource_provider::Event::ApplyOperation> operation;
-  EXPECT_CALL(resourceProvider, applyOperation(_))
+  EXPECT_CALL(*resourceProvider.process, applyOperation(_))
     .WillOnce(FutureArg<0>(&operation));
 
   // Start an operation.
@@ -1333,6 +1438,164 @@ TEST_P(MasterAPITest, ReserveResources)
 
   driver.stop();
   driver.join();
+}
+
+
+// This test verifies that an operator can update existing reservation through
+// the `RESERVE_RESOURCES` call.
+TEST_P(MasterAPITest, ReservationUpdate)
+{
+  ContentType contentType = GetParam();
+
+  TestAllocator<> allocator;
+  EXPECT_CALL(allocator, initialize(_, _, _));
+
+  Try<Owned<cluster::Master>> master = StartMaster(&allocator);
+  ASSERT_SOME(master);
+
+  Future<SlaveID> slaveId;
+  EXPECT_CALL(allocator, addSlave(_, _, _, _, _, _))
+    .WillOnce(DoAll(InvokeAddSlave(&allocator),
+                    FutureArg<0>(&slaveId)));
+
+  Future<Nothing> __recover = FUTURE_DISPATCH(_, &Slave::__recover);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get());
+  ASSERT_SOME(slave);
+
+  // Wait until the agent has finished recovery.
+  ASSERT_SOME(slave);
+  AWAIT_READY(__recover);
+
+  // It's actually impossible to construct `Resources` from the contents
+  // of `state["reserved_resources"]`, so instead we just compare against
+  // the expected JSON below.
+  JSON::Value resourcesJson = JSON::parse(R"_(
+        {
+            "cpus": 1.0,
+            "disk": 0.0,
+            "gpus": 0.0,
+            "mem": 10.0
+        }
+      )_").get();
+
+  Resources unreserved = Resources::parse("cpus:1;mem:10").get();
+  Resources dynamicallyReserved =
+    unreserved.pushReservation(createDynamicReservationInfo(
+        "role", DEFAULT_CREDENTIAL.principal()));
+
+  Resources dynamicallyReservedToFoo =
+    dynamicallyReserved.pushReservation(createDynamicReservationInfo(
+        "role/foo", DEFAULT_CREDENTIAL.principal()));
+
+  Resources dynamicallyReservedToBar =
+    dynamicallyReserved.pushReservation(createDynamicReservationInfo(
+        "role/bar", DEFAULT_CREDENTIAL.principal()));
+
+  // Helper function to attempt a reservation update from a given `source`
+  // to a given reservation using an operator API call.
+  //
+  // Note that RESERVE_RESOURCES call does not wait for the agent to apply
+  // the operation, hence this function might return before the agent changes
+  // its state!
+  auto attemptReservation = [&master, &slaveId, &contentType](
+      const Resources& source,
+      const Resources& resources,
+      const std::string& expectedResponseStatus) {
+    v1::master::Call v1Call;
+    v1Call.set_type(v1::master::Call::RESERVE_RESOURCES);
+    v1::master::Call::ReserveResources* reserveResources =
+      v1Call.mutable_reserve_resources();
+
+    reserveResources->mutable_agent_id()->CopyFrom(evolve(slaveId.get()));
+    reserveResources->mutable_source()->CopyFrom(evolve(source));
+    reserveResources->mutable_resources()->CopyFrom(evolve(resources));
+
+    Future<http::Response> response = http::post(
+      master.get()->pid,
+      "api/v1",
+      createBasicAuthHeaders(DEFAULT_CREDENTIAL),
+      serialize(contentType, v1Call),
+      stringify(contentType));
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(expectedResponseStatus, response);
+  };
+
+  // Helper function to verify that the resources on the agent are
+  // indeed reserved to the specified role.
+  auto verifyReservation = [&slave, &resourcesJson](
+      const std::string& intendedRole) {
+    Future<http::Response> response = http::get(
+        slave.get()->pid,
+        "state",
+        None(), // query
+        createBasicAuthHeaders(DEFAULT_CREDENTIAL));
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(http::OK().status, response);
+    AWAIT_EXPECT_RESPONSE_HEADER_EQ(APPLICATION_JSON, "Content-Type", response);
+
+    Try<JSON::Value> json = JSON::parse(response->body);
+    ASSERT_SOME(json);
+
+    Result<JSON::Object> reservations =
+      json->as<JSON::Object>().at<JSON::Object>("reserved_resources");
+
+    ASSERT_SOME(reservations);
+    EXPECT_EQ(reservations->values.size(), 1u);
+
+    foreachpair (
+        const std::string& role,
+        const JSON::Value& reservation,
+        reservations->values) {
+      EXPECT_EQ(role, intendedRole);
+      EXPECT_EQ(resourcesJson, reservation);
+    }
+  };
+
+  // Setup done, actual test can start now.
+  const std::string conflict = http::Conflict().status;
+  const std::string accepted = http::Accepted().status;
+
+  // Should fail, since there are no resources that are dynamically
+  // reserved to `role/bar`.
+  attemptReservation(
+      dynamicallyReservedToBar,
+      dynamicallyReservedToFoo,
+      conflict);
+
+  // Reserve unreserved resources to `role/foo`.
+  attemptReservation(
+      unreserved,
+      dynamicallyReservedToFoo,
+      accepted);
+
+  // Wait for the agent to apply operation.
+  Clock::pause();
+  Clock::settle();
+  Clock::resume();
+
+  verifyReservation("role/foo");
+
+  // Should fail again, since there are still no resources that are
+  // dynamically reserved to `role/bar`.
+  attemptReservation(
+      dynamicallyReservedToBar,
+      dynamicallyReservedToFoo,
+      conflict);
+
+  // Update reservation from `role/foo` to `role/bar`.
+  attemptReservation(
+      dynamicallyReservedToFoo,
+      dynamicallyReservedToBar,
+      accepted);
+
+  // Wait for the agent to apply operation.
+  Clock::pause();
+  Clock::settle();
+  Clock::resume();
+
+  verifyReservation("role/bar");
 }
 
 
@@ -1823,50 +2086,26 @@ TEST_P(MasterAPITest, SubscribeAgentEvents)
   Try<Owned<cluster::Master>> master = this->StartMaster();
   ASSERT_SOME(master);
 
-  v1::master::Call v1Call;
-  v1Call.set_type(v1::master::Call::SUBSCRIBE);
+  v1::MockMasterAPISubscriber subscriber;
 
-  http::Headers headers = createBasicAuthHeaders(DEFAULT_CREDENTIAL);
+  Future<v1::master::Event::Subscribed> subscribed;
+  EXPECT_CALL(subscriber, subscribed(_))
+    .WillOnce(FutureArg<0>(&subscribed));
 
-  headers["Accept"] = stringify(contentType);
+  AWAIT_READY(subscriber.subscribe(master.get()->pid, contentType));
+  AWAIT_READY(subscribed);
 
-  Future<http::Response> response = http::streaming::post(
-      master.get()->pid,
-      "api/v1",
-      headers,
-      serialize(contentType, v1Call),
-      stringify(contentType));
-
-  AWAIT_EXPECT_RESPONSE_STATUS_EQ(http::OK().status, response);
-  AWAIT_EXPECT_RESPONSE_HEADER_EQ("chunked", "Transfer-Encoding", response);
-  ASSERT_EQ(http::Response::PIPE, response->type);
-  ASSERT_SOME(response->reader);
-
-  http::Pipe::Reader reader = response->reader.get();
-
-  auto deserializer =
-    lambda::bind(deserialize<v1::master::Event>, contentType, lambda::_1);
-
-  Reader<v1::master::Event> decoder(
-      Decoder<v1::master::Event>(deserializer), reader);
-
-  Future<Result<v1::master::Event>> event = decoder.read();
-  AWAIT_READY(event);
-
-  EXPECT_EQ(v1::master::Event::SUBSCRIBED, event->get().type());
-  const v1::master::Response::GetState& getState =
-      event->get().subscribed().get_state();
+  const v1::master::Response::GetState& getState = subscribed->get_state();
 
   EXPECT_TRUE(getState.get_frameworks().frameworks().empty());
   EXPECT_TRUE(getState.get_agents().agents().empty());
   EXPECT_TRUE(getState.get_tasks().tasks().empty());
   EXPECT_TRUE(getState.get_executors().executors().empty());
 
-  event = decoder.read();
-
-  AWAIT_READY(event);
-
-  EXPECT_EQ(v1::master::Event::HEARTBEAT, event->get().type());
+  // Expect AGENT_ADDED message after starting an agent
+  Future<v1::master::Event::AgentAdded> agentAdded;
+  EXPECT_CALL(subscriber, agentAdded(_))
+    .WillOnce(FutureArg<0>(&agentAdded));
 
   // Start one agent.
   Future<SlaveRegisteredMessage> agentRegisteredMessage =
@@ -1881,16 +2120,12 @@ TEST_P(MasterAPITest, SubscribeAgentEvents)
 
   AWAIT_READY(agentRegisteredMessage);
 
-  event = decoder.read();
-  AWAIT_READY(event);
+  AWAIT_READY(agentAdded);
 
   SlaveID agentID = agentRegisteredMessage->slave_id();
 
   {
-    ASSERT_EQ(v1::master::Event::AGENT_ADDED, event->get().type());
-
-    const v1::master::Response::GetAgents::Agent& agent =
-      event->get().agent_added().agent();
+    const v1::master::Response::GetAgents::Agent& agent = agentAdded->agent();
 
     ASSERT_EQ("host", agent.agent_info().hostname());
     ASSERT_EQ(evolve(agentID), agent.agent_info().id());
@@ -1899,17 +2134,18 @@ TEST_P(MasterAPITest, SubscribeAgentEvents)
     ASSERT_EQ(4, agent.total_resources_size());
   }
 
+  // Expect AGENT_REMOVED message after agent removal.
+  Future<v1::master::Event::AgentRemoved> agentRemoved;
+  EXPECT_CALL(subscriber, agentRemoved(_))
+    .WillOnce(FutureArg<0>(&agentRemoved));
+
   // Forcefully trigger a shutdown on the slave so that master will remove it.
   slave.get()->shutdown();
   slave->reset();
 
-  event = decoder.read();
-  AWAIT_READY(event);
+  AWAIT_READY(agentRemoved);
 
-  {
-    ASSERT_EQ(v1::master::Event::AGENT_REMOVED, event->get().type());
-    ASSERT_EQ(evolve(agentID), event->get().agent_removed().agent_id());
-  }
+  ASSERT_EQ(evolve(agentID), agentRemoved->agent_id());
 }
 
 
@@ -2319,53 +2555,36 @@ TEST_P(MasterAPITest, Subscribe)
 
   // Create event stream after seeing first offer but before first task is
   // launched. We should see one framework, one agent and zero task/executor.
-  v1::master::Call v1Call;
-  v1Call.set_type(v1::master::Call::SUBSCRIBE);
+  v1::MockMasterAPISubscriber subscriber;
 
-  http::Headers headers = createBasicAuthHeaders(DEFAULT_CREDENTIAL);
+  Future<v1::master::Event::Subscribed> subscribedToMasterEvents;
+  EXPECT_CALL(subscriber, subscribed(_))
+    .WillOnce(FutureArg<0>(&subscribedToMasterEvents));
 
-  headers["Accept"] = stringify(contentType);
+  AWAIT_READY(subscriber.subscribe(master.get()->pid, contentType));
+  AWAIT_READY(subscribedToMasterEvents);
 
-  Future<http::Response> response = http::streaming::post(
-      master.get()->pid,
-      "api/v1",
-      headers,
-      serialize(contentType, v1Call),
-      stringify(contentType));
-
-  AWAIT_EXPECT_RESPONSE_STATUS_EQ(http::OK().status, response);
-  AWAIT_EXPECT_RESPONSE_HEADER_EQ("chunked", "Transfer-Encoding", response);
-  ASSERT_EQ(http::Response::PIPE, response->type);
-  ASSERT_SOME(response->reader);
-
-  http::Pipe::Reader reader = response->reader.get();
-
-  auto deserializer =
-    lambda::bind(deserialize<v1::master::Event>, contentType, lambda::_1);
-
-  Reader<v1::master::Event> decoder(
-      Decoder<v1::master::Event>(deserializer), reader);
-
-  Future<Result<v1::master::Event>> event = decoder.read();
-  AWAIT_READY(event);
-
-  EXPECT_EQ(v1::master::Event::SUBSCRIBED, event->get().type());
   const v1::master::Response::GetState& getState =
-      event->get().subscribed().get_state();
+    subscribedToMasterEvents->get_state();
 
   EXPECT_EQ(1, getState.get_frameworks().frameworks_size());
   EXPECT_EQ(1, getState.get_agents().agents_size());
   EXPECT_TRUE(getState.get_tasks().tasks().empty());
   EXPECT_TRUE(getState.get_executors().executors().empty());
 
-  event = decoder.read();
+  // Expect TASK_ADDED and TASK_UPDATED events, in sequence.
+  Sequence masterEventsSequence;
 
-  AWAIT_READY(event);
+  Future<v1::master::Event::TaskAdded> taskAdded;
+  EXPECT_CALL(subscriber, taskAdded(_))
+    .InSequence(masterEventsSequence)
+    .WillOnce(FutureArg<0>(&taskAdded));
 
-  EXPECT_EQ(v1::master::Event::HEARTBEAT, event->get().type());
-
-  event = decoder.read();
-  EXPECT_TRUE(event.isPending());
+  // There should be only one taskUpdated event
+  Future<v1::master::Event::TaskUpdated> taskUpdated;
+  EXPECT_CALL(subscriber, taskUpdated(_))
+    .InSequence(masterEventsSequence)
+    .WillOnce(FutureArg<0>(&taskUpdated));
 
   const v1::Offer& offer = offers->offers(0);
 
@@ -2418,33 +2637,23 @@ TEST_P(MasterAPITest, Subscribe)
     mesos.send(call);
   }
 
-  AWAIT_READY(event);
+  AWAIT_READY(taskAdded);
   AWAIT_READY(update);
 
-  ASSERT_EQ(v1::master::Event::TASK_ADDED, event->get().type());
-  ASSERT_EQ(evolve(task.task_id()),
-            event->get().task_added().task().task_id());
-  ASSERT_TRUE(event->get().task_added().task().has_health_check());
+  ASSERT_EQ(evolve(task.task_id()), taskAdded->task().task_id());
+  ASSERT_TRUE(taskAdded->task().has_health_check());
   ASSERT_EQ(
       v1::HealthCheck::COMMAND,
-      event->get().task_added().task().health_check().type());
+      taskAdded->task().health_check().type());
   ASSERT_EQ(
       checkCommandValue,
-      event->get().task_added().task().health_check().command().value());
+      taskAdded->task().health_check().command().value());
 
-  event = decoder.read();
+  AWAIT_READY(taskUpdated);
 
-  AWAIT_READY(event);
-
-  ASSERT_EQ(v1::master::Event::TASK_UPDATED, event->get().type());
-  ASSERT_EQ(v1::TASK_RUNNING,
-            event->get().task_updated().state());
-  ASSERT_EQ(v1::TASK_RUNNING,
-            event->get().task_updated().status().state());
-  ASSERT_EQ(evolve(task.task_id()),
-            event->get().task_updated().status().task_id());
-
-  event = decoder.read();
+  ASSERT_EQ(v1::TASK_RUNNING, taskUpdated->state());
+  ASSERT_EQ(v1::TASK_RUNNING, taskUpdated->status().state());
+  ASSERT_EQ(evolve(task.task_id()), taskUpdated->status().task_id());
 
   Future<Nothing> update2;
   EXPECT_CALL(*scheduler, update(_, _))
@@ -2459,16 +2668,29 @@ TEST_P(MasterAPITest, Subscribe)
 
   AWAIT_READY(update2);
 
-  EXPECT_TRUE(event.isPending());
-
-  EXPECT_TRUE(reader.close());
-
   EXPECT_CALL(*executor, shutdown(_))
     .Times(AtMost(1));
 
   EXPECT_CALL(*executor, disconnected(_))
     .Times(AtMost(1));
 }
+
+
+// Helper functor for SubscribersReceiveHealthUpdates test.
+// NOTE: We cannot use a lambda due to testing::ResultOf requiring result_type.
+struct IsFailedHealthCheckTaskUpdate
+{
+  TaskID taskId;
+  using result_type = bool;
+  bool operator() (const v1::master::Event::TaskUpdated& event) const {
+    const v1::TaskStatus& status = event.status();
+    return status.task_id() == evolve(taskId) &&
+           status.state() == v1::TASK_RUNNING &&
+           status.reason() ==
+             v1::TaskStatus::REASON_TASK_HEALTH_CHECK_STATUS_UPDATED &&
+           !status.healthy();
+  };
+};
 
 
 // This test verifies that subscribers eventually receive events with the
@@ -2516,34 +2738,10 @@ TEST_P(MasterAPITest, SubscribersReceiveHealthUpdates)
   v1::FrameworkID frameworkId(subscribed->framework_id());
 
   // Subscribe to the master's event stream via the v1 API.
-  v1::master::Call v1Call;
-  v1Call.set_type(v1::master::Call::SUBSCRIBE);
+  v1::MockMasterAPISubscriber subscriber;
+  AWAIT_READY(subscriber.subscribe(master.get()->pid, contentType));
 
-  http::Headers headers = createBasicAuthHeaders(DEFAULT_CREDENTIAL);
 
-  headers["Accept"] = stringify(contentType);
-
-  Future<http::Response> response = http::streaming::post(
-      master.get()->pid,
-      "api/v1",
-      headers,
-      serialize(contentType, v1Call),
-      stringify(contentType));
-
-  AWAIT_EXPECT_RESPONSE_STATUS_EQ(http::OK().status, response);
-  AWAIT_EXPECT_RESPONSE_HEADER_EQ("chunked", "Transfer-Encoding", response);
-  ASSERT_EQ(http::Response::PIPE, response->type);
-  ASSERT_SOME(response->reader);
-
-  http::Pipe::Reader reader = response->reader.get();
-
-  auto deserializer =
-    lambda::bind(deserialize<v1::master::Event>, contentType, lambda::_1);
-
-  Reader<v1::master::Event> decoder(
-      Decoder<v1::master::Event>(deserializer), reader);
-
-  // Prepare and launch a task with a failing health check using the scheduler.
   AWAIT_READY(offers);
   ASSERT_FALSE(offers->offers().empty());
 
@@ -2551,6 +2749,14 @@ TEST_P(MasterAPITest, SubscribersReceiveHealthUpdates)
   const v1::AgentID agentId(offer.agent_id());
 
   TaskInfo task = createTask(devolve(offer), SLEEP_COMMAND(10000));
+
+  // Expect taskUpdated event caused by a failed health check.
+  Future<Nothing> taskUpdateWithFailedHealthCheckObserved;
+  EXPECT_CALL(
+    subscriber,
+    taskUpdated(
+      testing::ResultOf(IsFailedHealthCheckTaskUpdate{task.task_id()}, true)))
+    .WillOnce(FutureSatisfy(&taskUpdateWithFailedHealthCheckObserved));
 
   // This describes a single health check that will fail.
   HealthCheck healthCheck;
@@ -2568,39 +2774,12 @@ TEST_P(MasterAPITest, SubscribersReceiveHealthUpdates)
   mesos.send(
       v1::createCallAccept(frameworkId, offer, {v1::LAUNCH({evolve(task)})}));
 
-  // Expect to get a task health update after a _small_ number of other events,
-  // e.g., `SUBSCRIBED`, initial `HEARTBEAT`, `TASK_STARTING` and `TASK_RUNNING`
-  // task status updates, etc; 10 seems to be a reasonable number.
-  //
-  // TODO(alexr): Instead of guessing the number of events we should filter
-  // out all uninteresting events. This can be done for example by introducing
-  // a way to inject a "matcher" for the event, something like:
-  //   AWAIT_READY(event, [](const auto& event ) -> bool {
-  //     return (event->get().type() == ...); });
-  int maxEventsToSkip = 10;
-  bool taskHealthUpdateObserved = false;
-  while (maxEventsToSkip--) {
-    Future<Result<v1::master::Event>> event = decoder.read();
-    AWAIT_READY(event);
-
-    if (event->get().type() == v1::master::Event::TASK_UPDATED &&
-        event->get().task_updated().status().task_id() ==
-          evolve(task.task_id()) &&
-        event->get().task_updated().status().state() == v1::TASK_RUNNING &&
-        event->get().task_updated().status().reason() ==
-          v1::TaskStatus::REASON_TASK_HEALTH_CHECK_STATUS_UPDATED &&
-        event->get().task_updated().status().healthy() == false) {
-      taskHealthUpdateObserved = true;
-      break;
-    }
-  }
-
-  ASSERT_TRUE(taskHealthUpdateObserved)
-      << "Health update for task '" << task.task_id()
-      << "' has not been received";
+  AWAIT_READY(taskUpdateWithFailedHealthCheckObserved);
 
   // Kill task before test tear-down to avoid race between scheduler
   // tear-down and scheduler getting/acknowledging status update.
+  //
+  // TODO(asekretenko): Check if we still need this.
   Future<Nothing> killed;
   EXPECT_CALL(*scheduler, update(_, TaskStatusUpdateStateEq(v1::TASK_KILLED)))
     .WillOnce(FutureSatisfy(&killed));
@@ -2612,8 +2791,9 @@ TEST_P(MasterAPITest, SubscribersReceiveHealthUpdates)
 
 
 // This test verifies that subscribing to the 'api/v1' endpoint between
-// a master failover and an agent re-registration won't cause the master
-// to crash. See MESOS-8601.
+// a master failover and an agent reregistration won't cause the master
+// to crash, and frameworks recovered through agent reregistration will be
+// broadcast to subscribers. See MESOS-8601 and MESOS-9785.
 TEST_P(MasterAPITest, MasterFailover)
 {
   ContentType contentType = GetParam();
@@ -2709,52 +2889,44 @@ TEST_P(MasterAPITest, MasterFailover)
 
   detector.appoint(master.get()->pid);
 
+  v1::MockMasterAPISubscriber subscriber;
+
+  Future<v1::master::Event::Subscribed> subscribedToMasterAPIEvents;
+  EXPECT_CALL(subscriber, subscribed(_))
+    .WillOnce(FutureArg<0>(&subscribedToMasterAPIEvents));
+
+  // The agent re-registration should result in an `AGENT_ADDED` event,
+  // a `FRAMEWORK_ADDED` event and a `TASK_ADDED` event in order.
+  Sequence masterEventsSequence;
+
+  Future<v1::master::Event::AgentAdded> agentAdded;
+  EXPECT_CALL(subscriber, agentAdded(_))
+    .InSequence(masterEventsSequence)
+    .WillOnce(FutureArg<0>(&agentAdded));
+
+  Future<v1::master::Event::FrameworkAdded> frameworkAdded;
+  EXPECT_CALL(subscriber, frameworkAdded(_))
+    .InSequence(masterEventsSequence)
+    .WillOnce(FutureArg<0>(&frameworkAdded));
+
+  Future<v1::master::Event::TaskAdded> taskAdded;
+  EXPECT_CALL(subscriber, taskAdded(_))
+    .InSequence(masterEventsSequence)
+    .WillOnce(FutureArg<0>(&taskAdded));
+
   // Create event stream after the master failover but before the agent
   // re-registration. We should see no framework, agent, task and
   // executor at all.
-  v1::master::Call v1Call;
-  v1Call.set_type(v1::master::Call::SUBSCRIBE);
+  AWAIT_READY(subscriber.subscribe(master.get()->pid, contentType));
+  AWAIT_READY(subscribedToMasterAPIEvents);
 
-  http::Headers headers = createBasicAuthHeaders(DEFAULT_CREDENTIAL);
-
-  headers["Accept"] = stringify(contentType);
-
-  Future<http::Response> response = http::streaming::post(
-      master.get()->pid,
-      "api/v1",
-      headers,
-      serialize(contentType, v1Call),
-      stringify(contentType));
-
-  AWAIT_EXPECT_RESPONSE_STATUS_EQ(http::OK().status, response);
-  AWAIT_EXPECT_RESPONSE_HEADER_EQ("chunked", "Transfer-Encoding", response);
-  ASSERT_EQ(http::Response::PIPE, response->type);
-  ASSERT_SOME(response->reader);
-
-  http::Pipe::Reader reader = response->reader.get();
-
-  auto deserializer =
-    lambda::bind(deserialize<v1::master::Event>, contentType, lambda::_1);
-
-  Reader<v1::master::Event> decoder(
-      Decoder<v1::master::Event>(deserializer), reader);
-
-  Future<Result<v1::master::Event>> event = decoder.read();
-  AWAIT_READY(event);
-
-  EXPECT_EQ(v1::master::Event::SUBSCRIBED, event->get().type());
   const v1::master::Response::GetState& getState =
-      event->get().subscribed().get_state();
+    subscribedToMasterAPIEvents->get_state();
 
   EXPECT_EQ(0, getState.get_frameworks().frameworks_size());
   EXPECT_EQ(0, getState.get_agents().agents_size());
   EXPECT_EQ(0, getState.get_tasks().tasks_size());
   EXPECT_EQ(0, getState.get_executors().executors_size());
-
-  event = decoder.read();
-  AWAIT_READY(event);
-
-  EXPECT_EQ(v1::master::Event::HEARTBEAT, event->get().type());
 
   Future<SlaveReregisteredMessage> slaveReregisteredMessage =
     FUTURE_PROTOBUF(SlaveReregisteredMessage(), _, _);
@@ -2764,21 +2936,17 @@ TEST_P(MasterAPITest, MasterFailover)
 
   AWAIT_READY(slaveReregisteredMessage);
 
-  // The agent re-registration should result in an `AGENT_ADDED` event
-  // and a `TASK_ADDED` event.
-  set<v1::master::Event::Type> expectedEvents =
-    {v1::master::Event::AGENT_ADDED, v1::master::Event::TASK_ADDED};
-  set<v1::master::Event::Type> observedEvents;
+  AWAIT_READY(agentAdded);
+  EXPECT_EQ(agentId, agentAdded->agent().agent_info().id());
 
-  event = decoder.read();
-  AWAIT_READY(event);
-  observedEvents.insert(event->get().type());
+  AWAIT_READY(frameworkAdded);
+  EXPECT_EQ(frameworkId, frameworkAdded->framework().framework_info().id());
+  EXPECT_FALSE(frameworkAdded->framework().active());
+  EXPECT_FALSE(frameworkAdded->framework().connected());
+  EXPECT_TRUE(frameworkAdded->framework().recovered());
 
-  event = decoder.read();
-  AWAIT_READY(event);
-  observedEvents.insert(event->get().type());
-
-  EXPECT_EQ(expectedEvents, observedEvents);
+  AWAIT_READY(taskAdded);
+  EXPECT_EQ(task.task_id(), taskAdded->task().task_id());
 }
 
 
@@ -2921,8 +3089,7 @@ TEST_P(MasterAPITest, EventAuthorizationFiltering)
   auto deserializer =
     lambda::bind(deserialize<v1::master::Event>, contentType, lambda::_1);
 
-  Reader<v1::master::Event> decoder(
-      Decoder<v1::master::Event>(deserializer), reader);
+  Reader<v1::master::Event> decoder(deserializer, reader);
 
   {
     Future<Result<v1::master::Event>> event = decoder.read();
@@ -3096,249 +3263,6 @@ TEST_P(MasterAPITest, EventAuthorizationFiltering)
 }
 
 
-// Operator API events are sent using an asynchronous call chain. When
-// event-related state changes in the master before the authorizer returns, the
-// continuations which actually send the event should still have a consistent
-// view of the master state from the time when the event occurred. This test
-// forces task removal in the master before the authorizer returns in order to
-// verify that events are sent correctly in that case.
-TEST_P(MasterAPITest, EventAuthorizationDelayed)
-{
-  Clock::pause();
-
-  ContentType contentType = GetParam();
-
-  MockAuthorizer authorizer;
-  Try<Owned<cluster::Master>> master = StartMaster(&authorizer);
-  ASSERT_SOME(master);
-
-  auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
-  auto executor = std::make_shared<v1::MockHTTPExecutor>();
-
-  ExecutorID executorId = DEFAULT_EXECUTOR_ID;
-  TestContainerizer containerizer(executorId, executor);
-
-  Future<SlaveRegisteredMessage> slaveRegisteredMessage =
-    FUTURE_PROTOBUF(SlaveRegisteredMessage(), _, _);
-
-  Owned<MasterDetector> detector = master.get()->createDetector();
-
-  slave::Flags slaveFlags = MesosTest::CreateSlaveFlags();
-
-  Try<Owned<cluster::Slave>> slave =
-    StartSlave(detector.get(), &containerizer, slaveFlags);
-  ASSERT_SOME(slave);
-
-  Clock::advance(slaveFlags.registration_backoff_factor);
-
-  AWAIT_READY(slaveRegisteredMessage);
-
-  EXPECT_CALL(*scheduler, connected(_))
-    .WillOnce(v1::scheduler::SendSubscribe(v1::DEFAULT_FRAMEWORK_INFO));
-
-  Future<v1::scheduler::Event::Subscribed> subscribed;
-  EXPECT_CALL(*scheduler, subscribed(_, _))
-    .WillOnce(FutureArg<1>(&subscribed));
-
-  EXPECT_CALL(*scheduler, heartbeat(_))
-    .WillRepeatedly(Return()); // Ignore heartbeats.
-
-  Future<v1::scheduler::Event::Offers> offers;
-  EXPECT_CALL(*scheduler, offers(_, _))
-    .WillOnce(FutureArg<1>(&offers));
-
-  v1::scheduler::TestMesos mesos(
-      master.get()->pid,
-      contentType,
-      scheduler);
-
-  AWAIT_READY(subscribed);
-
-  AWAIT_READY(offers);
-  ASSERT_FALSE(offers->offers().empty());
-
-  // Create an event stream after seeing first offer but before a task is
-  // launched. We should see one framework, one agent, and no tasks/executors.
-  v1::master::Call v1Call;
-  v1Call.set_type(v1::master::Call::SUBSCRIBE);
-
-  http::Headers headers = createBasicAuthHeaders(DEFAULT_CREDENTIAL);
-  headers["Accept"] = stringify(contentType);
-
-  Future<http::Response> response = http::streaming::post(
-      master.get()->pid,
-      "api/v1",
-      headers,
-      serialize(contentType, v1Call),
-      stringify(contentType));
-
-  AWAIT_EXPECT_RESPONSE_STATUS_EQ(http::OK().status, response);
-  AWAIT_EXPECT_RESPONSE_HEADER_EQ("chunked", "Transfer-Encoding", response);
-  ASSERT_EQ(http::Response::PIPE, response->type);
-  ASSERT_SOME(response->reader);
-
-  http::Pipe::Reader reader = response->reader.get();
-
-  auto deserializer =
-    lambda::bind(deserialize<v1::master::Event>, contentType, lambda::_1);
-
-  Reader<v1::master::Event> decoder(
-      Decoder<v1::master::Event>(deserializer), reader);
-
-  Future<Result<v1::master::Event>> event = decoder.read();
-  AWAIT_READY(event);
-
-  EXPECT_EQ(v1::master::Event::SUBSCRIBED, event->get().type());
-  const v1::master::Response::GetState& getState =
-    event->get().subscribed().get_state();
-
-  EXPECT_EQ(1, getState.get_frameworks().frameworks_size());
-  EXPECT_EQ(1, getState.get_agents().agents_size());
-  EXPECT_TRUE(getState.get_tasks().tasks().empty());
-  EXPECT_TRUE(getState.get_executors().executors().empty());
-
-  event = decoder.read();
-
-  AWAIT_READY(event);
-
-  EXPECT_EQ(v1::master::Event::HEARTBEAT, event->get().type());
-
-  event = decoder.read();
-  EXPECT_TRUE(event.isPending());
-
-  // When the authorizer is called, return pending futures
-  // that we can satisfy later.
-  Promise<Owned<ObjectApprover>> taskAddedApprover;
-  Promise<Owned<ObjectApprover>> updateRunningApprover;
-  Promise<Owned<ObjectApprover>> updateFinishedApprover;
-
-  Sequence approverSequence;
-
-  // Each event results in 4 calls into the authorizer.
-  // NOTE: This may change when the operator event stream code is refactored
-  // to avoid unnecessary authorizer calls. See MESOS-8475.
-  EXPECT_CALL(authorizer, getObjectApprover(_, _))
-    .Times(4)
-    .InSequence(approverSequence)
-    .WillRepeatedly(Return(taskAddedApprover.future()));
-  EXPECT_CALL(authorizer, getObjectApprover(_, _))
-    .Times(4)
-    .InSequence(approverSequence)
-    .WillRepeatedly(Return(updateRunningApprover.future()));
-  EXPECT_CALL(authorizer, getObjectApprover(_, _))
-    .Times(4)
-    .InSequence(approverSequence)
-    .WillRepeatedly(Return(updateFinishedApprover.future()));
-
-  const v1::Offer& offer = offers->offers(0);
-
-  v1::AgentID slaveId(offer.agent_id());
-
-  v1::FrameworkID frameworkId(subscribed->framework_id());
-
-  EXPECT_CALL(*scheduler, update(_, _))
-    .WillOnce(v1::scheduler::SendAcknowledge(frameworkId, slaveId))
-    .WillOnce(v1::scheduler::SendAcknowledge(frameworkId, slaveId));
-
-  // Capture the acknowledgement messages to the agent so that we can delay the
-  // authorizer until the master has processed the terminal acknowledgement.
-  // NOTE: These calls are in reverse order because they use `EXPECT_CALL` under
-  // the hood, and such expectations are evaluated in reverse order.
-  Future<StatusUpdateAcknowledgementMessage> acknowledgeFinished =
-    FUTURE_PROTOBUF(
-        StatusUpdateAcknowledgementMessage(),
-        master.get()->pid,
-        slave.get()->pid);
-  Future<StatusUpdateAcknowledgementMessage> acknowledgeRunning =
-    FUTURE_PROTOBUF(
-        StatusUpdateAcknowledgementMessage(),
-        master.get()->pid,
-        slave.get()->pid);
-
-  EXPECT_CALL(*executor, connected(_))
-    .WillOnce(v1::executor::SendSubscribe(frameworkId, evolve(executorId)));
-
-  EXPECT_CALL(*executor, subscribed(_, _));
-
-  EXPECT_CALL(*executor, launch(_, _))
-    .WillOnce(v1::executor::SendUpdateFromTask(
-        frameworkId, evolve(executorId), v1::TASK_RUNNING));
-
-  EXPECT_CALL(*executor, acknowledged(_, _))
-    .WillOnce(v1::executor::SendUpdateFromTaskID(
-        frameworkId, evolve(executorId), v1::TASK_FINISHED))
-    .WillOnce(Return());
-
-  TaskInfo task = createTask(devolve(offer), "", executorId);
-
-  mesos.send(v1::createCallAccept(
-      frameworkId,
-      offer,
-      {v1::LAUNCH({evolve(task)})}));
-
-  // Wait until the task has finished and task update acknowledgements
-  // have been processed to allow the authorizer to return.
-  AWAIT_READY(acknowledgeRunning);
-  AWAIT_READY(acknowledgeFinished);
-
-  {
-    taskAddedApprover.set(Owned<ObjectApprover>(new AcceptingObjectApprover()));
-
-    AWAIT_READY(event);
-
-    ASSERT_EQ(v1::master::Event::TASK_ADDED, event->get().type());
-    ASSERT_EQ(evolve(task.task_id()),
-              event->get().task_added().task().task_id());
-  }
-
-  event = decoder.read();
-
-  {
-    updateRunningApprover.set(Owned<ObjectApprover>(
-        new AcceptingObjectApprover()));
-
-    AWAIT_READY(event);
-
-    ASSERT_EQ(v1::master::Event::TASK_UPDATED, event->get().type());
-    ASSERT_EQ(v1::TASK_RUNNING,
-              event->get().task_updated().state());
-    ASSERT_EQ(v1::TASK_RUNNING,
-              event->get().task_updated().status().state());
-    ASSERT_EQ(evolve(task.task_id()),
-              event->get().task_updated().status().task_id());
-  }
-
-  event = decoder.read();
-
-  {
-    updateFinishedApprover.set(Owned<ObjectApprover>(
-        new AcceptingObjectApprover()));
-
-    AWAIT_READY(event);
-
-    ASSERT_EQ(v1::master::Event::TASK_UPDATED, event->get().type());
-    ASSERT_EQ(v1::TASK_FINISHED,
-              event->get().task_updated().state());
-    ASSERT_EQ(v1::TASK_FINISHED,
-              event->get().task_updated().status().state());
-    ASSERT_EQ(evolve(task.task_id()),
-              event->get().task_updated().status().task_id());
-  }
-
-  EXPECT_TRUE(reader.close());
-
-  EXPECT_CALL(authorizer, getObjectApprover(_, _))
-    .WillRepeatedly(Return(Owned<ObjectApprover>(
-        new AcceptingObjectApprover())));
-
-  EXPECT_CALL(*executor, shutdown(_))
-    .Times(AtMost(1));
-
-  EXPECT_CALL(*executor, disconnected(_))
-    .Times(AtMost(1));
-}
-
-
 // This test tries to verify that a client subscribed to the 'api/v1' endpoint
 // can receive `FRAMEWORK_ADDED`, `FRAMEWORK_UPDATED` and 'FRAMEWORK_REMOVED'
 // events.
@@ -3373,8 +3297,7 @@ TEST_P(MasterAPITest, FrameworksEvent)
   auto deserializer =
     lambda::bind(deserialize<v1::master::Event>, contentType, lambda::_1);
 
-  Reader<v1::master::Event> decoder(
-      Decoder<v1::master::Event>(deserializer), reader);
+  Reader<v1::master::Event> decoder(deserializer, reader);
 
   Future<Result<v1::master::Event>> event = decoder.read();
   AWAIT_READY(event);
@@ -3545,8 +3468,7 @@ TEST_P(MasterAPITest, Heartbeat)
   auto deserializer =
     lambda::bind(deserialize<v1::master::Event>, contentType, lambda::_1);
 
-  Reader<v1::master::Event> decoder(
-      Decoder<v1::master::Event>(deserializer), reader);
+  Reader<v1::master::Event> decoder(deserializer, reader);
 
   Future<Result<v1::master::Event>> event = decoder.read();
   AWAIT_READY(event);
@@ -3633,8 +3555,7 @@ TEST_P(MasterAPITest, MaxEventStreamSubscribers)
   ASSERT_SOME(response1->reader);
   http::Pipe::Reader reader1 = response1->reader.get();
 
-  Reader<v1::master::Event> decoder1(
-      Decoder<v1::master::Event>(deserializer), reader1);
+  Reader<v1::master::Event> decoder1(deserializer, reader1);
 
   event = decoder1.read();
   AWAIT_READY(event);
@@ -3655,8 +3576,7 @@ TEST_P(MasterAPITest, MaxEventStreamSubscribers)
   ASSERT_SOME(response2->reader);
   http::Pipe::Reader reader2 = response2->reader.get();
 
-  Reader<v1::master::Event> decoder2(
-      Decoder<v1::master::Event>(deserializer), reader2);
+  Reader<v1::master::Event> decoder2(deserializer, reader2);
 
   event = decoder2.read();
   AWAIT_READY(event);
@@ -3702,8 +3622,7 @@ TEST_P(MasterAPITest, MaxEventStreamSubscribers)
     ASSERT_SOME(response3->reader);
     http::Pipe::Reader reader3 = response3->reader.get();
 
-    Reader<v1::master::Event> decoder3(
-        Decoder<v1::master::Event>(deserializer), reader3);
+    Reader<v1::master::Event> decoder3(deserializer, reader3);
 
     event = decoder3.read();
     AWAIT_READY(event);
@@ -3746,8 +3665,7 @@ TEST_P(MasterAPITest, MaxEventStreamSubscribers)
   ASSERT_SOME(response4->reader);
   http::Pipe::Reader reader4 = response4->reader.get();
 
-  Reader<v1::master::Event> decoder4(
-      Decoder<v1::master::Event>(deserializer), reader4);
+  Reader<v1::master::Event> decoder4(deserializer, reader4);
 
   event = decoder4.read();
   AWAIT_READY(event);
@@ -4950,6 +4868,201 @@ TEST_P(MasterAPITest, TaskUpdatesUponAgentGone)
 }
 
 
+// This test verifies that the master correctly sends 'TASK_GONE_BY_OPERATOR'
+// status updates and transitions unreachable tasks to completed when an
+// unreachable agent which was running the tasks is marked as gone.
+TEST_P(MasterAPITest, UnreachableAgentMarkedGone)
+{
+  Clock::pause();
+
+  master::Flags masterFlags = CreateMasterFlags();
+  Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
+  ASSERT_SOME(master);
+
+  Future<SlaveRegisteredMessage> slaveRegisteredMessage =
+    FUTURE_PROTOBUF(SlaveRegisteredMessage(), _, _);
+
+  slave::Flags agentFlags = CreateSlaveFlags();
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), agentFlags);
+  ASSERT_SOME(slave);
+
+  Clock::advance(agentFlags.registration_backoff_factor);
+
+  AWAIT_READY(slaveRegisteredMessage);
+
+  auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
+
+  v1::FrameworkInfo frameworkInfo = v1::DEFAULT_FRAMEWORK_INFO;
+  frameworkInfo.add_capabilities()->set_type(
+      v1::FrameworkInfo::Capability::PARTITION_AWARE);
+
+  EXPECT_CALL(*scheduler, connected(_))
+    .WillOnce(v1::scheduler::SendSubscribe(frameworkInfo));
+
+  Future<v1::scheduler::Event::Subscribed> subscribed;
+  EXPECT_CALL(*scheduler, subscribed(_, _))
+    .WillOnce(FutureArg<1>(&subscribed));
+
+  EXPECT_CALL(*scheduler, heartbeat(_))
+    .WillRepeatedly(Return()); // Ignore heartbeats.
+
+  Future<v1::scheduler::Event::Offers> offers;
+  EXPECT_CALL(*scheduler, offers(_, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return());
+
+  auto mesos = std::make_shared<v1::scheduler::TestMesos>(
+      master.get()->pid, ContentType::PROTOBUF, scheduler);
+
+  AWAIT_READY(subscribed);
+  v1::FrameworkID frameworkId(subscribed->framework_id());
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->offers().empty());
+
+  // Launch a task on this agent so that agent removal will cause
+  // the master to look for the framework struct.
+
+  const v1::Offer& offer = offers->offers(0);
+  const v1::AgentID& agentId = offer.agent_id();
+
+  Try<v1::Resources> resources =
+    v1::Resources::parse("cpus:0.1;mem:64;disk:64");
+
+  ASSERT_SOME(resources);
+
+  v1::TaskInfo taskInfo =
+    v1::createTask(agentId, resources.get(), SLEEP_COMMAND(1000));
+
+  testing::Sequence updateSequence;
+  Future<v1::scheduler::Event::Update> startingUpdate;
+  Future<v1::scheduler::Event::Update> runningUpdate;
+
+  EXPECT_CALL(
+      *scheduler,
+      update(_, AllOf(
+          TaskStatusUpdateTaskIdEq(taskInfo.task_id()),
+          TaskStatusUpdateStateEq(v1::TASK_STARTING))))
+    .InSequence(updateSequence)
+    .WillOnce(DoAll(
+        FutureArg<1>(&startingUpdate),
+        v1::scheduler::SendAcknowledge(frameworkId, agentId)));
+
+  EXPECT_CALL(
+      *scheduler,
+      update(_, AllOf(
+            TaskStatusUpdateTaskIdEq(taskInfo.task_id()),
+            TaskStatusUpdateStateEq(v1::TASK_RUNNING))))
+    .InSequence(updateSequence)
+    .WillOnce(DoAll(
+        FutureArg<1>(&runningUpdate),
+        v1::scheduler::SendAcknowledge(frameworkId, agentId)))
+    .WillRepeatedly(Return());
+
+  mesos->send(
+      v1::createCallAccept(
+          frameworkId,
+          offer,
+          {v1::LAUNCH({taskInfo})}));
+
+  AWAIT_READY(startingUpdate);
+  AWAIT_READY(runningUpdate);
+
+  Future<v1::scheduler::Event::Update> unreachableUpdate;
+  EXPECT_CALL(
+      *scheduler,
+      update(_, AllOf(
+            TaskStatusUpdateTaskIdEq(taskInfo.task_id()),
+            TaskStatusUpdateStateEq(v1::TASK_UNREACHABLE))))
+    .WillOnce(FutureArg<1>(&unreachableUpdate));
+
+  EXPECT_CALL(*scheduler, failure(_, _));
+
+  // Detect pings from master to agent.
+  Future<process::Message> ping = FUTURE_MESSAGE(
+      Eq(PingSlaveMessage().GetTypeName()), _, _);
+
+  // Drop all PONGs to simulate agent partition.
+  DROP_PROTOBUFS(PongSlaveMessage(), _, _);
+
+  // Advance the clock to produce a ping.
+  Clock::advance(masterFlags.agent_ping_timeout);
+
+  // Now advance through enough pings to mark the agent unreachable.
+  size_t pings = 0;
+  while (true) {
+    AWAIT_READY(ping);
+    pings++;
+    if (pings == masterFlags.max_agent_ping_timeouts) {
+      break;
+    }
+    ping = FUTURE_MESSAGE(Eq(PingSlaveMessage().GetTypeName()), _, _);
+    Clock::advance(masterFlags.agent_ping_timeout);
+  }
+
+  Clock::advance(masterFlags.agent_ping_timeout);
+
+  AWAIT_READY(unreachableUpdate);
+
+  Future<v1::scheduler::Event::Update> goneUpdate;
+  EXPECT_CALL(
+      *scheduler,
+      update(_, AllOf(
+            TaskStatusUpdateTaskIdEq(taskInfo.task_id()),
+            TaskStatusUpdateStateEq(v1::TASK_GONE_BY_OPERATOR))))
+    .WillOnce(FutureArg<1>(&goneUpdate));
+
+  ContentType contentType = GetParam();
+
+  // Mark the agent as gone. This should result in the master sending
+  // a 'TASK_GONE_BY_OPERATOR' update for the running task.
+  {
+    v1::master::Call v1Call;
+    v1Call.set_type(v1::master::Call::MARK_AGENT_GONE);
+
+    v1::master::Call::MarkAgentGone* markAgentGone =
+      v1Call.mutable_mark_agent_gone();
+
+    markAgentGone->mutable_agent_id()->CopyFrom(agentId);
+
+    Future<http::Response> response = http::post(
+        master.get()->pid,
+        "api/v1",
+        createBasicAuthHeaders(DEFAULT_CREDENTIAL),
+        serialize(contentType, v1Call),
+        stringify(contentType));
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(http::OK().status, response);
+  }
+
+  AWAIT_READY(goneUpdate);
+
+  // GetState after agent is marked gone to ensure that the previously
+  // unreachable task has been moved to completed.
+  {
+    v1::master::Call v1Call;
+    v1Call.set_type(v1::master::Call::GET_STATE);
+
+    Future<v1::master::Response> v1Response =
+      post(master.get()->pid, v1Call, contentType);
+
+    AWAIT_READY(v1Response);
+    ASSERT_TRUE(v1Response->IsInitialized());
+    ASSERT_EQ(v1::master::Response::GET_STATE, v1Response->type());
+
+    const v1::master::Response::GetState& getState = v1Response->get_state();
+    ASSERT_TRUE(getState.get_tasks().unreachable_tasks().empty());
+    ASSERT_EQ(1, getState.get_tasks().completed_tasks_size());
+    ASSERT_EQ(
+        taskInfo.task_id(),
+        getState.get_tasks().completed_tasks(0).task_id());
+  }
+
+  Clock::resume();
+}
+
+
 // This test verifies that the master correctly sends
 // `OPERATION_GONE_BY_OPERATOR` status updates for operations
 // that are pending when the agent is marked as gone.
@@ -4987,8 +5100,8 @@ TEST_P(MasterAPITest, OperationUpdatesUponAgentGone)
   v1::Resource disk = v1::createDiskResource(
       "200", "*", None(), None(), v1::createDiskSourceRaw());
 
-  Owned<v1::MockResourceProvider> resourceProvider(
-      new v1::MockResourceProvider(resourceProviderInfo, v1::Resources(disk)));
+  Owned<v1::TestResourceProvider> resourceProvider(
+      new v1::TestResourceProvider(resourceProviderInfo, v1::Resources(disk)));
 
   Owned<EndpointDetector> endpointDetector(
       mesos::internal::tests::resource_provider::createEndpointDetector(
@@ -5114,6 +5227,11 @@ TEST_P(MasterAPITest, OperationUpdatesUponAgentGone)
   EXPECT_EQ(
       v1::OPERATION_GONE_BY_OPERATOR,
       operationGoneUpdate->status().state());
+
+  // TODO(bevers): We have to reset the agent before we can access the
+  // metrics to work around MESOS-9644.
+  slave->reset();
+  EXPECT_TRUE(metricEquals("master/operations/gone_by_operator", 1));
 }
 
 
@@ -5153,8 +5271,8 @@ TEST_P(MasterAPITest, OperationUpdatesUponUnreachable)
   v1::Resource disk = v1::createDiskResource(
       "200", "*", None(), None(), v1::createDiskSourceRaw());
 
-  Owned<v1::MockResourceProvider> resourceProvider(
-      new v1::MockResourceProvider(resourceProviderInfo, v1::Resources(disk)));
+  Owned<v1::TestResourceProvider> resourceProvider(
+      new v1::TestResourceProvider(resourceProviderInfo, v1::Resources(disk)));
 
   Owned<EndpointDetector> endpointDetector(
       mesos::internal::tests::resource_provider::createEndpointDetector(
@@ -5253,6 +5371,11 @@ TEST_P(MasterAPITest, OperationUpdatesUponUnreachable)
       v1::OPERATION_UNREACHABLE,
       operationUnreachableUpdate->status().state());
 
+  // TODO(bevers): We have to reset the agent before we can access the
+  // metrics to work around MESOS-9644.
+  slave->reset();
+  EXPECT_TRUE(metricEquals("master/operations/unreachable", 1));
+
   Clock::resume();
 }
 
@@ -5318,29 +5441,30 @@ static Future<tuple<string, string>> getProcessIOData(
       string stdoutReceived;
       string stderrReceived;
 
-      ::recordio::Decoder<v1::agent::ProcessIO> decoder(lambda::bind(
-          deserialize<v1::agent::ProcessIO>, contentType, lambda::_1));
+      ::recordio::Decoder decoder;
 
-      Try<std::deque<Try<v1::agent::ProcessIO>>> records =
-        decoder.decode(data);
+      Try<std::deque<string>> records = decoder.decode(data);
 
       if (records.isError()) {
         return process::Failure(records.error());
       }
 
       while(!records->empty()) {
-        Try<v1::agent::ProcessIO> record = records->front();
+        string record = std::move(records->front());
         records->pop_front();
 
-        if (record.isError()) {
-          return process::Failure(record.error());
+        Try<v1::agent::ProcessIO> processIO =
+          deserialize<v1::agent::ProcessIO>(contentType, record);
+
+        if (processIO.isError()) {
+          return process::Failure(processIO.error());
         }
 
-        if (record->data().type() == v1::agent::ProcessIO::Data::STDOUT) {
-          stdoutReceived += record->data().data();
-        } else if (record->data().type() ==
+        if (processIO->data().type() == v1::agent::ProcessIO::Data::STDOUT) {
+          stdoutReceived += processIO->data().data();
+        } else if (processIO->data().type() ==
             v1::agent::ProcessIO::Data::STDERR) {
-          stderrReceived += record->data().data();
+          stderrReceived += processIO->data().data();
         }
       }
 
@@ -6441,6 +6565,253 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(AgentAPITest, GetState)
 }
 
 
+// Checks that the V1 GET_STATE API will correctly categorize a non-terminal
+// task as a completed task, if the task belongs to a completed executor.
+TEST_P_TEMP_DISABLED_ON_WINDOWS(
+    AgentAPITest, GetStateWithNonTerminalCompletedTask)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  MockExecutor exec(DEFAULT_EXECUTOR_ID);
+  TestContainerizer containerizer(&exec);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  slave::Flags slaveFlags = CreateSlaveFlags();
+
+  // Remove this delay so that the agent will immediately kill any tasks.
+  slaveFlags.executor_shutdown_grace_period = Seconds(0);
+
+  Try<Owned<cluster::Slave>> slave =
+    StartSlave(detector.get(), &containerizer, slaveFlags);
+  ASSERT_SOME(slave);
+
+  FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
+  frameworkInfo.set_checkpoint(true);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, frameworkInfo, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  Future<FrameworkID> frameworkId;
+  EXPECT_CALL(sched, registered(_, _, _))
+    .WillOnce(FutureArg<1>(&frameworkId));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  Future<TaskStatus> statusRunning;
+  Future<TaskStatus> statusLost;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusRunning))
+    .WillOnce(FutureArg<1>(&statusLost));
+
+  EXPECT_CALL(sched, slaveLost(&driver, _))
+    .Times(AtMost(1));
+
+  EXPECT_CALL(exec, registered(_, _, _, _));
+
+  EXPECT_CALL(exec, launchTask(_, _))
+    .WillOnce(SendStatusUpdateFromTask(TASK_RUNNING));
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->empty());
+  const Offer& offer = offers.get()[0];
+
+  TaskInfo task = createTask(offer, "", DEFAULT_EXECUTOR_ID);
+
+  driver.launchTasks(offer.id(), {task});
+
+  AWAIT_READY(statusRunning);
+  EXPECT_EQ(TASK_RUNNING, statusRunning->state());
+
+  // Emulate the checkpointed state of an executor where the following occurs:
+  //   1) A graceful shutdown is initiated on the agent (i.e. SIGUSR1).
+  //   2) The executor is sent a kill, and starts killing its tasks.
+  //   3) The executor exits, before all terminal status updates reach the
+  //      agent. This results in a completed executor, with non-terminal tasks.
+  //
+  // A simple way to reach this state is to shutdown the agent and prevent
+  // the executor from sending the appropriate terminal status update.
+  Future<Nothing> shutdown;
+  EXPECT_CALL(exec, shutdown(_))
+    .WillOnce(FutureSatisfy(&shutdown));
+
+  slave.get()->shutdown();
+
+  AWAIT_READY(shutdown);
+  AWAIT_READY(statusLost);
+
+  // Start the agent back up, and allow it to recover the "completed" executor.
+  Future<Nothing> __recover = FUTURE_DISPATCH(_, &Slave::__recover);
+
+  slave = StartSlave(detector.get(), slaveFlags);
+  ASSERT_SOME(slave);
+
+  AWAIT_READY(__recover);
+
+  driver.stop();
+  driver.join();
+
+  ContentType contentType = GetParam();
+
+  // Non-terminal tasks on completed executors should appear as terminated
+  // tasks, even if they do not have a terminal status update.
+  {
+    v1::agent::Call v1Call;
+    v1Call.set_type(v1::agent::Call::GET_STATE);
+
+    Future<v1::agent::Response> v1Response =
+      post(slave.get()->pid, v1Call, contentType);
+
+    AWAIT_READY(v1Response);
+    ASSERT_TRUE(v1Response->IsInitialized());
+    ASSERT_EQ(v1::agent::Response::GET_STATE, v1Response->type());
+
+    const v1::agent::Response::GetState& getState = v1Response->get_state();
+    EXPECT_TRUE(getState.get_frameworks().frameworks().empty());
+    EXPECT_EQ(1, getState.get_frameworks().completed_frameworks_size());
+    EXPECT_TRUE(getState.get_tasks().launched_tasks().empty());
+    ASSERT_EQ(1, getState.get_tasks().terminated_tasks_size());
+    EXPECT_TRUE(getState.get_executors().executors().empty());
+    EXPECT_EQ(1, getState.get_executors().completed_executors_size());
+
+    // The latest state of this terminated task will not be terminal,
+    // because the executor was not given the chance to send the update.
+    EXPECT_EQ(
+        v1::TASK_RUNNING, getState.get_tasks().terminated_tasks(0).state());
+  }
+}
+
+
+// Checks that the V1 GET_STATE API will correctly categorize a non-terminal
+// task as a completed task, if the task belongs to a completed executor.
+// This variant of the test introduces the non-terminal task via the
+// master TEARDOWN call. A framework TEARDOWN call has similar effects.
+TEST_P_TEMP_DISABLED_ON_WINDOWS(
+    AgentAPITest, TeardownAndGetStateWithNonTerminalCompletedTask)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  MockExecutor exec(DEFAULT_EXECUTOR_ID);
+  TestContainerizer containerizer(&exec);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  slave::Flags slaveFlags = CreateSlaveFlags();
+
+  // Remove this delay so that the agent will immediately kill any tasks.
+  slaveFlags.executor_shutdown_grace_period = Seconds(0);
+
+  Try<Owned<cluster::Slave>> slave =
+    StartSlave(detector.get(), &containerizer, slaveFlags);
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  Future<FrameworkID> frameworkId;
+  EXPECT_CALL(sched, registered(_, _, _))
+    .WillOnce(FutureArg<1>(&frameworkId));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  Future<TaskStatus> statusRunning;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusRunning));
+
+  EXPECT_CALL(sched, slaveLost(&driver, _))
+    .Times(AtMost(1));
+
+  EXPECT_CALL(exec, registered(_, _, _, _));
+
+  EXPECT_CALL(exec, launchTask(_, _))
+    .WillOnce(SendStatusUpdateFromTask(TASK_RUNNING));
+
+  Future<Nothing> executorShutdown;
+  EXPECT_CALL(exec, shutdown(_))
+    .WillOnce(FutureSatisfy(&executorShutdown));
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->empty());
+  const Offer& offer = offers.get()[0];
+
+  TaskInfo task = createTask(offer, "", DEFAULT_EXECUTOR_ID);
+
+  driver.launchTasks(offer.id(), {task});
+
+  AWAIT_READY(statusRunning);
+  EXPECT_EQ(TASK_RUNNING, statusRunning->state());
+
+  ContentType contentType = GetParam();
+
+  // Emulate the checkpointed state of an executor where the following occurs:
+  //   1) The operator initiates a TEARDOWN on a running framework.
+  //   2) The master tells any affected agents to shutdown the framework.
+  //   3) The agent shuts down any executors, the executors exit before
+  //      all terminal status updates reach the agent.
+  //      This results in a completed executor, with non-terminal tasks.
+  {
+    v1::master::Call v1Call;
+    v1Call.set_type(v1::master::Call::TEARDOWN);
+
+    v1Call.mutable_teardown()
+      ->mutable_framework_id()->set_value(frameworkId->value());
+
+    Future<http::Response> response = http::post(
+        master.get()->pid,
+        "api/v1",
+        createBasicAuthHeaders(DEFAULT_CREDENTIAL),
+        serialize(contentType, v1Call),
+        stringify(contentType));
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(http::OK().status, response);
+  }
+
+  AWAIT_READY(executorShutdown);
+
+  driver.stop();
+  driver.join();
+
+  // Non-terminal tasks on completed executors should appear as terminated
+  // tasks, even if they do not have a terminal status update.
+  {
+    v1::agent::Call v1Call;
+    v1Call.set_type(v1::agent::Call::GET_STATE);
+
+    Future<v1::agent::Response> v1Response =
+      post(slave.get()->pid, v1Call, contentType);
+
+    AWAIT_READY(v1Response);
+    ASSERT_TRUE(v1Response->IsInitialized());
+    ASSERT_EQ(v1::agent::Response::GET_STATE, v1Response->type());
+
+    const v1::agent::Response::GetState& getState = v1Response->get_state();
+    EXPECT_TRUE(getState.get_frameworks().frameworks().empty());
+    EXPECT_EQ(1, getState.get_frameworks().completed_frameworks_size());
+    EXPECT_TRUE(getState.get_tasks().launched_tasks().empty());
+    ASSERT_EQ(1, getState.get_tasks().terminated_tasks_size());
+    EXPECT_TRUE(getState.get_executors().executors().empty());
+    EXPECT_EQ(1, getState.get_executors().completed_executors_size());
+
+    // The latest state of this terminated task will not be terminal,
+    // because the executor was not given the chance to send the update.
+    EXPECT_EQ(
+        v1::TASK_RUNNING, getState.get_tasks().terminated_tasks(0).state());
+  }
+}
+
+
 // This test verifies that launch nested container session fails when
 // attaching to the output of the container fails. Consequently, the
 // launched container should be destroyed.
@@ -7364,9 +7735,6 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(
   http::Pipe::Writer writer = pipe.writer();
   http::Pipe::Reader reader = pipe.reader();
 
-  ::recordio::Encoder<v1::agent::Call> encoder(lambda::bind(
-      serialize, contentType, lambda::_1));
-
   {
     v1::agent::Call call;
     call.set_type(v1::agent::Call::ATTACH_CONTAINER_INPUT);
@@ -7377,7 +7745,7 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(
     attach->set_type(v1::agent::Call::AttachContainerInput::CONTAINER_ID);
     attach->mutable_container_id()->CopyFrom(containerId);
 
-    writer.write(encoder.encode(call));
+    writer.write(::recordio::encode(serialize(contentType, call)));
   }
 
   const std::string command = "pkill sleep\n";
@@ -7396,7 +7764,7 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(
     processIO->mutable_data()->set_type(v1::agent::ProcessIO::Data::STDIN);
     processIO->mutable_data()->set_data(command);
 
-    writer.write(encoder.encode(call));
+    writer.write(::recordio::encode(serialize(contentType, call)));
   }
 
   {
@@ -7546,9 +7914,6 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(AgentAPITest, AttachContainerInputRepeat)
     http::Pipe::Writer writer = pipe.writer();
     http::Pipe::Reader reader = pipe.reader();
 
-    ::recordio::Encoder<v1::agent::Call> encoder(lambda::bind(
-        serialize, contentType, lambda::_1));
-
     {
       v1::agent::Call call;
       call.set_type(v1::agent::Call::ATTACH_CONTAINER_INPUT);
@@ -7559,7 +7924,7 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(AgentAPITest, AttachContainerInputRepeat)
       attach->set_type(v1::agent::Call::AttachContainerInput::CONTAINER_ID);
       attach->mutable_container_id()->CopyFrom(containerId);
 
-      writer.write(encoder.encode(call));
+      writer.write(::recordio::encode(serialize(contentType, call)));
     }
 
     size_t offset = 0;
@@ -7581,7 +7946,7 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(AgentAPITest, AttachContainerInputRepeat)
       processIO->mutable_data()->set_type(v1::agent::ProcessIO::Data::STDIN);
       processIO->mutable_data()->set_data(dataChunk);
 
-      writer.write(encoder.encode(call));
+      writer.write(::recordio::encode(serialize(contentType, call)));
     }
 
     // Signal `EOF` to the 'cat' command.
@@ -7599,7 +7964,7 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(AgentAPITest, AttachContainerInputRepeat)
       processIO->mutable_data()->set_type(v1::agent::ProcessIO::Data::STDIN);
       processIO->mutable_data()->set_data("");
 
-      writer.write(encoder.encode(call));
+      writer.write(::recordio::encode(serialize(contentType, call)));
     }
 
     writer.close();
@@ -7831,9 +8196,6 @@ TEST_F(AgentAPITest, AttachContainerInputFailure)
   http::Headers headers = createBasicAuthHeaders(DEFAULT_CREDENTIAL);
   headers[MESSAGE_CONTENT_TYPE] = stringify(messageContentType);
 
-  ::recordio::Encoder<v1::agent::Call> encoder(lambda::bind(
-      serialize, messageContentType, lambda::_1));
-
   EXPECT_CALL(containerizer, attach(_))
     .WillOnce(Return(process::Failure("Unsupported")));
 
@@ -7841,7 +8203,7 @@ TEST_F(AgentAPITest, AttachContainerInputFailure)
     slave.get()->pid,
     "api/v1",
     headers,
-    encoder.encode(call),
+    ::recordio::encode(serialize(messageContentType, call)),
     stringify(contentType));
 
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(http::InternalServerError().status, response);
@@ -7969,9 +8331,6 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(
     ContentType contentType = ContentType::RECORDIO;
     ContentType messageContentType = ContentType::PROTOBUF;
 
-    ::recordio::Encoder<v1::agent::Call> encoder(
-        lambda::bind(serialize, messageContentType, lambda::_1));
-
     http::Headers headers = createBasicAuthHeaders(DEFAULT_CREDENTIAL);
     headers[MESSAGE_CONTENT_TYPE] = stringify(messageContentType);
 
@@ -7979,7 +8338,7 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(
       slave.get()->pid,
       "api/v1",
       headers,
-      encoder.encode(call),
+      ::recordio::encode(serialize(messageContentType, call)),
       stringify(contentType));
 
     AWAIT_EXPECT_RESPONSE_STATUS_EQ(http::Forbidden().status, response);
@@ -8020,14 +8379,11 @@ TEST_F(AgentAPITest, AttachContainerInputValidation)
     call.mutable_attach_container_input()->set_type(
         v1::agent::Call::AttachContainerInput::CONTAINER_ID);
 
-    ::recordio::Encoder<v1::agent::Call> encoder(lambda::bind(
-        serialize, messageContentType, lambda::_1));
-
     Future<http::Response> response = http::post(
         slave.get()->pid,
         "api/v1",
         headers,
-        encoder.encode(call),
+        ::recordio::encode(serialize(messageContentType, call)),
         stringify(contentType));
 
     AWAIT_EXPECT_RESPONSE_STATUS_EQ(http::BadRequest().status, response);
@@ -8042,14 +8398,11 @@ TEST_F(AgentAPITest, AttachContainerInputValidation)
     call.mutable_attach_container_input()->set_type(
         v1::agent::Call::AttachContainerInput::PROCESS_IO);
 
-    ::recordio::Encoder<v1::agent::Call> encoder(lambda::bind(
-        serialize, messageContentType, lambda::_1));
-
     Future<http::Response> response = http::post(
         slave.get()->pid,
         "api/v1",
         headers,
-        encoder.encode(call),
+        ::recordio::encode(serialize(messageContentType, call)),
         stringify(contentType));
 
     AWAIT_EXPECT_RESPONSE_STATUS_EQ(http::BadRequest().status, response);
@@ -8083,14 +8436,11 @@ TEST_F(AgentAPITest, HeaderValidation)
     call.mutable_attach_container_input()->set_type(
         v1::agent::Call::AttachContainerInput::CONTAINER_ID);
 
-    ::recordio::Encoder<v1::agent::Call> encoder(lambda::bind(
-        serialize, ContentType::PROTOBUF, lambda::_1));
-
     Future<http::Response> response = http::post(
         slave.get()->pid,
         "api/v1",
         createBasicAuthHeaders(DEFAULT_CREDENTIAL),
-        encoder.encode(call),
+        ::recordio::encode(serialize(ContentType::PROTOBUF, call)),
         stringify(ContentType::RECORDIO));
 
     AWAIT_EXPECT_RESPONSE_STATUS_EQ(http::BadRequest().status, response);
@@ -8104,9 +8454,6 @@ TEST_F(AgentAPITest, HeaderValidation)
     call.mutable_attach_container_input()->set_type(
         v1::agent::Call::AttachContainerInput::CONTAINER_ID);
 
-    ::recordio::Encoder<v1::agent::Call> encoder(lambda::bind(
-        serialize, ContentType::PROTOBUF, lambda::_1));
-
     http::Headers headers = createBasicAuthHeaders(DEFAULT_CREDENTIAL);
     headers[MESSAGE_CONTENT_TYPE] = "unsupported/media-type";
 
@@ -8114,7 +8461,7 @@ TEST_F(AgentAPITest, HeaderValidation)
         slave.get()->pid,
         "api/v1",
         headers,
-        encoder.encode(call),
+        ::recordio::encode(serialize(ContentType::PROTOBUF, call)),
         stringify(ContentType::RECORDIO));
 
     AWAIT_EXPECT_RESPONSE_STATUS_EQ(http::UnsupportedMediaType().status,
@@ -8286,7 +8633,7 @@ TEST_P(AgentAPITest, GetResourceProviders)
   v1::Resource resource = v1::createDiskResource(
       "200", "*", None(), None(), v1::createDiskSourceRaw());
 
-  v1::MockResourceProvider resourceProvider(info, resource);
+  v1::TestResourceProvider resourceProvider(info, resource);
 
   // Start and register a resource provider.
   Owned<EndpointDetector> endpointDetector(
@@ -8374,7 +8721,7 @@ TEST_P(AgentAPITest, MarkResourceProviderGone)
 
   // Start a resource provider without resources since resource
   // providers with resources cannot be marked gone.
-  v1::MockResourceProvider resourceProvider(info, v1::Resource());
+  v1::TestResourceProvider resourceProvider(info, v1::Resource());
 
   // Start and register a resource provider.
   Owned<EndpointDetector> endpointDetector(
@@ -8382,9 +8729,18 @@ TEST_P(AgentAPITest, MarkResourceProviderGone)
 
   Future<mesos::v1::resource_provider::Event::Subscribed> subscribed;
 
-  EXPECT_CALL(resourceProvider, subscribed(_))
+  auto resourceProviderProcess = resourceProvider.process->self();
+  EXPECT_CALL(*resourceProvider.process, subscribed(_))
     .WillOnce(DoAll(
-        Invoke(&resourceProvider, &v1::MockResourceProvider::subscribedDefault),
+        Invoke(
+            [resourceProviderProcess](
+                const typename mesos::v1::resource_provider::Event::Subscribed&
+                  subscribed) {
+              dispatch(
+                  resourceProviderProcess,
+                  &v1::TestResourceProviderProcess::subscribedDefault,
+                  subscribed);
+            }),
         FutureArg<0>(&subscribed)))
     .WillRepeatedly(Return());
 
@@ -8413,7 +8769,7 @@ TEST_P(AgentAPITest, MarkResourceProviderGone)
     // connection is broken will does not succeed, we might observe other
     // `disconnected` events.
     Future<Nothing> disconnected;
-    EXPECT_CALL(resourceProvider, disconnected())
+    EXPECT_CALL(*resourceProvider.process, disconnected())
       .WillOnce(FutureSatisfy(&disconnected))
       .WillRepeatedly(Return());
 
@@ -8503,7 +8859,7 @@ TEST_P(AgentAPITest, GetOperations)
   info.set_type("org.apache.mesos.rp.test");
   info.set_name("test");
 
-  v1::MockResourceProvider resourceProvider(
+  v1::TestResourceProvider resourceProvider(
       info,
       v1::createDiskResource(
           "200",
@@ -8578,7 +8934,7 @@ TEST_P(AgentAPITest, GetOperations)
 
   // The operation is still pending when we receive this event.
   Future<mesos::v1::resource_provider::Event::ApplyOperation> operation;
-  EXPECT_CALL(resourceProvider, applyOperation(_))
+  EXPECT_CALL(*resourceProvider.process, applyOperation(_))
     .WillOnce(FutureArg<0>(&operation));
 
   // Start an operation.
@@ -8769,9 +9125,6 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(AgentAPIStreamingTest,
   http::Pipe::Writer writer = pipe.writer();
   http::Pipe::Reader reader = pipe.reader();
 
-  ::recordio::Encoder<v1::agent::Call> encoder(lambda::bind(
-      serialize, messageContentType, lambda::_1));
-
   // Prepare the data that needs to be streamed to the entrypoint
   // of the container.
 
@@ -8785,7 +9138,7 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(AgentAPIStreamingTest,
     attach->set_type(v1::agent::Call::AttachContainerInput::CONTAINER_ID);
     attach->mutable_container_id()->CopyFrom(containerId);
 
-    writer.write(encoder.encode(call));
+    writer.write(::recordio::encode(serialize(messageContentType, call)));
   }
 
   size_t offset = 0;
@@ -8807,7 +9160,7 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(AgentAPIStreamingTest,
     processIO->mutable_data()->set_type(v1::agent::ProcessIO::Data::STDIN);
     processIO->mutable_data()->set_data(dataChunk);
 
-    writer.write(encoder.encode(call));
+    writer.write(::recordio::encode(serialize(messageContentType, call)));
   }
 
   // Signal `EOT` to the terminal so that it sends `EOF` to `cat` command.
@@ -8825,7 +9178,7 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(AgentAPIStreamingTest,
     processIO->mutable_data()->set_type(v1::agent::ProcessIO::Data::STDIN);
     processIO->mutable_data()->set_data("\x04");
 
-    writer.write(encoder.encode(call));
+    writer.write(::recordio::encode(serialize(messageContentType, call)));
   }
 
   writer.close();
@@ -8997,9 +9350,6 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(
   http::Pipe::Writer writer = pipe.writer();
   http::Pipe::Reader reader = pipe.reader();
 
-  ::recordio::Encoder<v1::agent::Call> encoder(lambda::bind(
-      serialize, messageContentType, lambda::_1));
-
   {
     v1::agent::Call call;
     call.set_type(v1::agent::Call::ATTACH_CONTAINER_INPUT);
@@ -9010,7 +9360,7 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(
     attach->set_type(v1::agent::Call::AttachContainerInput::CONTAINER_ID);
     attach->mutable_container_id()->CopyFrom(containerId);
 
-    writer.write(encoder.encode(call));
+    writer.write(::recordio::encode(serialize(messageContentType, call)));
   }
 
   size_t offset = 0;
@@ -9032,7 +9382,7 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(
     processIO->mutable_data()->set_type(v1::agent::ProcessIO::Data::STDIN);
     processIO->mutable_data()->set_data(dataChunk);
 
-    writer.write(encoder.encode(call));
+    writer.write(::recordio::encode(serialize(messageContentType, call)));
   }
 
   // Signal `EOF` to the 'cat' command.
@@ -9050,7 +9400,7 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(
     processIO->mutable_data()->set_type(v1::agent::ProcessIO::Data::STDIN);
     processIO->mutable_data()->set_data("");
 
-    writer.write(encoder.encode(call));
+    writer.write(::recordio::encode(serialize(messageContentType, call)));
   }
 
   writer.close();

@@ -24,15 +24,13 @@
 #include <stout/stringify.hpp>
 #include <stout/try.hpp>
 
+#include <mesos/resources.hpp>
+#include <mesos/resource_quantities.hpp>
 #include <mesos/values.hpp>
-
-#include "common/resource_quantities.hpp"
 
 using std::pair;
 using std::string;
 using std::vector;
-
-using mesos::internal::ResourceQuantities;
 
 namespace mesos {
 namespace internal {
@@ -145,6 +143,24 @@ TEST(QuantitiesTest, FromScalarResources)
     CHECK_NOTERROR(Resources::parse("cpus:1;mem:512;disk:800")));
   vector<pair<string, double>> expected = {
     {"cpus", 1}, {"disk", 800}, {"mem", 512}};
+  EXPECT_EQ(expected, toVector(quantities));
+}
+
+
+TEST(QuantitiesTest, FromResources)
+{
+  // Empty resources.
+  ResourceQuantities quantities =
+    ResourceQuantities::fromResources(Resources());
+  EXPECT_EQ(0u, quantities.size());
+
+  // Result entries are ordered alphabetically.
+  quantities =
+    ResourceQuantities::fromResources(
+        CHECK_NOTERROR(Resources::parse(
+            "cpus:1;mem:512;ports:[5000-6000];zones:{a,b};disk:800")));
+  vector<pair<string, double>> expected = {
+    {"cpus", 1}, {"disk", 800}, {"mem", 512}, {"ports", 1001}, {"zones", 2}};
   EXPECT_EQ(expected, toVector(quantities));
 }
 
@@ -299,6 +315,43 @@ TEST(QuantitiesTest, Stringify)
     CHECK_NOTERROR(ResourceQuantities::fromString("cpus:1;mem:1024"));
 
   EXPECT_EQ("cpus:1; mem:1024", stringify(some));
+}
+
+
+TEST(QuantitiesTest, Sum)
+{
+  ResourceQuantities empty{};
+  ResourceQuantities cpus1 =
+    CHECK_NOTERROR(ResourceQuantities::fromString("cpus:1"));
+  ResourceQuantities cpus2 =
+    CHECK_NOTERROR(ResourceQuantities::fromString("cpus:2"));
+  ResourceQuantities memory =
+    CHECK_NOTERROR(ResourceQuantities::fromString("memory:1"));
+  ResourceQuantities cpuAndMemory =
+    CHECK_NOTERROR(ResourceQuantities::fromString("cpus:1;memory:1"));
+
+  hashmap<string, ResourceQuantities> quantitiesMap;
+  vector<pair<string, double>> expected;
+  EXPECT_EQ(expected, toVector(ResourceQuantities::sum(quantitiesMap)));
+
+  quantitiesMap["empty"] = empty;
+  EXPECT_EQ(expected, toVector(ResourceQuantities::sum(quantitiesMap)));
+
+  quantitiesMap["cpus1"] = cpus1;
+  expected = {{"cpus", 1}};
+  EXPECT_EQ(expected, toVector(ResourceQuantities::sum(quantitiesMap)));
+
+  quantitiesMap["cpus2"] = cpus2;
+  expected = {{"cpus", 3}};
+  EXPECT_EQ(expected, toVector(ResourceQuantities::sum(quantitiesMap)));
+
+  quantitiesMap["memory"] = memory;
+  expected = {{"cpus", 3}, {"memory", 1}};
+  EXPECT_EQ(expected, toVector(ResourceQuantities::sum(quantitiesMap)));
+
+  quantitiesMap["cpuAndMemory"] = cpuAndMemory;
+  expected = {{"cpus", 4}, {"memory", 2}};
+  EXPECT_EQ(expected, toVector(ResourceQuantities::sum(quantitiesMap)));
 }
 
 
@@ -484,6 +537,40 @@ TEST(LimitsTest, ContainsQuantities)
   limits = CHECK_NOTERROR(ResourceLimits::fromString("cpus:2;mem:1"));
   quantities = CHECK_NOTERROR(ResourceQuantities::fromString("cpus:2;mem:2"));
   EXPECT_FALSE(limits.contains(quantities));
+}
+
+
+TEST(LimitsTest, SubtractQuantities)
+{
+  auto limits = [](const string& resourceLimitsString) {
+    return CHECK_NOTERROR(ResourceLimits::fromString(resourceLimitsString));
+  };
+
+  auto subtract = [](const string& resourceLimitsString,
+                     const string& resourceQuantitiesString) {
+    ResourceLimits limits =
+      CHECK_NOTERROR(ResourceLimits::fromString(resourceLimitsString));
+    ResourceQuantities quantities =
+      CHECK_NOTERROR(ResourceQuantities::fromString(resourceQuantitiesString));
+
+    return limits - quantities;
+  };
+
+  EXPECT_EQ(limits(""), subtract("", ""));
+  EXPECT_EQ(limits(""), subtract("", "cpus:10"));
+
+  EXPECT_EQ(limits("cpus:1"), subtract("cpus:1", ""));
+
+  EXPECT_EQ(limits("cpus:0"), subtract("cpus:1", "cpus:1"));
+  EXPECT_EQ(limits("cpus:0"), subtract("cpus:1", "cpus:2"));
+
+  EXPECT_EQ(limits("cpus:0;mem:10"), subtract("cpus:1;mem:10", "cpus:1"));
+  EXPECT_EQ(
+      limits("cpus:0;mem:10"), subtract("cpus:1;mem:10", "cpus:1;disk:10"));
+
+  EXPECT_EQ(
+      limits("cpus:0;mem:5"),
+      subtract("cpus:1;mem:10", "cpus:1;mem:5;disk:10"));
 }
 
 

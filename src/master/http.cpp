@@ -25,6 +25,12 @@
 #include <utility>
 #include <vector>
 
+#include <google/protobuf/descriptor.h>
+#include <google/protobuf/wire_format_lite.h>
+
+#include <google/protobuf/io/coded_stream.h>
+#include <google/protobuf/io/zero_copy_stream_impl_lite.h>
+
 #include <mesos/attributes.hpp>
 #include <mesos/type_utils.hpp>
 
@@ -77,6 +83,7 @@
 
 #include "logging/logging.hpp"
 
+#include "master/authorization.hpp"
 #include "master/machine.hpp"
 #include "master/maintenance.hpp"
 #include "master/master.hpp"
@@ -89,6 +96,8 @@
 #include "version/version.hpp"
 
 using google::protobuf::RepeatedPtrField;
+
+using google::protobuf::internal::WireFormatLite;
 
 using process::AUTHENTICATION;
 using process::AUTHORIZATION;
@@ -120,18 +129,24 @@ using process::http::URL;
 using process::http::authentication::Principal;
 
 using std::copy_if;
+using std::function;
 using std::list;
 using std::map;
+using std::pair;
 using std::set;
 using std::string;
 using std::tie;
 using std::tuple;
 using std::vector;
 
+using mesos::authorization::ActionObject;
 using mesos::authorization::createSubject;
+using mesos::authorization::DEACTIVATE_AGENT;
+using mesos::authorization::DRAIN_AGENT;
 using mesos::authorization::GET_MAINTENANCE_SCHEDULE;
 using mesos::authorization::GET_MAINTENANCE_STATUS;
 using mesos::authorization::MARK_AGENT_GONE;
+using mesos::authorization::REACTIVATE_AGENT;
 using mesos::authorization::SET_LOG_LEVEL;
 using mesos::authorization::START_MAINTENANCE;
 using mesos::authorization::STOP_MAINTENANCE;
@@ -141,6 +156,8 @@ using mesos::authorization::VIEW_FLAGS;
 using mesos::authorization::VIEW_FRAMEWORK;
 using mesos::authorization::VIEW_ROLE;
 using mesos::authorization::VIEW_TASK;
+
+using mesos::internal::protobuf::WireFormatLite2;
 
 namespace mesos {
 namespace internal {
@@ -364,11 +381,20 @@ Future<Response> Master::Http::api(
     case mesos::master::Call::STOP_MAINTENANCE:
       return stopMaintenance(call, principal, acceptType);
 
+    case mesos::master::Call::DRAIN_AGENT:
+      return drainAgent(call, principal, acceptType);
+
+    case mesos::master::Call::DEACTIVATE_AGENT:
+      return deactivateAgent(call, principal, acceptType);
+
+    case mesos::master::Call::REACTIVATE_AGENT:
+      return reactivateAgent(call, principal, acceptType);
+
     case mesos::master::Call::GET_QUOTA:
       return quotaHandler.status(call, principal, acceptType);
 
     case mesos::master::Call::UPDATE_QUOTA:
-      return NotImplemented();
+      return quotaHandler.update(call, principal);
 
     // TODO(bmahler): Add this to a deprecated call section
     // at the bottom once deprecated by `UPDATE_QUOTA`.
@@ -394,7 +420,7 @@ Future<Response> Master::Http::api(
 Future<Response> Master::Http::subscribe(
     const mesos::master::Call& call,
     const Option<Principal>& principal,
-    ContentType contentType) const
+    ContentType outputContentType) const
 {
   CHECK_EQ(mesos::master::Call::SUBSCRIBE, call.type());
 
@@ -403,38 +429,16 @@ Future<Response> Master::Http::subscribe(
       principal,
       {VIEW_FRAMEWORK, VIEW_TASK, VIEW_EXECUTOR, VIEW_ROLE})
     .then(defer(
-        master->self(),
-        [=](const Owned<ObjectApprovers>& approvers) -> Future<Response> {
-          Pipe pipe;
-          OK ok;
-
-          ok.headers["Content-Type"] = stringify(contentType);
-          ok.type = Response::PIPE;
-          ok.reader = pipe.reader();
-
-          StreamingHttpConnection<v1::master::Event> http(
-              pipe.writer(), contentType);
-
-          mesos::master::Event event;
-          event.set_type(mesos::master::Event::SUBSCRIBED);
-          *event.mutable_subscribed()->mutable_get_state() =
-            _getState(approvers);
-
-          event.mutable_subscribed()->set_heartbeat_interval_seconds(
-              DEFAULT_HEARTBEAT_INTERVAL.secs());
-
-          http.send(event);
-
-          mesos::master::Event heartbeatEvent;
-          heartbeatEvent.set_type(mesos::master::Event::HEARTBEAT);
-          http.send(heartbeatEvent);
-
-          // Master::subscribe will start the heartbeater process, which should
-          // only happen after `SUBSCRIBED` event is sent.
-          master->subscribe(http, principal);
-
-          return ok;
-        }));
+          master->self(),
+          [this, principal, outputContentType](
+              const Owned<ObjectApprovers>& approvers) {
+            return deferBatchedRequest(
+                &Master::ReadOnlyHandler::subscribe,
+                principal,
+                outputContentType,
+                {},
+                approvers);
+          }));
 }
 
 
@@ -602,7 +606,7 @@ Future<Response> Master::Http::scheduler(
     StreamingHttpConnection<v1::scheduler::Event> http(
         pipe.writer(), acceptType, streamId);
 
-    master->subscribe(http, call.subscribe());
+    master->subscribe(http, std::move(*call.mutable_subscribe()));
 
     return ok;
   }
@@ -630,7 +634,7 @@ Future<Response> Master::Http::scheduler(
     return Forbidden("Framework is not subscribed");
   }
 
-  if (framework->http.isNone()) {
+  if (framework->http().isNone()) {
     return Forbidden("Framework is not connected via HTTP");
   }
 
@@ -641,7 +645,7 @@ Future<Response> Master::Http::scheduler(
   }
 
   const string& streamId = request.headers.at("Mesos-Stream-Id");
-  if (streamId != framework->http->streamId.toString()) {
+  if (streamId != framework->http()->streamId.toString()) {
     return BadRequest(
         "The stream ID '" + streamId + "' included in this request "
         "didn't match the stream ID currently associated with framework ID "
@@ -714,6 +718,10 @@ Future<Response> Master::Http::scheduler(
     case scheduler::Call::REQUEST:
       master->request(framework, call.request());
       return Accepted();
+
+    case scheduler::Call::UPDATE_FRAMEWORK:
+      return master->updateFramework(
+          std::move(*call.mutable_update_framework()));
 
     case scheduler::Call::UNKNOWN:
       LOG(WARNING) << "Received 'UNKNOWN' call";
@@ -859,7 +867,8 @@ Future<Response> Master::Http::_createVolumes(
         error->message);
   }
 
-  return master->authorizeCreateVolume(operation.create(), principal)
+  return master->authorize(
+      principal, ActionObject::createVolume(operation.create()))
     .then(defer(master->self(), [=](bool authorized) -> Future<Response> {
       if (!authorized) {
         return Forbidden();
@@ -1020,14 +1029,14 @@ Future<Response> Master::Http::_destroyVolumes(
   error = validation::operation::validate(
       operation.destroy(),
       slave->checkpointedResources,
-      slave->usedResources,
-      slave->pendingTasks);
+      slave->usedResources);
 
   if (error.isSome()) {
     return BadRequest("Invalid DESTROY operation: " + error->message);
   }
 
-  return master->authorizeDestroyVolume(operation.destroy(), principal)
+  return master->authorize(
+      principal, ActionObject::destroyVolume(operation.destroy()))
     .then(defer(master->self(), [=](bool authorized) -> Future<Response> {
       if (!authorized) {
         return Forbidden();
@@ -1113,8 +1122,8 @@ Future<Response> Master::Http::growVolume(
         stringify(*slave) + ": " + error->message);
   }
 
-  return master->authorizeResizeVolume(
-      operation.grow_volume().volume(), principal)
+  return master->authorize(
+      principal, ActionObject::growVolume(operation.grow_volume()))
     .then(defer(master->self(), [=](bool authorized) -> Future<Response> {
       if (!authorized) {
         return Forbidden();
@@ -1176,8 +1185,8 @@ Future<Response> Master::Http::shrinkVolume(
         stringify(*slave) + ": " + error->message);
   }
 
-  return master->authorizeResizeVolume(
-      operation.shrink_volume().volume(), principal)
+  return master->authorize(
+      principal, ActionObject::shrinkVolume(operation.shrink_volume()))
     .then(defer(master->self(), [=](bool authorized) -> Future<Response> {
       if (!authorized) {
         return Forbidden();
@@ -1239,6 +1248,7 @@ Future<Response> Master::Http::frameworks(
           return deferBatchedRequest(
               &Master::ReadOnlyHandler::frameworks,
               principal,
+              ContentType::JSON,
               request.url.query,
               approvers);
         }));
@@ -1298,7 +1308,7 @@ mesos::master::Response::GetFrameworks::Framework model(
 Future<Response> Master::Http::getFrameworks(
     const mesos::master::Call& call,
     const Option<Principal>& principal,
-    ContentType contentType) const
+    ContentType outputContentType) const
 {
   CHECK_EQ(mesos::master::Call::GET_FRAMEWORKS, call.type());
 
@@ -1307,50 +1317,23 @@ Future<Response> Master::Http::getFrameworks(
       principal,
       {VIEW_FRAMEWORK})
     .then(defer(
-        master->self(),
-        [=](const Owned<ObjectApprovers>& approvers) -> Future<Response> {
-          mesos::master::Response response;
-          response.set_type(mesos::master::Response::GET_FRAMEWORKS);
-          *response.mutable_get_frameworks() = _getFrameworks(approvers);
-
-          return OK(
-              serialize(contentType, evolve(response)), stringify(contentType));
-        }));
-}
-
-
-mesos::master::Response::GetFrameworks Master::Http::_getFrameworks(
-    const Owned<ObjectApprovers>& approvers) const
-{
-  mesos::master::Response::GetFrameworks getFrameworks;
-  foreachvalue (const Framework* framework,
-                master->frameworks.registered) {
-    // Skip unauthorized frameworks.
-    if (!approvers->approved<VIEW_FRAMEWORK>(framework->info)) {
-      continue;
-    }
-
-    *getFrameworks.add_frameworks() = model(*framework);
-  }
-
-  foreachvalue (const Owned<Framework>& framework,
-                master->frameworks.completed) {
-    // Skip unauthorized frameworks.
-    if (!approvers->approved<VIEW_FRAMEWORK>(framework->info)) {
-      continue;
-    }
-
-    *getFrameworks.add_completed_frameworks() = model(*framework);
-  }
-
-  return getFrameworks;
+          master->self(),
+          [this, principal, outputContentType](
+              const Owned<ObjectApprovers>& approvers) {
+            return deferBatchedRequest(
+                &Master::ReadOnlyHandler::getFrameworks,
+                principal,
+                outputContentType,
+                {},
+                approvers);
+          }));
 }
 
 
 Future<Response> Master::Http::getExecutors(
     const mesos::master::Call& call,
     const Option<Principal>& principal,
-    ContentType contentType) const
+    ContentType outputContentType) const
 {
   CHECK_EQ(mesos::master::Call::GET_EXECUTORS, call.type());
 
@@ -1359,73 +1342,23 @@ Future<Response> Master::Http::getExecutors(
       principal,
       {VIEW_FRAMEWORK, VIEW_EXECUTOR})
     .then(defer(
-        master->self(),
-        [=](const Owned<ObjectApprovers>& approvers) -> Response {
-          mesos::master::Response response;
-          response.set_type(mesos::master::Response::GET_EXECUTORS);
-
-          *response.mutable_get_executors() = _getExecutors(approvers);
-
-          return OK(
-              serialize(contentType, evolve(response)), stringify(contentType));
-        }));
-}
-
-
-mesos::master::Response::GetExecutors Master::Http::_getExecutors(
-    const Owned<ObjectApprovers>& approvers) const
-{
-  // Construct framework list with both active and completed frameworks.
-  vector<const Framework*> frameworks;
-  foreachvalue (Framework* framework, master->frameworks.registered) {
-    // Skip unauthorized frameworks.
-    if (!approvers->approved<VIEW_FRAMEWORK>(framework->info)) {
-      continue;
-    }
-
-    frameworks.push_back(framework);
-  }
-
-  foreachvalue (const Owned<Framework>& framework,
-                master->frameworks.completed) {
-    // Skip unauthorized frameworks.
-    if (!approvers->approved<VIEW_FRAMEWORK>(framework->info)) {
-      continue;
-    }
-
-    frameworks.push_back(framework.get());
-  }
-
-  mesos::master::Response::GetExecutors getExecutors;
-
-  foreach (const Framework* framework, frameworks) {
-    foreachpair (const SlaveID& slaveId,
-                 const auto& executorsMap,
-                 framework->executors) {
-      foreachvalue (const ExecutorInfo& executorInfo, executorsMap) {
-        // Skip unauthorized executors.
-        if (!approvers->approved<VIEW_EXECUTOR>(
-                executorInfo, framework->info)) {
-          continue;
-        }
-
-        mesos::master::Response::GetExecutors::Executor* executor =
-          getExecutors.add_executors();
-
-        executor->mutable_executor_info()->CopyFrom(executorInfo);
-        executor->mutable_slave_id()->CopyFrom(slaveId);
-      }
-    }
-  }
-
-  return getExecutors;
+          master->self(),
+          [this, principal, outputContentType](
+             const Owned<ObjectApprovers>& approvers) {
+            return deferBatchedRequest(
+                &Master::ReadOnlyHandler::getExecutors,
+                principal,
+                outputContentType,
+                {},
+                approvers);
+          }));
 }
 
 
 Future<Response> Master::Http::getState(
     const mesos::master::Call& call,
     const Option<Principal>& principal,
-    ContentType contentType) const
+    ContentType outputContentType) const
 {
   CHECK_EQ(mesos::master::Call::GET_STATE, call.type());
 
@@ -1434,35 +1367,16 @@ Future<Response> Master::Http::getState(
       principal,
       {VIEW_FRAMEWORK, VIEW_TASK, VIEW_EXECUTOR, VIEW_ROLE})
     .then(defer(
-        master->self(),
-        [=](const Owned<ObjectApprovers>& approvers) -> Response {
-          mesos::master::Response response;
-          response.set_type(mesos::master::Response::GET_STATE);
-
-          *response.mutable_get_state() = _getState(approvers);
-
-          return OK(
-              serialize(contentType, evolve(response)), stringify(contentType));
-        }));
-}
-
-
-mesos::master::Response::GetState Master::Http::_getState(
-    const Owned<ObjectApprovers>& approvers) const
-{
-  // NOTE: This function must be blocking instead of returning a
-  // `Future`. This is because `subscribe()` needs to atomically
-  // add subscriber to `subscribers` map and send the captured state
-  // in `SUBSCRIBED` without being interleaved by any other events.
-
-  mesos::master::Response::GetState getState;
-
-  *getState.mutable_get_tasks() = _getTasks(approvers);
-  *getState.mutable_get_executors() = _getExecutors(approvers);
-  *getState.mutable_get_frameworks() = _getFrameworks(approvers);
-  *getState.mutable_get_agents() = _getAgents(approvers);
-
-  return getState;
+          master->self(),
+          [this, principal, outputContentType](
+              const Owned<ObjectApprovers>& approvers) {
+            return deferBatchedRequest(
+                &Master::ReadOnlyHandler::getState,
+                principal,
+                outputContentType,
+                {},
+                approvers);
+          }));
 }
 
 
@@ -1673,19 +1587,64 @@ Future<Response> Master::Http::getMetrics(
 
   return process::metrics::snapshot(timeout)
     .then([contentType](const map<string, double>& metrics) -> Response {
-      mesos::master::Response response;
-      response.set_type(mesos::master::Response::GET_METRICS);
-      mesos::master::Response::GetMetrics* _getMetrics =
-        response.mutable_get_metrics();
+      // Serialize the following message:
+      //
+      //   mesos::master::Response response;
+      //   response.set_type(mesos::master::Response::GET_METRICS);
+      //   mesos::master::Response::GetMetrics* getMetrics = ...;
 
-      foreachpair (const string& key, double value, metrics) {
-        Metric* metric = _getMetrics->add_metrics();
-        metric->set_name(key);
-        metric->set_value(value);
+      switch (contentType) {
+        case ContentType::PROTOBUF: {
+          string output;
+          google::protobuf::io::StringOutputStream stream(&output);
+          google::protobuf::io::CodedOutputStream writer(&stream);
+
+          WireFormatLite::WriteEnum(
+              mesos::v1::master::Response::kTypeFieldNumber,
+              mesos::v1::master::Response::GET_METRICS,
+              &writer);
+
+          WireFormatLite::WriteBytes(
+              mesos::v1::master::Response::kGetMetricsFieldNumber,
+              serializeGetMetrics<mesos::v1::master::Response::GetMetrics>(
+                  metrics),
+              &writer);
+
+          // We must manually trim the unused buffer space since
+          // we use the string before the coded output stream is
+          // destructed.
+          writer.Trim();
+
+          return OK(std::move(output), stringify(contentType));
+        }
+
+        case ContentType::JSON: {
+          string body = jsonify([&](JSON::ObjectWriter* writer) {
+            const google::protobuf::Descriptor* descriptor =
+              v1::master::Response::descriptor();
+
+            int field;
+
+            field = v1::master::Response::kTypeFieldNumber;
+            writer->field(
+                descriptor->FindFieldByNumber(field)->name(),
+                v1::master::Response::Type_Name(
+                    v1::master::Response::GET_METRICS));
+
+            field = v1::master::Response::kGetMetricsFieldNumber;
+            writer->field(
+                descriptor->FindFieldByNumber(field)->name(),
+                jsonifyGetMetrics<mesos::v1::master::Response::GetMetrics>(
+                    metrics));
+          });
+
+          // TODO(bmahler): Pass jsonp query parameter through here.
+          return OK(std::move(body), stringify(contentType));
+        }
+
+        default:
+          return NotAcceptable("Request must accept json or protobuf");
       }
-
-      return OK(serialize(contentType, evolve(response)),
-                stringify(contentType));
     });
 }
 
@@ -1898,11 +1857,45 @@ Future<Response> Master::Http::reserve(
     return BadRequest("Unable to decode query string: " + decode.error());
   }
 
+  // Helper function to parse a list of resource from query parameters.
+  auto parseResourcesList = [](
+      const std::string& key,
+      const hashmap<string, string>& queryParameters)
+    -> Try<RepeatedPtrField<Resource>>
+    {
+      Option<string> value = queryParameters.get(key);
+      if (value.isNone()) {
+        return Error(
+          "Missing '" + key + "' query parameter in the request body");
+      }
+
+      Try<JSON::Array> parse =
+        JSON::parse<JSON::Array>(value.get());
+
+      if (parse.isError()) {
+        return Error(
+            "Error parsing '" + key +
+            "' query parameter in the request body: " + parse.error());
+      }
+
+      RepeatedPtrField<Resource> resources;
+      foreach (const JSON::Value& value, parse->values) {
+        Try<Resource> resource = ::protobuf::parse<Resource>(value);
+        if (resource.isError()) {
+          return Error(
+              "Error parsing '" + key +
+              "' query parameter in the request body: " + resource.error());
+        }
+
+        resources.Add()->CopyFrom(resource.get());
+      }
+
+      return resources;
+    };
+
   const hashmap<string, string>& values = decode.get();
 
-  Option<string> value;
-
-  value = values.get("slaveId");
+  Option<string> value = values.get("slaveId");
   if (value.isNone()) {
     return BadRequest("Missing 'slaveId' query parameter in the request body");
   }
@@ -1910,39 +1903,32 @@ Future<Response> Master::Http::reserve(
   SlaveID slaveId;
   slaveId.set_value(value.get());
 
-  value = values.get("resources");
-  if (value.isNone()) {
-    return BadRequest(
-        "Missing 'resources' query parameter in the request body");
+  Try<RepeatedPtrField<Resource>> resources =
+    parseResourcesList("resources", values);
+
+  if (resources.isError()) {
+    return BadRequest(resources.error());
   }
 
-  Try<JSON::Array> parse =
-    JSON::parse<JSON::Array>(value.get());
+  RepeatedPtrField<Resource> source;
+  if (values.contains("source")) {
+    Try<RepeatedPtrField<Resource>> parsedSource =
+      parseResourcesList("source", values);
 
-  if (parse.isError()) {
-    return BadRequest(
-        "Error in parsing 'resources' query parameter in the request body: " +
-        parse.error());
-  }
-
-  RepeatedPtrField<Resource> resources;
-  foreach (const JSON::Value& value, parse->values) {
-    Try<Resource> resource = ::protobuf::parse<Resource>(value);
-    if (resource.isError()) {
-      return BadRequest(
-          "Error in parsing 'resources' query parameter in the request body: " +
-          resource.error());
+    if (parsedSource.isError()) {
+      return BadRequest(parsedSource.error());
     }
 
-    resources.Add()->CopyFrom(resource.get());
+    source = parsedSource.get();
   }
 
-  return _reserve(slaveId, resources, principal);
+  return _reserve(slaveId, source, resources.get(), principal);
 }
 
 
 Future<Response> Master::Http::_reserve(
     const SlaveID& slaveId,
+    const RepeatedPtrField<Resource>& source,
     const RepeatedPtrField<Resource>& resources,
     const Option<Principal>& principal) const
 {
@@ -1954,6 +1940,7 @@ Future<Response> Master::Http::_reserve(
   // Create an operation.
   Offer::Operation operation;
   operation.set_type(Offer::Operation::RESERVE);
+  operation.mutable_reserve()->mutable_source()->CopyFrom(source);
   operation.mutable_reserve()->mutable_resources()->CopyFrom(resources);
 
   Option<Error> error = validateAndUpgradeResources(&operation);
@@ -1970,7 +1957,8 @@ Future<Response> Master::Http::_reserve(
         error->message);
   }
 
-  return master->authorizeReserveResources(operation.reserve(), principal)
+  return master->authorize(
+      principal, ActionObject::reserve(operation.reserve()))
     .then(defer(master->self(), [=](bool authorized) -> Future<Response> {
       if (!authorized) {
         return Forbidden();
@@ -1989,10 +1977,11 @@ Future<Response> Master::Http::reserveResources(
   CHECK_EQ(mesos::master::Call::RESERVE_RESOURCES, call.type());
 
   const SlaveID& slaveId = call.reserve_resources().slave_id();
+  const RepeatedPtrField<Resource>& source = call.reserve_resources().source();
   const RepeatedPtrField<Resource>& resources =
     call.reserve_resources().resources();
 
-  return _reserve(slaveId, resources, principal);
+  return _reserve(slaveId, source, resources, principal);
 }
 
 
@@ -2037,6 +2026,7 @@ Future<Response> Master::Http::slaves(
           return deferBatchedRequest(
               &Master::ReadOnlyHandler::slaves,
               principal,
+              ContentType::JSON,
               request.url.query,
               approvers);
         }));
@@ -2046,46 +2036,22 @@ Future<Response> Master::Http::slaves(
 Future<Response> Master::Http::getAgents(
     const mesos::master::Call& call,
     const Option<Principal>& principal,
-    ContentType contentType) const
+    ContentType outputContentType) const
 {
   CHECK_EQ(mesos::master::Call::GET_AGENTS, call.type());
 
   return ObjectApprovers::create(master->authorizer, principal, {VIEW_ROLE})
     .then(defer(
-        master->self(),
-        [=](const Owned<ObjectApprovers>& approvers) -> Response {
-          mesos::master::Response response;
-          response.set_type(mesos::master::Response::GET_AGENTS);
-          *response.mutable_get_agents() = _getAgents(approvers);
-
-          return OK(
-              serialize(contentType, evolve(response)), stringify(contentType));
-    }));
-}
-
-
-mesos::master::Response::GetAgents Master::Http::_getAgents(
-    const Owned<ObjectApprovers>& approvers) const
-{
-  mesos::master::Response::GetAgents getAgents;
-  foreachvalue (const Slave* slave, master->slaves.registered) {
-    mesos::master::Response::GetAgents::Agent* agent = getAgents.add_agents();
-    *agent =
-        protobuf::master::event::createAgentResponse(*slave, approvers);
-  }
-
-  foreachvalue (const SlaveInfo& slaveInfo, master->slaves.recovered) {
-    SlaveInfo* agent = getAgents.add_recovered_agents();
-    agent->CopyFrom(slaveInfo);
-    agent->clear_resources();
-    foreach (const Resource& resource, slaveInfo.resources()) {
-      if (approvers->approved<VIEW_ROLE>(resource)) {
-        agent->add_resources()->CopyFrom(resource);
-      }
-    }
-  }
-
-  return getAgents;
+          master->self(),
+          [this, principal, outputContentType](
+              const Owned<ObjectApprovers>& approvers) {
+            return deferBatchedRequest(
+                &Master::ReadOnlyHandler::getAgents,
+                principal,
+                outputContentType,
+                {},
+                approvers);
+          }));
 }
 
 
@@ -2093,8 +2059,11 @@ string Master::Http::QUOTA_HELP()
 {
   return HELP(
     TLDR(
-        "Gets or updates quota for roles."),
+        "(Deprecated) Gets or updates quota for roles."),
     DESCRIPTION(
+        "NOTE: This endpoint is deprecated in favor of using the v1 master",
+        "calls: UPDATE_QUOTA and GET_QUOTA.",
+        "",
         "Returns 200 OK when the quota was queried or updated successfully.",
         "",
         "Returns 307 TEMPORARY_REDIRECT redirect to the leading master when",
@@ -2123,6 +2092,7 @@ string Master::Http::QUOTA_HELP()
 }
 
 
+// Deprecated in favor of v1 UPDATE_QUOTA and GET_QUOTA.
 Future<Response> Master::Http::quota(
     const Request& request,
     const Option<Principal>& principal) const
@@ -2342,6 +2312,7 @@ Future<Response> Master::Http::state(
           return deferBatchedRequest(
               &Master::ReadOnlyHandler::state,
               principal,
+              ContentType::JSON,
               request.url.query,
               approvers);
         }));
@@ -2351,13 +2322,14 @@ Future<Response> Master::Http::state(
 Future<Response> Master::Http::deferBatchedRequest(
     ReadOnlyRequestHandler handler,
     const Option<Principal>& principal,
+    ContentType outputContentType,
     const hashmap<std::string, std::string>& queryParameters,
     const Owned<ObjectApprovers>& approvers) const
 {
   bool scheduleBatch = batchedRequests.empty();
 
   auto it = std::find_if(batchedRequests.begin(), batchedRequests.end(),
-      [handler, &principal, &queryParameters](
+      [handler, &principal, &queryParameters, &outputContentType](
           const BatchedRequest& batchedRequest) {
         // NOTE: This is not a general-purpose request comparison, but
         // specific to the batched requests which are always members of
@@ -2365,11 +2337,28 @@ Future<Response> Master::Http::deferBatchedRequest(
         // on query parameters and the current master state.
         return handler == batchedRequest.handler &&
                principal == batchedRequest.principal &&
+               outputContentType == batchedRequest.outputContentType &&
                queryParameters == batchedRequest.queryParameters;
       });
 
   Future<Response> future;
-  if (it != batchedRequests.end()) {
+
+  // Note that we do not de-duplicate the SUBSCRIBE responses,
+  // since the http server in libprocess assumes there's only
+  // 1 reader of the pipe.
+  if (handler == &Master::ReadOnlyHandler::subscribe ||
+      it == batchedRequests.end()) {
+    // Add an element to the batched state requests.
+    Promise<Response> promise;
+    future = promise.future();
+    batchedRequests.push_back(BatchedRequest{
+        handler,
+        outputContentType,
+        queryParameters,
+        principal,
+        approvers,
+        std::move(promise)});
+  } else {
     // Return the existing future if we have a matching request.
     // NOTE: This is effectively adding a layer of authorization permissions
     // caching since we only checked the equality of principals, not the
@@ -2378,16 +2367,14 @@ Future<Response> Master::Http::deferBatchedRequest(
     // before permission changes for a principal take effect.
     future = it->promise.future();
     ++master->metrics->http_cache_hits;
-  } else {
-    // Add an element to the batched state requests.
-    Promise<Response> promise;
-    future = promise.future();
-    batchedRequests.push_back(BatchedRequest{
-        handler,
-        queryParameters,
-        principal,
-        approvers,
-        std::move(promise)});
+
+    // NOTE: The returned response should be either of type
+    // `BODY` or `PATH`, since `PIPE`-type responses cannot
+    // be de-duplicated currently.
+    it->promise.future()
+      .onReady([](const Response& r) {
+        CHECK_NE(r.type, Response::PIPE);
+      });
   }
 
   // Schedule processing of batched requests if not yet scheduled.
@@ -2406,6 +2393,9 @@ void Master::Http::processRequestsBatch() const
   CHECK(!batchedRequests.empty())
     << "Bug in state batching logic: No requests to process";
 
+  vector<Future<pair<Response, Option<ReadOnlyHandler::PostProcessing>>>>
+    results;
+
   // Produce the responses in parallel.
   //
   // TODO(alexr): Consider abstracting this into `parallel_async` or
@@ -2414,15 +2404,30 @@ void Master::Http::processRequestsBatch() const
   // TODO(alexr): Consider moving `BatchedStateRequest`'s fields into
   // `process::async` once it supports moving.
   foreach (BatchedRequest& request, batchedRequests) {
-    request.promise.associate(process::async(
-        [this](ReadOnlyRequestHandler handler,
-               const hashmap<std::string, std::string>& queryParameters,
-               const process::Owned<ObjectApprovers>& approvers) {
-          return (readonlyHandler.*handler)(queryParameters, approvers);
-        },
-        request.handler,
-        request.queryParameters,
-        request.approvers));
+    Future<pair<Response, Option<ReadOnlyHandler::PostProcessing>>>
+      f = process::async(
+          [this](ReadOnlyRequestHandler handler,
+                 ContentType outputContentType,
+                 const hashmap<std::string, std::string>& queryParameters,
+                 const process::Owned<ObjectApprovers>& approvers) {
+            return (readonlyHandler.*handler)(
+                outputContentType,
+                queryParameters,
+                approvers);
+          },
+          request.handler,
+          request.outputContentType,
+          request.queryParameters,
+          request.approvers);
+
+    request.promise.associate(
+      f.then([](const pair<
+          Response,
+          Option<ReadOnlyHandler::PostProcessing>>& result) {
+        return result.first;
+      }));
+
+    results.push_back(f);
   }
 
   // Block the master actor until all workers have generated state responses.
@@ -2431,13 +2436,27 @@ void Master::Http::processRequestsBatch() const
   //
   // NOTE: There is the potential for deadlock since we are blocking 1 working
   // thread here, see MESOS-8256.
-  vector<Future<Response>> responses;
-  foreach (const BatchedRequest& request, batchedRequests) {
-    responses.push_back(request.promise.future());
-  }
-  process::await(responses).await();
+  process::await(results).await();
 
   batchedRequests.clear();
+
+  // Now perform the post-processing "writes" synchronously.
+  for (const auto& result : results) {
+    CHECK(!result.isPending()) << result;
+
+    // Response failed or was discarded.
+    if (!result.isReady()) continue;
+
+    // No post-processing needed.
+    if (result->second.isNone()) continue;
+
+    const ReadOnlyHandler::PostProcessing& postProcessing = *result->second;
+
+    postProcessing.state.visit(
+        [&](const ReadOnlyHandler::PostProcessing::Subscribe& s) {
+          master->subscribe(s.connection, s.approvers);
+        });
+  }
 }
 
 
@@ -2547,6 +2566,7 @@ Future<Response> Master::Http::stateSummary(
           return deferBatchedRequest(
               &Master::ReadOnlyHandler::stateSummary,
               principal,
+              ContentType::JSON,
               request.url.query,
               approvers);
         }));
@@ -2600,6 +2620,7 @@ Future<Response> Master::Http::roles(
             return deferBatchedRequest(
                 &Master::ReadOnlyHandler::roles,
                 principal,
+                ContentType::JSON,
                 request.url.query,
                 approvers);
           }));
@@ -2661,48 +2682,22 @@ Future<Response> Master::Http::listFiles(
 Future<Response> Master::Http::getRoles(
     const mesos::master::Call& call,
     const Option<Principal>& principal,
-    ContentType contentType) const
+    ContentType outputContentType) const
 {
   CHECK_EQ(mesos::master::Call::GET_ROLES, call.type());
+
   return ObjectApprovers::create(master->authorizer, principal, {VIEW_ROLE})
-    .then(defer(master->self(),
-        [this, contentType](const Owned<ObjectApprovers>& approvers)
-          -> Response {
-      const vector<string> filteredRoles = master->filterRoles(approvers);
-
-      mesos::master::Response response;
-      response.set_type(mesos::master::Response::GET_ROLES);
-
-      mesos::master::Response::GetRoles* getRoles =
-        response.mutable_get_roles();
-
-      foreach (const string& name, filteredRoles) {
-        mesos::Role role;
-
-        if (master->weights.contains(name)) {
-          role.set_weight(master->weights[name]);
-        } else {
-          role.set_weight(1.0);
-        }
-
-        if (master->roles.contains(name)) {
-          Role* role_ = master->roles.at(name);
-
-          role.mutable_resources()->CopyFrom(role_->allocatedResources());
-
-          foreachkey (const FrameworkID& frameworkId, role_->frameworks) {
-            role.add_frameworks()->CopyFrom(frameworkId);
-          }
-        }
-
-        role.set_name(name);
-
-        getRoles->add_roles()->CopyFrom(role);
-      }
-
-      return OK(serialize(contentType, evolve(response)),
-                stringify(contentType));
-    }));
+    .then(defer(
+          master->self(),
+          [this, principal, outputContentType](
+              const Owned<ObjectApprovers>& approvers) {
+            return deferBatchedRequest(
+                &Master::ReadOnlyHandler::getRoles,
+                principal,
+                outputContentType,
+                {},
+                approvers);
+          }));
 }
 
 
@@ -2847,66 +2842,22 @@ Future<Response> Master::Http::teardown(
 Future<Response> Master::Http::getOperations(
     const mesos::master::Call& call,
     const Option<Principal>& principal,
-    ContentType contentType) const
+    ContentType outputContentType) const
 {
   CHECK_EQ(mesos::master::Call::GET_OPERATIONS, call.type());
 
   return ObjectApprovers::create(master->authorizer, principal, {VIEW_ROLE})
     .then(defer(
-        master->self(),
-        [=](const Owned<ObjectApprovers>& approvers) -> Response {
-          // We consider a principal to be authorized to view an operation if it
-          // is authorized to view the resources the operation is performed on.
-          auto approved = [&approvers](const Operation& operation) {
-            Try<Resources> consumedResources =
-              protobuf::getConsumedResources(operation.info());
-
-            if (consumedResources.isError()) {
-              LOG(WARNING)
-                << "Could not approve operation " << operation.uuid()
-                << " since its consumed resources could not be determined:"
-                << consumedResources.error();
-
-              return false;
-            }
-
-            foreach (const Resource& resource, consumedResources.get()) {
-              if (!approvers->approved<VIEW_ROLE>(resource)) {
-                return false;
-              }
-            }
-
-            return true;
-          };
-
-          mesos::master::Response response;
-          response.set_type(mesos::master::Response::GET_OPERATIONS);
-
-          mesos::master::Response::GetOperations* operations =
-            response.mutable_get_operations();
-
-          foreachvalue (const Slave* slave, master->slaves.registered) {
-            foreachvalue (Operation* operation, slave->operations) {
-              if (approved(*operation)) {
-                operations->add_operations()->CopyFrom(*operation);
-              }
-            }
-
-            foreachvalue (
-                const Slave::ResourceProvider resourceProvider,
-                slave->resourceProviders) {
-              foreachvalue (Operation* operation, resourceProvider.operations) {
-                if (approved(*operation)) {
-                  operations->add_operations()->CopyFrom(*operation);
-                }
-              }
-            }
-          }
-
-          return OK(
-              serialize(contentType, evolve(response)),
-              stringify(contentType));
-        }));
+          master->self(),
+          [this, principal, outputContentType](
+             const Owned<ObjectApprovers>& approvers) {
+            return deferBatchedRequest(
+                &Master::ReadOnlyHandler::getOperations,
+                principal,
+                outputContentType,
+                {},
+                approvers);
+          }));
 }
 
 
@@ -2977,6 +2928,7 @@ Future<Response> Master::Http::tasks(
           return deferBatchedRequest(
               &Master::ReadOnlyHandler::tasks,
               principal,
+              ContentType::JSON,
               request.url.query,
               approvers);
         }));
@@ -2986,7 +2938,7 @@ Future<Response> Master::Http::tasks(
 Future<Response> Master::Http::getTasks(
     const mesos::master::Call& call,
     const Option<Principal>& principal,
-    ContentType contentType) const
+    ContentType outputContentType) const
 {
   CHECK_EQ(mesos::master::Call::GET_TASKS, call.type());
 
@@ -2995,91 +2947,16 @@ Future<Response> Master::Http::getTasks(
       principal,
       {VIEW_FRAMEWORK, VIEW_TASK})
     .then(defer(
-        master->self(),
-        [=](const Owned<ObjectApprovers>& approvers) -> Response {
-          mesos::master::Response response;
-          response.set_type(mesos::master::Response::GET_TASKS);
-
-          *response.mutable_get_tasks() = _getTasks(approvers);
-
-          return OK(
-              serialize(contentType, evolve(response)), stringify(contentType));
-  }));
-}
-
-
-mesos::master::Response::GetTasks Master::Http::_getTasks(
-    const Owned<ObjectApprovers>& approvers) const
-{
-  // Construct framework list with both active and completed frameworks.
-  vector<const Framework*> frameworks;
-  foreachvalue (Framework* framework, master->frameworks.registered) {
-    // Skip unauthorized frameworks.
-    if (!approvers->approved<VIEW_FRAMEWORK>(framework->info)) {
-      continue;
-    }
-
-    frameworks.push_back(framework);
-  }
-
-  foreachvalue (const Owned<Framework>& framework,
-                master->frameworks.completed) {
-    // Skip unauthorized frameworks.
-    if (!approvers->approved<VIEW_FRAMEWORK>(framework->info)) {
-      continue;
-    }
-
-    frameworks.push_back(framework.get());
-  }
-
-  mesos::master::Response::GetTasks getTasks;
-
-  vector<const Task*> tasks;
-  foreach (const Framework* framework, frameworks) {
-    // Pending tasks.
-    foreachvalue (const TaskInfo& taskInfo, framework->pendingTasks) {
-      // Skip unauthorized tasks.
-      if (!approvers->approved<VIEW_TASK>(taskInfo, framework->info)) {
-        continue;
-      }
-
-      *getTasks.add_pending_tasks() =
-        protobuf::createTask(taskInfo, TASK_STAGING, framework->id());
-    }
-
-    // Active tasks.
-    foreachvalue (Task* task, framework->tasks) {
-      CHECK_NOTNULL(task);
-      // Skip unauthorized tasks.
-      if (!approvers->approved<VIEW_TASK>(*task, framework->info)) {
-        continue;
-      }
-
-      getTasks.add_tasks()->CopyFrom(*task);
-    }
-
-    // Unreachable tasks.
-    foreachvalue (const Owned<Task>& task, framework->unreachableTasks) {
-      // Skip unauthorized tasks.
-      if (!approvers->approved<VIEW_TASK>(*task, framework->info)) {
-        continue;
-      }
-
-      getTasks.add_unreachable_tasks()->CopyFrom(*task);
-    }
-
-    // Completed tasks.
-    foreach (const Owned<Task>& task, framework->completedTasks) {
-      // Skip unauthorized tasks.
-      if (!approvers->approved<VIEW_TASK>(*task, framework->info)) {
-        continue;
-      }
-
-      getTasks.add_completed_tasks()->CopyFrom(*task);
-    }
-  }
-
-  return getTasks;
+          master->self(),
+          [this, principal, outputContentType](
+             const Owned<ObjectApprovers>& approvers) {
+            return deferBatchedRequest(
+                &Master::ReadOnlyHandler::getTasks,
+                principal,
+                outputContentType,
+                {},
+                approvers);
+          }));
 }
 
 
@@ -3845,6 +3722,302 @@ Future<Response> Master::Http::getMaintenanceStatus(
 }
 
 
+Future<Response> Master::Http::_drainAgent(
+    const SlaveID& slaveId,
+    const Option<DurationInfo>& maxGracePeriod,
+    const bool markGone,
+    const Owned<ObjectApprovers>& approvers) const
+{
+  if (!approvers->approved<DRAIN_AGENT>()) {
+    return Forbidden();
+  }
+
+  if (markGone && !approvers->approved<MARK_AGENT_GONE>()) {
+    return Forbidden();
+  }
+
+  // Check that the agent is either recovering, registered, or unreachable.
+  if (!master->slaves.recovered.contains(slaveId) &&
+      !master->slaves.registered.contains(slaveId) &&
+      !master->slaves.unreachable.contains(slaveId)) {
+    return BadRequest("Unknown agent");
+  }
+
+  // If this agent is being marked gone, then no draining can be performed.
+  if (master->slaves.markingGone.contains(slaveId)) {
+    return Conflict("Agent is currently being marked gone");
+  }
+
+  // Save the draining info to the registry.
+  return master->registrar->apply(Owned<RegistryOperation>(
+      new DrainAgent(slaveId, maxGracePeriod, markGone)))
+    .onAny([](const Future<bool>& result) {
+      CHECK_READY(result)
+        << "Failed to update draining info in the registry";
+    })
+    .then(defer(
+        master->self(),
+        [this, slaveId, maxGracePeriod, markGone](bool result) -> Response {
+          // Update the in-memory state.
+          DrainConfig drainConfig;
+          drainConfig.set_mark_gone(markGone);
+
+          if (maxGracePeriod.isSome()) {
+            drainConfig.mutable_max_grace_period()
+              ->CopyFrom(maxGracePeriod.get());
+          }
+
+          DrainInfo drainInfo;
+          drainInfo.set_state(DRAINING);
+          drainInfo.mutable_config()->CopyFrom(drainConfig);
+
+          master->slaves.draining[slaveId] = drainInfo;
+
+          // Deactivate the agent.
+          master->slaves.deactivated.insert(slaveId);
+
+          Slave* slave = master->slaves.registered.get(slaveId);
+
+          // It's possible for the slave to be removed in the interim
+          // if it is marked unreachable.
+          if (slave != nullptr) {
+            hashmap<FrameworkID, hashset<TaskID>> taskIds;
+            foreachpair (const FrameworkID& frameworkId,
+                         const auto& tasks,
+                         slave->tasks) {
+              taskIds[frameworkId] = tasks.keys();
+            }
+
+            LOG(INFO)
+              << "Transitioning agent " << slaveId << " to the DRAINING state"
+              << "; agent has (tasks, operations) == ("
+              << stringify(taskIds) << ", "
+              << stringify(slave->operations.keys()) << ")";
+
+            master->deactivate(slave);
+
+            // Tell the agent to start draining.
+            DrainSlaveMessage message;
+            message.mutable_config()->CopyFrom(drainConfig);
+            master->send(slave->pid, message);
+
+            slave->estimatedDrainStartTime = Clock::now();
+
+            // Check if the agent is already drained and transition it
+            // appropriately if so.
+            master->checkAndTransitionDrainingAgent(slave);
+          }
+
+          return OK();
+        }));
+}
+
+
+Future<Response> Master::Http::drainAgent(
+    const mesos::master::Call& call,
+    const Option<Principal>& principal,
+    ContentType /*contentType*/) const
+{
+  CHECK_EQ(mesos::master::Call::DRAIN_AGENT, call.type());
+  CHECK(call.has_drain_agent());
+
+  SlaveID slaveId = call.drain_agent().slave_id();
+  Slave* slave = master->slaves.registered.get(slaveId);
+
+  if (slave != nullptr) {
+    // Check that the targeted agent is not part of a maintenance schedule.
+    // NOTE: This is a best-effort check, because it is possible to drain
+    // an agent, and then change the agent's hostname/IP into a MachineID
+    // in a maintenance schedule. Also, the MachineID of unreachable agents
+    // is unknown until they reregister.
+    //
+    // TODO(josephw): Reconsider this check once the maintenance and agent
+    // draining features are integrated.
+    //
+    // TODO(josephw): Check this condition against unreachable agents
+    // once MESOS-9884 is resolved.
+    if (!master->maintenance.schedules.empty()) {
+      foreach (
+          const mesos::maintenance::Window& window,
+          master->maintenance.schedules.front().windows()) {
+        foreach (const MachineID& machineId, window.machine_ids()) {
+          if (machineId == slave->machineId) {
+            return BadRequest(
+                "Agent " + stringify(slaveId) + " is part of a maintenance"
+                " schedule under Machine " + stringify(machineId));
+          }
+        }
+      }
+    }
+
+    // Check that the targeted agent is capable of `AGENT_DRAINING`.
+    // NOTE: This is a best-effort check, because it is possible to drain
+    // an agent, and then downgrade the agent to a version that does not
+    // support draining. Also, the capabilities of unreachable agents
+    // are unknown until they reregister.
+    //
+    // TODO(josephw): Check this condition against unreachable agents
+    // once MESOS-9884 is resolved.
+    if (!slave->capabilities.agentDraining) {
+      return BadRequest(
+          "Agent " + stringify(slaveId) + " is not capable of draining");
+    }
+  }
+
+  Option<DurationInfo> maxGracePeriod;
+  if (call.drain_agent().has_max_grace_period()) {
+    maxGracePeriod = call.drain_agent().max_grace_period();
+  }
+
+  bool markGone = call.drain_agent().mark_gone();
+
+  return ObjectApprovers::create(
+      master->authorizer,
+      principal,
+      {DRAIN_AGENT, MARK_AGENT_GONE})
+    .then(defer(
+      master->self(),
+      [this, slaveId, maxGracePeriod, markGone](
+          const Owned<ObjectApprovers>& approvers) {
+        return _drainAgent(slaveId, maxGracePeriod, markGone, approvers);
+      }));
+}
+
+
+Future<Response> Master::Http::_deactivateAgent(
+    const SlaveID& slaveId,
+    const Owned<ObjectApprovers>& approvers) const
+{
+  if (!approvers->approved<DEACTIVATE_AGENT>()) {
+    return Forbidden();
+  }
+
+  // Check that the agent is either recovering, registered, or unreachable.
+  if (!master->slaves.recovered.contains(slaveId) &&
+      !master->slaves.registered.contains(slaveId) &&
+      !master->slaves.unreachable.contains(slaveId)) {
+    return BadRequest("Unknown agent");
+  }
+
+  // Save the deactivation to the registry.
+  return master->registrar->apply(Owned<RegistryOperation>(
+      new DeactivateAgent(slaveId)))
+    .onAny([](const Future<bool>& result) {
+      CHECK_READY(result)
+        << "Failed to deactivate agent in the registry";
+    })
+    .then(defer(master->self(), [this, slaveId](bool result) -> Response {
+      // Deactivate the agent.
+      master->slaves.deactivated.insert(slaveId);
+
+      Slave* slave = master->slaves.registered.get(slaveId);
+      if (slave != nullptr) {
+        master->deactivate(slave);
+      }
+
+      return OK();
+    }));
+}
+
+
+Future<Response> Master::Http::deactivateAgent(
+    const mesos::master::Call& call,
+    const Option<Principal>& principal,
+    ContentType /*contentType*/) const
+{
+  CHECK_EQ(mesos::master::Call::DEACTIVATE_AGENT, call.type());
+  CHECK(call.has_deactivate_agent());
+
+  SlaveID slaveId = call.deactivate_agent().slave_id();
+
+  return ObjectApprovers::create(
+      master->authorizer,
+      principal,
+      {DEACTIVATE_AGENT})
+    .then(defer(
+      master->self(),
+      [this, slaveId](
+          const Owned<ObjectApprovers>& approvers) {
+        return _deactivateAgent(slaveId, approvers);
+      }));
+}
+
+
+Future<Response> Master::Http::_reactivateAgent(
+    const SlaveID& slaveId,
+    const Owned<ObjectApprovers>& approvers) const
+{
+  if (!approvers->approved<REACTIVATE_AGENT>()) {
+    return Forbidden();
+  }
+
+  // Check that the agent is deactivated.
+  if (!master->slaves.deactivated.contains(slaveId)) {
+    return BadRequest("Agent is not deactivated");
+  }
+
+  if (master->slaves.draining.contains(slaveId) &&
+      master->slaves.draining.at(slaveId).state() == DRAINING) {
+    return BadRequest("Agent is still in the DRAINING state");
+  }
+
+  // Save the reactivation to the registry.
+  return master->registrar->apply(Owned<RegistryOperation>(
+      new ReactivateAgent(slaveId)))
+    .onAny([](const Future<bool>& result) {
+      CHECK_READY(result)
+        << "Failed to reactivate agent in the registry";
+    })
+    .then(defer(master->self(), [this, slaveId](bool result) -> Response {
+      // Reactivate the agent.
+      master->slaves.draining.erase(slaveId);
+      master->slaves.deactivated.erase(slaveId);
+
+      Slave* slave = master->slaves.registered.get(slaveId);
+      if (slave == nullptr) {
+        return Conflict("Agent removed while processing the call");
+      }
+
+      if (slave->connected) {
+        LOG(INFO) << "Reactivating agent " << *slave;
+
+        slave->active = true;
+        master->allocator->activateSlave(slaveId);
+      } else {
+        LOG(INFO) << "Disconnected agent " << *slave
+                  << " will be reactivated upon reregistration.";
+      }
+
+      slave->estimatedDrainStartTime = None();
+
+      return OK();
+    }));
+}
+
+
+Future<Response> Master::Http::reactivateAgent(
+    const mesos::master::Call& call,
+    const Option<Principal>& principal,
+    ContentType /*contentType*/) const
+{
+  CHECK_EQ(mesos::master::Call::REACTIVATE_AGENT, call.type());
+  CHECK(call.has_reactivate_agent());
+
+  SlaveID slaveId = call.reactivate_agent().slave_id();
+
+  return ObjectApprovers::create(
+      master->authorizer,
+      principal,
+      {REACTIVATE_AGENT})
+    .then(defer(
+      master->self(),
+      [this, slaveId](
+          const Owned<ObjectApprovers>& approvers) {
+        return _reactivateAgent(slaveId, approvers);
+      }));
+}
+
+
 string Master::Http::UNRESERVE_HELP()
 {
   return HELP(
@@ -3974,7 +4147,8 @@ Future<Response> Master::Http::_unreserve(
     return BadRequest("Invalid UNRESERVE operation: " + error->message);
   }
 
-  return master->authorizeUnreserveResources(operation.unreserve(), principal)
+  return master->authorize(
+      principal, ActionObject::unreserve(operation.unreserve()))
     .then(defer(master->self(), [=](bool authorized) -> Future<Response> {
       if (!authorized) {
         return Forbidden();
@@ -4031,13 +4205,7 @@ Future<Response> Master::Http::_operation(
     // NOTE: However it's entirely possible that these resources are
     // offered to other frameworks in the next 'allocate' and the filter
     // cannot prevent it.
-    master->allocator->recoverResources(
-        offer->framework_id(),
-        offer->slave_id(),
-        offer->resources(),
-        Filters());
-
-    master->removeOffer(offer, true); // Rescind!
+    master->rescindOffer(offer, Filters());
 
     // If we've rescinded enough offers to cover 'operation', we're done.
     Try<Resources> updatedRecovered = totalRecovered.apply(operation);
@@ -4171,15 +4339,7 @@ Future<Response> Master::Http::_markAgentGone(const SlaveID& slaveId) const
                  << registrarResult.failure();
     }
 
-    Slave* slave = master->slaves.registered.get(slaveId);
-
-    // This can happen if the agent that is being marked as
-    // gone is not currently registered (unreachable/recovered).
-    if (slave == nullptr) {
-      return;
-    }
-
-    master->markGone(slave, goneTime);
+    master->markGone(slaveId, goneTime);
   }));
 
   return gone.then([]() -> Future<Response> {

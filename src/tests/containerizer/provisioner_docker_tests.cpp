@@ -36,10 +36,9 @@
 #include "slave/containerizer/mesos/provisioner/constants.hpp"
 #include "slave/containerizer/mesos/provisioner/paths.hpp"
 
+#include "slave/containerizer/mesos/provisioner/docker/message.hpp"
 #include "slave/containerizer/mesos/provisioner/docker/metadata_manager.hpp"
 #include "slave/containerizer/mesos/provisioner/docker/paths.hpp"
-#include "slave/containerizer/mesos/provisioner/docker/puller.hpp"
-#include "slave/containerizer/mesos/provisioner/docker/registry_puller.hpp"
 #include "slave/containerizer/mesos/provisioner/docker/store.hpp"
 
 #include "tests/environment.hpp"
@@ -80,8 +79,6 @@ using mesos::slave::ContainerTermination;
 using slave::ImageInfo;
 using slave::Slave;
 
-using slave::docker::Puller;
-using slave::docker::RegistryPuller;
 using slave::docker::Store;
 
 using testing::WithParamInterface;
@@ -297,102 +294,6 @@ TEST_F(ProvisionerDockerLocalStoreTest, MissingLayer)
   imageInfo = store.get()->get(image, flags.image_provisioner_backend.get());
   AWAIT_READY(imageInfo);
   verifyLocalDockerImage(flags, imageInfo->layers);
-}
-
-
-class MockPuller : public Puller
-{
-public:
-  MockPuller()
-  {
-    EXPECT_CALL(*this, pull(_, _, _, _))
-      .WillRepeatedly(Invoke(this, &MockPuller::unmocked_pull));
-  }
-
-  ~MockPuller() override {}
-
-  MOCK_METHOD4(
-      pull,
-      Future<vector<string>>(
-          const spec::ImageReference&,
-          const string&,
-          const string&,
-          const Option<Secret>&));
-
-  Future<vector<string>> unmocked_pull(
-      const spec::ImageReference& reference,
-      const string& directory,
-      const string& backend,
-      const Option<Secret>& config)
-  {
-    // TODO(gilbert): Allow return list to be overridden.
-    return vector<string>();
-  }
-};
-
-
-// This tests the store to pull the same image simultaneously.
-// This test verifies that the store only calls the puller once
-// when multiple requests for the same image is in flight.
-TEST_F(ProvisionerDockerLocalStoreTest, PullingSameImageSimutanuously)
-{
-  slave::Flags flags;
-  flags.docker_registry = path::join(os::getcwd(), "images");
-  flags.docker_store_dir = path::join(os::getcwd(), "store");
-
-  MockPuller* puller = new MockPuller();
-  Future<Nothing> pull;
-  Future<string> directory;
-  Promise<vector<string>> promise;
-
-  EXPECT_CALL(*puller, pull(_, _, _, _))
-    .WillOnce(testing::DoAll(FutureSatisfy(&pull),
-                             FutureArg<1>(&directory),
-                             Return(promise.future())));
-
-  Try<Owned<slave::Store>> store =
-      slave::docker::Store::create(flags, Owned<Puller>(puller));
-  ASSERT_SOME(store);
-
-  Image mesosImage;
-  mesosImage.set_type(Image::DOCKER);
-  mesosImage.mutable_docker()->set_name("abc");
-
-  Future<slave::ImageInfo> imageInfo1 =
-    store.get()->get(mesosImage, COPY_BACKEND);
-
-  AWAIT_READY(pull);
-  AWAIT_READY(directory);
-
-  // TODO(gilbert): Need a helper method to create test layers
-  // which will allow us to set manifest so that we can add
-  // checks here.
-  const string layerPath = path::join(directory.get(), "456");
-
-  Try<Nothing> mkdir = os::mkdir(layerPath);
-  ASSERT_SOME(mkdir);
-
-  JSON::Value manifest = JSON::parse(
-        "{"
-        "  \"parent\": \"\""
-        "}").get();
-
-  ASSERT_SOME(
-      os::write(path::join(layerPath, "json"), stringify(manifest)));
-
-  ASSERT_TRUE(imageInfo1.isPending());
-  Future<slave::ImageInfo> imageInfo2 =
-    store.get()->get(mesosImage, COPY_BACKEND);
-
-  const vector<string> result = {"456"};
-
-  ASSERT_TRUE(imageInfo2.isPending());
-  promise.set(result);
-
-  AWAIT_READY(imageInfo1);
-  AWAIT_READY(imageInfo2);
-
-  EXPECT_EQ(imageInfo1->layers, imageInfo2->layers);
 }
 
 
@@ -631,15 +532,18 @@ TEST_P(ProvisionerDockerHdfsTest, ROOT_ImageTarPullerHdfsFetcherSimpleCommand)
 // when specifying the repository name (e.g., 'busybox'). The registry
 // puller normalize docker official images if necessary.
 INSTANTIATE_TEST_CASE_P(
-    ImageAlpine,
+    ContainerImage,
     ProvisionerDockerTest,
     ::testing::ValuesIn(vector<string>({
         "alpine", // Verifies the normalization of the Docker repository name.
         "library/alpine",
+        "gcr.io/google-containers/busybox:1.24", // manifest.v1+prettyjws
+        "gcr.io/google-containers/busybox:1.27", // manifest.v2+json
         // TODO(alexr): The registry below is unreliable and hence disabled.
         // Consider re-enabling shall it become more stable.
         // "registry.cn-hangzhou.aliyuncs.com/acs-sample/alpine",
-        "quay.io/coreos/alpine-sh"})));
+        "quay.io/coreos/alpine-sh" // manifest.v1+prettyjws
+      })));
 
 
 // TODO(jieyu): This is a ROOT test because of MESOS-4757. Remove the
@@ -723,6 +627,133 @@ TEST_P(ProvisionerDockerTest, ROOT_INTERNET_CURL_SimpleCommand)
   AWAIT_READY(statusFinished);
   EXPECT_EQ(task.task_id(), statusFinished->task_id());
   EXPECT_EQ(TASK_FINISHED, statusFinished->state());
+
+  driver.stop();
+  driver.join();
+}
+
+
+// This test verifies the functionality of image `cached` option
+// for image force pulling.
+TEST_F(ProvisionerDockerTest, ROOT_INTERNET_CURL_ImageForcePulling)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  slave::Flags flags = CreateSlaveFlags();
+  flags.isolation = "docker/runtime,filesystem/linux";
+  flags.image_providers = "docker";
+
+  // Image pulling time may be long, depending on the location of
+  // the registry server.
+  flags.executor_registration_timeout = Minutes(10);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), flags);
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(&driver, _, _));
+
+  Future<vector<Offer>> offers1, offers2;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers1))
+    .WillOnce(FutureArg<1>(&offers2))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(offers1);
+  ASSERT_EQ(1u, offers1->size());
+
+  const Offer& offer1 = offers1.get()[0];
+
+  // NOTE: We use a non-shell command here because 'sh' might not be
+  // in the PATH. 'alpine' does not specify env PATH in the image. On
+  // some linux distribution, '/bin' is not in the PATH by default.
+  CommandInfo command;
+  command.set_shell(false);
+  command.set_value("/bin/ls");
+  command.add_arguments("ls");
+  command.add_arguments("-al");
+  command.add_arguments("/");
+
+  TaskInfo task = createTask(
+      offer1.slave_id(),
+      Resources::parse("cpus:1;mem:128").get(),
+      command);
+
+  Image image;
+  image.set_type(Image::DOCKER);
+  image.mutable_docker()->set_name("alpine");
+
+  ContainerInfo* container = task.mutable_container();
+  container->set_type(ContainerInfo::MESOS);
+  container->mutable_mesos()->mutable_image()->CopyFrom(image);
+
+  Future<TaskStatus> statusStarting1;
+  Future<TaskStatus> statusRunning1;
+  Future<TaskStatus> statusFinished1;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusStarting1))
+    .WillOnce(FutureArg<1>(&statusRunning1))
+    .WillOnce(FutureArg<1>(&statusFinished1));
+
+  driver.launchTasks(offer1.id(), {task});
+
+  AWAIT_READY_FOR(statusStarting1, Minutes(10));
+  EXPECT_EQ(task.task_id(), statusStarting1->task_id());
+  EXPECT_EQ(TASK_STARTING, statusStarting1->state());
+
+  AWAIT_READY(statusRunning1);
+  EXPECT_EQ(task.task_id(), statusRunning1->task_id());
+  EXPECT_EQ(TASK_RUNNING, statusRunning1->state());
+
+  AWAIT_READY(statusFinished1);
+  EXPECT_EQ(task.task_id(), statusFinished1->task_id());
+  EXPECT_EQ(TASK_FINISHED, statusFinished1->state());
+
+  AWAIT_READY(offers2);
+  ASSERT_EQ(1u, offers2->size());
+
+  const Offer& offer2 = offers2.get()[0];
+
+  task = createTask(
+      offer2.slave_id(),
+      Resources::parse("cpus:1;mem:128").get(),
+      command);
+
+  // Image force pulling.
+  image.set_cached(false);
+
+  container = task.mutable_container();
+  container->set_type(ContainerInfo::MESOS);
+  container->mutable_mesos()->mutable_image()->CopyFrom(image);
+
+  Future<TaskStatus> statusStarting2;
+  Future<TaskStatus> statusRunning2;
+  Future<TaskStatus> statusFinished2;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusStarting2))
+    .WillOnce(FutureArg<1>(&statusRunning2))
+    .WillOnce(FutureArg<1>(&statusFinished2));
+
+  driver.launchTasks(offer2.id(), {task});
+
+  AWAIT_READY_FOR(statusStarting2, Minutes(10));
+  EXPECT_EQ(task.task_id(), statusStarting2->task_id());
+  EXPECT_EQ(TASK_STARTING, statusStarting2->state());
+
+  AWAIT_READY(statusRunning2);
+  EXPECT_EQ(task.task_id(), statusRunning2->task_id());
+  EXPECT_EQ(TASK_RUNNING, statusRunning2->state());
+
+  AWAIT_READY(statusFinished2);
+  EXPECT_EQ(task.task_id(), statusFinished2->task_id());
+  EXPECT_EQ(TASK_FINISHED, statusFinished2->state());
 
   driver.stop();
   driver.join();
@@ -1232,6 +1263,103 @@ TEST_F(ProvisionerDockerTest, ROOT_INTERNET_CURL_ImageDigest)
   EXPECT_EQ(TASK_STARTING, statusStarting->state());
 
   AWAIT_READY_FOR(statusRunning, Seconds(60));
+  EXPECT_EQ(task.task_id(), statusRunning->task_id());
+  EXPECT_EQ(TASK_RUNNING, statusRunning->state());
+
+  AWAIT_READY(statusFinished);
+  EXPECT_EQ(task.task_id(), statusFinished->task_id());
+  EXPECT_EQ(TASK_FINISHED, statusFinished->state());
+
+  driver.stop();
+  driver.join();
+}
+
+
+// This test verifies that Docker manifest configuration is not carried over
+// into the container if the `--docker_ignore_runtime` flag is set. Due to the
+// complexity of the `CommandInfo` mapping, simply check to see if the
+// environment was merged by the isolator into the task container.
+TEST_F(ProvisionerDockerTest, ROOT_DockerIgnoreRuntime)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  const string directory = path::join(os::getcwd(), "registry");
+
+  const std::vector<std::string>& environment = {
+    {"DOCKER_RUNTIME_ENV=true"},
+  };
+
+  // Setting the entrypoint and command that will be reflected in the
+  // manifest.
+  Future<Nothing> testImage = DockerArchive::create(
+      directory, "alpine", "null", "null", environment);
+  AWAIT_READY(testImage);
+
+  ASSERT_TRUE(os::exists(path::join(directory, "alpine.tar")));
+
+  slave::Flags flags = CreateSlaveFlags();
+  flags.isolation = "docker/runtime,filesystem/linux";
+  flags.image_providers = "docker";
+  flags.docker_registry = directory;
+  flags.docker_store_dir = path::join(os::getcwd(), "store");
+  flags.docker_ignore_runtime = true;
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), flags);
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(&driver, _, _));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  ASSERT_EQ(1u, offers->size());
+
+  const Offer& offer = offers.get()[0];
+
+  // This task will fail if Docker manifest metadata is propagated
+  // to the container i.e. the `DOCKER_RUNTIME_ENV` variable should
+  // not be present in the container since we are setting the
+  // `--docker_ignore_runtime` flag.
+  TaskInfo task = createTask(
+    offer.slave_id(),
+    offer.resources(),
+    "test -z $DOCKER_RUNTIME_ENV");
+
+  Image image;
+  image.set_type(Image::DOCKER);
+  image.mutable_docker()->set_name("alpine");
+
+  ContainerInfo* container = task.mutable_container();
+  container->set_type(ContainerInfo::MESOS);
+  container->mutable_mesos()->mutable_image()->CopyFrom(image);
+
+  Future<TaskStatus> statusStarting;
+  Future<TaskStatus> statusRunning;
+  Future<TaskStatus> statusFinished;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
+    .WillOnce(FutureArg<1>(&statusRunning))
+    .WillOnce(FutureArg<1>(&statusFinished));
+
+  driver.launchTasks(offer.id(), {task});
+
+  AWAIT_READY(statusStarting);
+  EXPECT_EQ(task.task_id(), statusStarting->task_id());
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
+
+  AWAIT_READY(statusRunning);
   EXPECT_EQ(task.task_id(), statusRunning->task_id());
   EXPECT_EQ(TASK_RUNNING, statusRunning->state());
 

@@ -920,6 +920,14 @@ message MasterInfo {
       // The master can handle slaves whose state
       // changes after reregistering.
       AGENT_UPDATE = 1;
+
+      // The master can drain or deactivate agents when requested
+      // via operator APIs.
+      AGENT_DRAINING = 2;
+
+      // The master can handle the new quota API, which supports setting
+      // limits separately from guarantees (introduced in Mesos 1.9).
+      QUOTA_V2 = 3;
     }
     optional Type type = 1;
   }
@@ -1038,6 +1046,14 @@ message SlaveInfo {
       // handle feedback for operations on agent default resources, the
       // RESOURCE_PROVIDER capability should be set as well.
       AGENT_OPERATION_FEEDBACK = 6;
+
+      // This expresses the ability for the agent to automatically drain tasks
+      // in preparation for operator maintenance. This capability is required.
+      AGENT_DRAINING = 7;
+
+      // This expresses the ability for the agent to launch tasks which specify
+      // resource limits for CPU and/or memory.
+      TASK_RESOURCE_LIMITS = 8;
     }
 
     // Enum fields should be optional, see: MESOS-4997.
@@ -1136,6 +1152,12 @@ message ResourceProviderInfo {
   // Storage resource provider related information.
   message Storage {
     required CSIPluginInfo plugin = 1;
+
+    // Amount of time to wait after the resource provider finishes reconciling
+    // existing volumes and storage pools against the CSI plugin to start the
+    // next reconciliation. A non-positive value means that no reconciliation
+    // will happen after startup.
+    optional double reconciliation_interval_seconds = 2;
   }
 
   optional Storage storage = 6; // EXPERIMENTAL.
@@ -1510,7 +1532,8 @@ message Resource {
       optional string id = 4; // EXPERIMENTAL.
 
       // Additional metadata for this source. This field maps onto CSI volume
-      // attributes and is not expected to be set by frameworks.
+      // context. Frameworks should neither alter this field, nor expect this
+      // field to remain unchanged.
       optional Labels metadata = 5; // EXPERIMENTAL.
 
       // This field serves as an indirection to a set of storage
@@ -1546,6 +1569,10 @@ message Resource {
   // can be launched using this resource and all of them shall refer
   // to the same physical resource on the cluster. Note that only
   // persistent volumes can be shared currently.
+  //
+  // NOTE: Different shared resources must be uniquely identifiable.
+  // This currently holds as persistent volume should have unique `id`
+  // (this is not validated for enforced though).
   optional SharedInfo shared = 10;
 }
 
@@ -1732,8 +1759,11 @@ message ResourceStatistics {
   optional double cpus_user_time_secs = 2;
   optional double cpus_system_time_secs = 3;
 
-  // Number of CPUs allocated.
+  // Hard CPU limit.
   optional double cpus_limit = 4;
+
+  // Soft CPU limit.
+  optional double cpus_soft_limit = 45;
 
   // cpu.stat on process throttling (for contention issues).
   optional uint32 cpus_nr_periods = 7;
@@ -1752,10 +1782,10 @@ message ResourceStatistics {
   // Total memory + swap usage. This is set if swap is enabled.
   optional uint64 mem_total_memsw_bytes = 37;
 
-  // Hard memory limit for a container.
+  // Hard memory limit.
   optional uint64 mem_limit_bytes = 6;
 
-  // Soft memory limit for a container.
+  // Soft memory limit.
   optional uint64 mem_soft_limit_bytes = 38;
 
   // Broken out memory usage information: pagecache, rss (anonymous),
@@ -2030,6 +2060,7 @@ message Offer {
     }
 
     message Reserve {
+      repeated Resource source = 2;
       repeated Resource resources = 1;
     }
 
@@ -2088,7 +2119,7 @@ message Offer {
     message CreateDisk {
       required Resource source = 1;
 
-      // NOTE: Only `MOUNT` or `BLOCK` is allowed in the `target_type` field.
+      // NOTE: Only `MOUNT` or `BLOCK` is allowed in this field.
       required Resource.DiskInfo.Source.Type target_type = 2;
 
       // Apply the specified profile to the created disk. This field must be set
@@ -2099,17 +2130,19 @@ message Offer {
       optional string target_profile = 3;
     }
 
-    // Destroy a `MOUNT` or `BLOCK` disk resource backed by a CSI volume.
+    // Destroy a disk resource backed by a CSI volume.
     //
     // In the typical case where the CSI plugin of the volume supports volume
-    // deprovisioning and the profile of the disk resource is known to Mesos,
-    // the volume will be deprovisioned and a `RAW` disk resource with the same
-    // profile but no source ID will be returned. However, the following corner
-    // cases could lead to different outcomes:
+    // deprovisioning and the disk resource is a `MOUNT` or `BLOCK` disk with a
+    // profile known to Mesos, the volume will be deprovisioned and a `RAW` disk
+    // resource with the same profile but no source ID will be returned.
+    // However, the following scenarios could lead to different outcomes:
     //
     // (1) If the CSI plugin supports volume deprovisioning but the profile of
-    //     the disk resource is no longer reported by the disk profile adaptor,
-    //     the volume will be deprovisioned but no resource will be returned.
+    //     the disk resource is unknown to the disk profile adaptor, or the disk
+    //     resource is a `RAW` disk with no profile but a source ID (see above
+    //     for possible scenarios), the volume will be deprovisioned but no
+    //     resource will be returned.
     //
     // (2) If the CSI plugin does not support volume deprovisioning, the volume
     //     won't be deprovisioned and a `RAW` disk resource with no profile but
@@ -2118,7 +2151,7 @@ message Offer {
     // NOTE: For the time being, this API is subject to change and the related
     // feature is experimental.
     message DestroyDisk {
-      // NOTE: Only a `MOUNT` or `BLOCK` disk is allowed in the `source` field.
+      // NOTE: Only a `MOUNT`, `BLOCK` or `RAW` disk is allowed in this field.
       required Resource source = 1;
     }
 
@@ -2257,6 +2290,9 @@ message TaskInfo {
   // It is the executor's responsibility to implement this, so it might not be
   // supported by all custom executors.
   optional DurationInfo max_completion_time = 14;
+
+  // Resource limits associated with the task.
+  map<string, Value.Scalar> limits = 15;
 }
 
 
@@ -2323,8 +2359,15 @@ message Task {
 
   // TODO(greggomann): Add the task's `CheckInfo`. See MESOS-8780.
 
+  // The kill policy used for this task when it is killed. It's possible for
+  // this policy to be overridden by the scheduler when killing the task.
+  optional KillPolicy kill_policy = 16;
+
   // Specific user under which task is running.
   optional string user = 14;
+
+  // Resource limits associated with the task.
+  map<string, Value.Scalar> limits = 17;
 }
 
 
@@ -2619,6 +2662,7 @@ message TaskStatus {
     REASON_RECONCILIATION = 9;
     REASON_RESOURCES_UNKNOWN = 18;
     REASON_SLAVE_DISCONNECTED = 10;
+    REASON_SLAVE_DRAINING = 34;
     REASON_SLAVE_REMOVED = 11;
     REASON_SLAVE_REMOVED_BY_OPERATOR = 31;
     REASON_SLAVE_REREGISTERED = 32;
@@ -3226,7 +3270,9 @@ message SeccompInfo {
   // If not set or set to `false`, the container is launched with
   // the profile specified in the `profile_name` field.
   //
-  // NOTE: `profile_name` should not be specified if `unconfined` set to `true`.
+  // NOTE: `profile_name` must not be specified if `unconfined` set to `true`.
+  // `profile_name` must be specified if `unconfined` is not set or
+  // is set to `false`.
   optional bool unconfined = 2;
 }
 
@@ -3256,7 +3302,71 @@ message LinuxInfo {
   optional bool share_pid_namespace = 4;
 
   // Represents Seccomp configuration, which is used for syscall filtering.
+  // This field is used to override the agent's default Seccomp configuration.
   optional SeccompInfo seccomp = 5;
+
+  enum IpcMode {
+    UNKNOWN = 0;
+
+    // The container will have its own IPC namespace and /dev/shm, with a
+    // possibility to share them with its child containers.
+    PRIVATE = 1;
+
+    // The container will share the IPC namespace and /dev/shm from its
+    // parent. If the container is a top level container, it will share
+    // the IPC namespace and /dev/shm from the agent host, if the container
+    // is a nested container, it will share the IPC namespace and /dev/shm
+    // from its parent container. The implication is if a nested container
+    // wants to share the IPC namespace and /dev/shm from the agent host,
+    // its parent container has to do it first.
+    SHARE_PARENT = 2;
+  }
+
+  // There are two special cases that we need to handle for this field:
+  // 1. This field is not set: For backward compatibility we will keep the
+  //    previous behavior: Top level container will have its own IPC namespace
+  //    and nested container will share the IPC namespace from its parent
+  //    container. If the container does not have its own rootfs, it will share
+  //    agent's /dev/shm, otherwise it will have its own /dev/shm.
+  // 2. The `namespaces/ipc` isolator is not enabled: This field will be ignored
+  //    in this case. For backward compatibility, in the `filesystem/linux`
+  //    isolator we will keep the previous behavior: Any containers will share
+  //    IPC namespace from agent, and if the container does not have its own
+  //    rootfs, it will also share agent's /dev/shm, otherwise it will have its
+  //    own /dev/shm.
+  //
+  // TODO(qianzhang): Remove the support for the above two cases after the
+  // deprecation cycle (started in 1.9). Eventually we want a single isolator
+  // (`namespaces/ipc`) to handle both IPC namespace and /dev/shm, and decouple
+  // /dev/shm from container's rootfs (i.e., whether a container will have its
+  // own /dev/shm depends on its `ipc_mode` instead of whether the container
+  // has its own rootfs).
+  optional IpcMode ipc_mode = 6;
+
+  // Size of /dev/shm in MB. If not set, the size of the /dev/shm for container
+  // will be value of the `--default_container_shm_size` agent flag, if that
+  // flag is not set too, the size of the /dev/shm will be half of the host RAM
+  // which is the default behavior of Linux. This field will be ignored for the
+  // container which shares /dev/shm from its parent and it will be also ignored
+  // for any containers if the `namespaces/ipc` isolator is not enabled. Please
+  // note that we only support setting this field when the `ipc_mode` field is
+  // set to `PRIVATE` otherwise the container launch will be rejected.
+  optional uint32 shm_size = 7;
+
+  // If set as 'true', the container will share the cgroups from its parent
+  // container, otherwise it will have its own cgroups created. Please note:
+  // 1. For tasks in a task group launched via the LAUNCH_GROUP operation,
+  //    this field may be set to 'true' or 'false'. Resource limits may only be
+  //    set for tasks in a task group when this field is set to 'false'.
+  // 2. For tasks launched via the LAUNCH operation, this field may only be set
+  //    to 'true', and in this case resource limits may be set on these tasks.
+  // 3. For containers launched via the agent's LAUNCH_NESTED_CONTAINER_SESSION
+  //    call, this field must be set to 'true'.
+  // 4. For executor containers, this field may only be set to 'false'.
+  // 5. All tasks under a single executor must share the same value of this
+  //    field, if it is set. Note that this means that all tasks within a single
+  //    task group must set this field to the same value.
+  optional bool share_cgroups = 8 [default = true];
 }
 
 
@@ -3630,6 +3740,11 @@ message Role {
   required string name = 1;
   required double weight = 2;
   repeated FrameworkID frameworks = 3;
+
+  // TODO(bmahler): Deprecate `resources` and introduce quota,
+  // consumed quota, allocated, offered, and reserved resource
+  // quantity fields. This is blocked by MESOS-9497 since the
+  // computation of these quantities is currently expensive.
   repeated Resource resources = 4;
 }
 
@@ -3701,4 +3816,53 @@ message DeviceAccess {
 
 message DeviceWhitelist {
    repeated DeviceAccess allowed_devices = 1;
+}
+
+
+enum DrainState {
+  UNKNOWN = 0;
+
+  // The agent is currently draining.
+  DRAINING = 1;
+
+  // The agent has been drained: all tasks have terminated, all terminal
+  // task status updates have been acknowledged by the frameworks, and all
+  // operations have finished and had their terminal updates acknowledged.
+  DRAINED = 2;
+}
+
+
+message DrainConfig {
+  // An upper bound for tasks with a KillPolicy.
+  // If a task has a KillPolicy grace period greater than this value, this value
+  // will be used instead. This allows the operator to limit the maximum time it
+  // will take the agent to drain. If this field is unset, the task's KillPolicy
+  // or the executor's default grace period is used.
+  //
+  // NOTE: Grace periods start when the executor receives the associated kill.
+  // If, for example, the agent is unreachable when this call is made,
+  // tasks will still receive their full grace period to kill gracefully.
+  optional DurationInfo max_grace_period = 1;
+
+  // Whether or not this agent will be removed permanently from the cluster when
+  // draining is complete. This transition is automatic and does **NOT** require
+  // a separate call to `MarkAgentGone`. If this field is unset, then the
+  // default value of `false` is used.
+  //
+  // Compared to `MarkAgentGone`, which is used for unreachable agents,
+  // marking agents gone after draining will respect kill policies.
+  // To notify frameworks, tasks terminated during draining will return
+  // a `TASK_GONE_BY_OPERATOR` status update instead of any other terminal
+  // status. Executors will not need to account for this case, because
+  // the terminal status update will be intercepted and modified by the agent.
+  optional bool mark_gone = 2 [default = false];
+}
+
+
+message DrainInfo {
+  // The drain state of the agent.
+  required DrainState state = 1;
+
+  // The configuration used to drain the agent.
+  required DrainConfig config = 2;
 }
